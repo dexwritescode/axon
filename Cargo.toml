@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-openai = "0.38.0"
+async-openai = { version = "0.38.0", features = ["chat-completion"] }
 crossterm = "0.29.0"
 eventsource-stream = "0.2.3"
 ratatui = "0.30.0"
@@ -12,3 +12,6 @@ reqwest = { version = "0.12", features = ["stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.52.3", features = ["full"] }
+
+[dev-dependencies]
+futures = "0.3.32"
