@@ -1,0 +1,13 @@
+/target
+
+# Claude
+.claude/
+CLAUDE.md
+ARCHITECTURE.md
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/
+AGENTS.md
