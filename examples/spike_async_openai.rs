@@ -25,8 +25,8 @@ use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| "http://localhost:8080/v1".to_string());
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "http://localhost:8080/v1".to_string());
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "x".to_string());
     let model = std::env::var("MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
@@ -115,7 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for tc in tool_calls {
                             tool_chunks += 1;
                             let name = tc.function.as_ref().and_then(|f| f.name.as_deref());
-                            let args = tc.function.as_ref()
+                            let args = tc
+                                .function
+                                .as_ref()
                                 .and_then(|f| f.arguments.as_deref())
                                 .unwrap_or("");
                             assembled_args.push_str(args);
