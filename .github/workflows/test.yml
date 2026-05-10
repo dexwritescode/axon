@@ -48,7 +48,7 @@ jobs:
 
       - name: Start Prism mock server
         run: |
-          prism mock https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml \
+          prism mock https://raw.githubusercontent.com/openai/openai-openapi/2.0.0/openapi.yaml \
             --port 4010 --errors &
           timeout 30 bash -c 'until nc -z 127.0.0.1 4010; do sleep 1; done'
 
