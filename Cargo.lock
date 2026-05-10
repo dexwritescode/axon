@@ -109,6 +109,7 @@ dependencies = [
 name = "axon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-openai",
  "crossterm",
  "eventsource-stream",
@@ -118,6 +119,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
