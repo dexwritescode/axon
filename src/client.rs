@@ -80,7 +80,14 @@ async fn run_stream(
     let mut pending: HashMap<u32, (String, String, String)> = HashMap::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        // async-openai emits JSONDeserialize("[DONE]") for the SSE sentinel — treat as end-of-stream
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(async_openai::error::OpenAIError::JSONDeserialize(_, ref s)) if s == "[DONE]" => {
+                break
+            }
+            Err(e) => return Err(e.into()),
+        };
         for choice in chunk.choices {
             if let Some(content) = choice.delta.content
                 && !content.is_empty()
@@ -106,14 +113,115 @@ async fn run_stream(
         }
     }
 
-    // Emit assembled tool calls in index order, then signal completion.
-    let mut calls: Vec<_> = pending.into_iter().collect();
-    calls.sort_by_key(|(idx, _)| *idx);
-    for (_, (_, name, args_str)) in calls {
-        let args = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
-        tx.send(Ok(AppEvent::ToolCall { name, args })).await?;
+    for event in assemble_tool_calls(pending) {
+        tx.send(Ok(event)).await?;
     }
-
     tx.send(Ok(AppEvent::Done)).await?;
     Ok(())
+}
+
+// index → (id, name, accumulated_args)
+type PendingToolCalls = HashMap<u32, (String, String, String)>;
+
+fn assemble_tool_calls(pending: PendingToolCalls) -> Vec<AppEvent> {
+    let mut calls: Vec<_> = pending.into_iter().collect();
+    calls.sort_by_key(|(idx, _)| *idx);
+    calls
+        .into_iter()
+        .map(|(_, (_, name, args_str))| {
+            let args = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
+            AppEvent::ToolCall { name, args }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pending(entries: &[(u32, &str, &str, &str)]) -> PendingToolCalls {
+        entries
+            .iter()
+            .map(|(idx, id, name, args)| (*idx, (id.to_string(), name.to_string(), args.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn single_tool_call_valid_json() {
+        let events = assemble_tool_calls(pending(&[(
+            0,
+            "call_abc",
+            "read_file",
+            r#"{"path":"/etc/hostname"}"#,
+        )]));
+        assert_eq!(
+            events,
+            vec![AppEvent::ToolCall {
+                name: "read_file".into(),
+                args: json!({"path": "/etc/hostname"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn multiple_tool_calls_emitted_in_index_order() {
+        // Insert in reverse order to verify sorting.
+        let events = assemble_tool_calls(pending(&[
+            (1, "call_2", "shell", r#"{"cmd":"ls"}"#),
+            (0, "call_1", "read_file", r#"{"path":"/etc/hostname"}"#),
+        ]));
+        assert_eq!(events[0], AppEvent::ToolCall { name: "read_file".into(), args: json!({"path": "/etc/hostname"}) });
+        assert_eq!(events[1], AppEvent::ToolCall { name: "shell".into(), args: json!({"cmd": "ls"}) });
+    }
+
+    #[test]
+    fn invalid_json_args_become_null() {
+        let events = assemble_tool_calls(pending(&[(0, "call_x", "read_file", "not json")]));
+        assert_eq!(
+            events,
+            vec![AppEvent::ToolCall {
+                name: "read_file".into(),
+                args: serde_json::Value::Null,
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_args_string_becomes_null() {
+        let events = assemble_tool_calls(pending(&[(0, "call_x", "read_file", "")]));
+        assert_eq!(
+            events,
+            vec![AppEvent::ToolCall {
+                name: "read_file".into(),
+                args: serde_json::Value::Null,
+            }]
+        );
+    }
+
+    #[test]
+    fn no_pending_tool_calls_yields_empty() {
+        assert!(assemble_tool_calls(HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn fragmented_args_assemble_correctly() {
+        // Simulate the three-chunk arg stream: '{"pa' + 'th":"' + '/etc/hostname"}'
+        let mut p: PendingToolCalls = HashMap::new();
+        let entry = p.entry(0).or_default();
+        entry.0 = "call_1".into();
+        entry.1 = "read_file".into();
+        entry.2.push_str(r#"{"pa"#);
+        entry.2.push_str(r#"th":""#);
+        entry.2.push_str(r#"/etc/hostname"}"#);
+
+        let events = assemble_tool_calls(p);
+        assert_eq!(
+            events,
+            vec![AppEvent::ToolCall {
+                name: "read_file".into(),
+                args: json!({"path": "/etc/hostname"}),
+            }]
+        );
+    }
 }

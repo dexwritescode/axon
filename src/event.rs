@@ -1,4 +1,5 @@
 #[allow(dead_code)]
+#[derive(Debug, PartialEq)]
 pub enum AppEvent {
     Token(String),
     ToolCall {
