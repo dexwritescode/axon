@@ -1,21 +1,43 @@
-use tokio::sync::mpsc;
+use crate::{client::AxonClient, config::Config};
 
-use crate::{config::Config, event::AppEvent};
+#[derive(Debug)]
+pub enum ChatMessage {
+    User(String),
+    Agent(String),
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolResult {
+        name: String,
+        content: String,
+    },
+}
 
 pub struct App {
     pub running: bool,
     pub config: Config,
-    /// Receives AppEvent variants from the active inference task.
-    /// Replace to cancel the previous task and start a new one.
-    pub inference_rx: Option<mpsc::Receiver<AppEvent>>,
+    pub client: AxonClient,
+    pub input: String,
+    pub messages: Vec<ChatMessage>,
 }
 
 impl Default for App {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        let config = Config::default();
+        let client = AxonClient::new(&config.backend);
         Self {
             running: true,
-            config: Config::default(),
-            inference_rx: None,
+            client,
+            config,
+            input: String::new(),
+            messages: Vec::new(),
         }
     }
 }
