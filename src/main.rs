@@ -1,10 +1,7 @@
-mod app;
-mod config;
-mod event;
-mod ui;
-
 use std::io::{self, Stdout};
 
+use axon::app::App;
+use axon::ui;
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -13,8 +10,6 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::time::{self, Duration};
-
-use app::App;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
