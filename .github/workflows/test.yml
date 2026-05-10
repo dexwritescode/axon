@@ -29,5 +29,30 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Set npm prefix
+        run: |
+          npm config set prefix ~/.npm-global
+          echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - name: Cache Prism
+        id: cache-prism
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: prism-${{ runner.os }}-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: prism-${{ runner.os }}-
+
+      - name: Install Prism
+        if: steps.cache-prism.outputs.cache-hit != 'true'
+        run: npm install -g @stoplight/prism-cli
+
+      - name: Start Prism mock server
+        run: |
+          prism mock https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml \
+            --port 4010 --errors &
+          timeout 30 bash -c 'until nc -z 127.0.0.1 4010; do sleep 1; done'
+
       - name: Test
         run: cargo test --locked
+        env:
+          PRISM_BASE_URL: http://127.0.0.1:4010/v1
