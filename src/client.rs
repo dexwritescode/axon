@@ -1,5 +1,3 @@
-#![allow(dead_code)] // wired up in axon-ptq (inference task)
-
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -15,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{config::BackendConfig, event::AppEvent};
 
+#[derive(Clone)]
 pub struct AxonClient {
     inner: Client<OpenAIConfig>,
     model: String,
