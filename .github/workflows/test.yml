@@ -55,4 +55,4 @@ jobs:
       - name: Test
         run: cargo test --locked
         env:
-          PRISM_BASE_URL: http://127.0.0.1:4010/v1
+          PRISM_BASE_URL: http://127.0.0.1:4010
