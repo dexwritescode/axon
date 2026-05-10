@@ -106,7 +106,12 @@ fn stop_chunk() -> String {
 #[tokio::test]
 async fn token_stream() {
     let server = MockServer::start().await;
-    let body = sse_body(&[&chunk("Hello"), &chunk(", "), &chunk("world"), &stop_chunk()]);
+    let body = sse_body(&[
+        &chunk("Hello"),
+        &chunk(", "),
+        &chunk("world"),
+        &stop_chunk(),
+    ]);
     let events = collect_events(&server, body).await;
     assert_eq!(
         events,
@@ -123,7 +128,12 @@ async fn token_stream() {
 async fn tool_call_single_chunk() {
     let server = MockServer::start().await;
     // All args arrive in the first chunk; subsequent chunk just has finish_reason.
-    let first = tool_chunk(0, Some("call_abc"), Some("read_file"), Some(r#"{"path":"/etc/hostname"}"#));
+    let first = tool_chunk(
+        0,
+        Some("call_abc"),
+        Some("read_file"),
+        Some(r#"{"path":"/etc/hostname"}"#),
+    );
     let finish = serde_json::to_string(&json!({
         "id": "chatcmpl-test",
         "object": "chat.completion.chunk",

@@ -84,7 +84,7 @@ async fn run_stream(
         let chunk = match chunk {
             Ok(c) => c,
             Err(async_openai::error::OpenAIError::JSONDeserialize(_, ref s)) if s == "[DONE]" => {
-                break
+                break;
             }
             Err(e) => return Err(e.into()),
         };
@@ -143,7 +143,9 @@ mod tests {
     fn pending(entries: &[(u32, &str, &str, &str)]) -> PendingToolCalls {
         entries
             .iter()
-            .map(|(idx, id, name, args)| (*idx, (id.to_string(), name.to_string(), args.to_string())))
+            .map(|(idx, id, name, args)| {
+                (*idx, (id.to_string(), name.to_string(), args.to_string()))
+            })
             .collect()
     }
 
@@ -171,8 +173,20 @@ mod tests {
             (1, "call_2", "shell", r#"{"cmd":"ls"}"#),
             (0, "call_1", "read_file", r#"{"path":"/etc/hostname"}"#),
         ]));
-        assert_eq!(events[0], AppEvent::ToolCall { name: "read_file".into(), args: json!({"path": "/etc/hostname"}) });
-        assert_eq!(events[1], AppEvent::ToolCall { name: "shell".into(), args: json!({"cmd": "ls"}) });
+        assert_eq!(
+            events[0],
+            AppEvent::ToolCall {
+                name: "read_file".into(),
+                args: json!({"path": "/etc/hostname"})
+            }
+        );
+        assert_eq!(
+            events[1],
+            AppEvent::ToolCall {
+                name: "shell".into(),
+                args: json!({"cmd": "ls"})
+            }
+        );
     }
 
     #[test]
