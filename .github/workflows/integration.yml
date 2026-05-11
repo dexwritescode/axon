@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   live:
-    runs-on: macos-latest
+    runs-on: macos-26
 
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +28,9 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Install gRPC runtime
+        run: brew install grpc
 
       - name: Download neuron CLI
         run: |
