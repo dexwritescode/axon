@@ -1,0 +1,59 @@
+name: Integration
+
+on:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download neuron CLI
+        run: |
+          gh release download --repo dexwritescode/neurons --pattern "neuron-*-arm64" --dir "$RUNNER_TEMP/neuron"
+          mv "$RUNNER_TEMP/neuron"/neuron-*-arm64 /usr/local/bin/neuron
+          chmod +x /usr/local/bin/neuron
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache TinyLlama 4-bit model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: ~/.neurons/models/mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit
+          key: neurons-model-tinyllama-1.1b-4bit
+
+      - name: Download model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: neuron download mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit
+
+      - name: Start neuron server
+        run: |
+          neuron server -m mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit --http-port 8080 &
+          timeout 120 bash -c 'until curl -sf http://127.0.0.1:8080/v1/models > /dev/null; do sleep 2; done'
+
+      - name: Integration tests
+        run: cargo test --locked --test client_live
+        env:
+          AXON_TEST_BASE_URL: http://127.0.0.1:8080/v1
