@@ -13,12 +13,7 @@ use std::{fs, path::Path};
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
 };
-use axon::{
-    client::AxonClient,
-    config::BackendConfig,
-    event::AppEvent,
-    tools::tool_schemas,
-};
+use axon::{client::AxonClient, config::BackendConfig, event::AppEvent, tools::tool_schemas};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -63,7 +58,9 @@ async fn collect(rx: &mut mpsc::Receiver<AppEvent>) -> Vec<AppEvent> {
 }
 
 fn has_tool_call(events: &[AppEvent], tool_name: &str) -> bool {
-    events.iter().any(|e| matches!(e, AppEvent::ToolCall { name, .. } if name == tool_name))
+    events
+        .iter()
+        .any(|e| matches!(e, AppEvent::ToolCall { name, .. } if name == tool_name))
 }
 
 fn has_tool_result(events: &[AppEvent], tool_name: &str) -> bool {
@@ -75,7 +72,13 @@ fn has_tool_result(events: &[AppEvent], tool_name: &str) -> bool {
 fn token_text(events: &[AppEvent]) -> String {
     events
         .iter()
-        .filter_map(|e| if let AppEvent::Token(t) = e { Some(t.as_str()) } else { None })
+        .filter_map(|e| {
+            if let AppEvent::Token(t) = e {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -98,13 +101,26 @@ async fn read_file_tool_called_and_executed() {
     let working_dir = dir.path().to_owned();
 
     tokio::spawn(async move {
-        run_agent(client, vec![user_msg(prompt)], tool_schemas(), tx, &working_dir).await;
+        run_agent(
+            client,
+            vec![user_msg(prompt)],
+            tool_schemas(),
+            tx,
+            &working_dir,
+        )
+        .await;
     });
 
     let events = collect(&mut rx).await;
 
-    assert!(has_tool_call(&events, "read_file"), "expected read_file tool call");
-    assert!(has_tool_result(&events, "read_file"), "expected read_file result");
+    assert!(
+        has_tool_call(&events, "read_file"),
+        "expected read_file tool call"
+    );
+    assert!(
+        has_tool_result(&events, "read_file"),
+        "expected read_file result"
+    );
 
     let text = token_text(&events);
     assert!(
@@ -130,13 +146,26 @@ async fn edit_file_tool_called_and_file_written() {
     let (tx, mut rx) = mpsc::channel(64);
 
     tokio::spawn(async move {
-        run_agent(client, vec![user_msg(prompt)], tool_schemas(), tx, &working_dir).await;
+        run_agent(
+            client,
+            vec![user_msg(prompt)],
+            tool_schemas(),
+            tx,
+            &working_dir,
+        )
+        .await;
     });
 
     let events = collect(&mut rx).await;
 
-    assert!(has_tool_call(&events, "edit_file"), "expected edit_file tool call");
-    assert!(has_tool_result(&events, "edit_file"), "expected edit_file result");
+    assert!(
+        has_tool_call(&events, "edit_file"),
+        "expected edit_file tool call"
+    );
+    assert!(
+        has_tool_result(&events, "edit_file"),
+        "expected edit_file result"
+    );
     assert!(out_path.exists(), "expected file to be created on disk");
 
     let contents = fs::read_to_string(&out_path).unwrap();
@@ -161,7 +190,14 @@ async fn shell_tool_called_and_output_returned() {
     let (tx, mut rx) = mpsc::channel(64);
 
     tokio::spawn(async move {
-        run_agent(client, vec![user_msg(prompt)], tool_schemas(), tx, &working_dir).await;
+        run_agent(
+            client,
+            vec![user_msg(prompt)],
+            tool_schemas(),
+            tx,
+            &working_dir,
+        )
+        .await;
     });
 
     let events = collect(&mut rx).await;
@@ -194,17 +230,33 @@ async fn multi_step_read_then_shell_verify() {
     let (tx, mut rx) = mpsc::channel(64);
 
     tokio::spawn(async move {
-        run_agent(client, vec![user_msg(prompt)], tool_schemas(), tx, &working_dir).await;
+        run_agent(
+            client,
+            vec![user_msg(prompt)],
+            tool_schemas(),
+            tx,
+            &working_dir,
+        )
+        .await;
     });
 
     let events = collect(&mut rx).await;
 
     let tool_calls: Vec<&str> = events
         .iter()
-        .filter_map(|e| if let AppEvent::ToolCall { name, .. } = e { Some(name.as_str()) } else { None })
+        .filter_map(|e| {
+            if let AppEvent::ToolCall { name, .. } = e {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
 
-    assert!(tool_calls.len() >= 2, "expected at least two tool calls, got: {tool_calls:?}");
+    assert!(
+        tool_calls.len() >= 2,
+        "expected at least two tool calls, got: {tool_calls:?}"
+    );
     assert!(
         tool_calls.contains(&"read_file") || tool_calls.contains(&"shell"),
         "expected read_file and/or shell calls"
@@ -222,7 +274,8 @@ async fn run_agent(
     working_dir: &Path,
 ) {
     use axon::config::ToolApproval;
-    let mut rx = axon::inference::spawn_in(client, messages, tools, ToolApproval::Allow, working_dir);
+    let mut rx =
+        axon::inference::spawn_in(client, messages, tools, ToolApproval::Allow, working_dir);
     while let Some(ev) = rx.recv().await {
         let done = matches!(ev, AppEvent::Done);
         let _ = tx.send(ev).await;

@@ -20,7 +20,13 @@ pub fn spawn(
     tools: Vec<ChatCompletionTools>,
     tool_approval: ToolApproval,
 ) -> mpsc::Receiver<AppEvent> {
-    spawn_in(client, messages, tools, tool_approval, std::env::current_dir().unwrap_or_default())
+    spawn_in(
+        client,
+        messages,
+        tools,
+        tool_approval,
+        std::env::current_dir().unwrap_or_default(),
+    )
 }
 
 /// Spawn the inference task rooted at `working_dir`. Useful for tests.
