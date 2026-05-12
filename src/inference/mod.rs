@@ -1,64 +1,122 @@
 use anyhow::Result;
-use async_openai::types::chat::{ChatCompletionRequestMessage, ChatCompletionTools};
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionTools,
+    FunctionCall,
+};
 use futures::StreamExt;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::{client::AxonClient, config::ToolApproval, event::AppEvent};
+use crate::{client::AxonClient, config::ToolApproval, event::AppEvent, tools::ToolExecutor};
 
-/// Spawn the inference task and return the event receiver.
-///
-/// Drop the receiver to cancel: the task detects the closed channel and exits
-/// at the next send, so no explicit abort is needed.
+const MAX_TURNS: usize = 10;
+
+/// Spawn the inference task rooted at the current working directory.
 pub fn spawn(
     client: AxonClient,
     messages: Vec<ChatCompletionRequestMessage>,
     tools: Vec<ChatCompletionTools>,
+    tool_approval: ToolApproval,
+) -> mpsc::Receiver<AppEvent> {
+    spawn_in(client, messages, tools, tool_approval, std::env::current_dir().unwrap_or_default())
+}
+
+/// Spawn the inference task rooted at `working_dir`. Useful for tests.
+pub fn spawn_in(
+    client: AxonClient,
+    messages: Vec<ChatCompletionRequestMessage>,
+    tools: Vec<ChatCompletionTools>,
     _tool_approval: ToolApproval,
+    working_dir: impl Into<PathBuf>,
 ) -> mpsc::Receiver<AppEvent> {
     let (tx, rx) = mpsc::channel(64);
+    let executor = ToolExecutor::new(working_dir);
     tokio::spawn(async move {
-        run(client, messages, tools, tx).await;
+        run(client, messages, tools, tx, executor).await;
     });
     rx
 }
 
 async fn run(
     client: AxonClient,
-    messages: Vec<ChatCompletionRequestMessage>,
+    mut messages: Vec<ChatCompletionRequestMessage>,
     tools: Vec<ChatCompletionTools>,
     tx: mpsc::Sender<AppEvent>,
+    executor: ToolExecutor,
 ) {
-    let stream = client.stream_chat(messages, tools);
-    match run_turn(stream, &tx).await {
-        Ok(tool_calls) if !tool_calls.is_empty() => {
-            // Stub: acknowledge each tool call with a placeholder result.
-            // Real dispatch to the local executor lands in axon-je8.
-            for (name, _args) in tool_calls {
-                if tx
-                    .send(AppEvent::ToolResult {
-                        name,
-                        content: "stub".into(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return; // receiver dropped
-                }
-            }
+    for _ in 0..MAX_TURNS {
+        let stream = client.stream_chat(messages.clone(), tools.clone());
+        let tool_calls = match run_turn(stream, &tx).await {
+            Ok(calls) => calls,
+            Err(_) => break,
+        };
+
+        if tool_calls.is_empty() {
+            break;
         }
-        Ok(_) | Err(_) => {}
+
+        // Append assistant message with the tool_calls to history.
+        let msg_tool_calls: Vec<ChatCompletionMessageToolCalls> = tool_calls
+            .iter()
+            .map(|(id, name, args)| {
+                ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                    id: id.clone(),
+                    function: FunctionCall {
+                        name: name.clone(),
+                        arguments: serde_json::to_string(args).unwrap_or_default(),
+                    },
+                })
+            })
+            .collect();
+
+        #[allow(deprecated)]
+        messages.push(ChatCompletionRequestMessage::Assistant(
+            ChatCompletionRequestAssistantMessage {
+                tool_calls: Some(msg_tool_calls),
+                ..Default::default()
+            },
+        ));
+
+        // Execute each tool and append results to history.
+        for (id, name, args) in &tool_calls {
+            let content = executor
+                .execute(name, args)
+                .unwrap_or_else(|e| format!("error: {e}"));
+
+            if tx
+                .send(AppEvent::ToolResult {
+                    name: name.clone(),
+                    content: content.clone(),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            messages.push(ChatCompletionRequestMessage::Tool(
+                ChatCompletionRequestToolMessage {
+                    content: ChatCompletionRequestToolMessageContent::Text(content),
+                    tool_call_id: id.clone(),
+                },
+            ));
+        }
     }
+
     let _ = tx.send(AppEvent::Done).await;
 }
 
 /// Process one streaming turn: forward Token and ToolCall events to `tx`,
-/// return the tool calls collected. Returns early (Ok) if `tx` is closed.
+/// return the tool calls collected as (id, name, args). Returns early (Ok)
+/// if `tx` is closed.
 pub(crate) async fn run_turn(
     stream: impl futures::Stream<Item = Result<AppEvent>>,
     tx: &mpsc::Sender<AppEvent>,
-) -> Result<Vec<(String, serde_json::Value)>> {
+) -> Result<Vec<(String, String, serde_json::Value)>> {
     futures::pin_mut!(stream);
-    let mut tool_calls = Vec::new();
+    let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
 
     while let Some(result) = stream.next().await {
         match result? {
@@ -67,9 +125,13 @@ pub(crate) async fn run_turn(
                     return Ok(tool_calls);
                 }
             }
-            AppEvent::ToolCall { name, args } => {
-                tool_calls.push((name.clone(), args.clone()));
-                if tx.send(AppEvent::ToolCall { name, args }).await.is_err() {
+            AppEvent::ToolCall { id, name, args } => {
+                tool_calls.push((id.clone(), name.clone(), args.clone()));
+                if tx
+                    .send(AppEvent::ToolCall { id, name, args })
+                    .await
+                    .is_err()
+                {
                     return Ok(tool_calls);
                 }
             }
@@ -99,7 +161,7 @@ mod tests {
         assert!(tool_calls.is_empty());
         assert_eq!(rx.recv().await.unwrap(), AppEvent::Token("hello".into()));
         assert_eq!(rx.recv().await.unwrap(), AppEvent::Token(" world".into()));
-        assert!(rx.recv().await.is_none()); // Done is not forwarded; channel closed by drop(tx)
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -107,6 +169,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let events = vec![
             Ok(AppEvent::ToolCall {
+                id: "call_1".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hosts"}),
             }),
@@ -114,11 +177,13 @@ mod tests {
         ];
         let tool_calls = run_turn(stream::iter(events), &tx).await.unwrap();
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].0, "read_file");
-        assert_eq!(tool_calls[0].1, json!({"path": "/etc/hosts"}));
+        assert_eq!(tool_calls[0].0, "call_1");
+        assert_eq!(tool_calls[0].1, "read_file");
+        assert_eq!(tool_calls[0].2, json!({"path": "/etc/hosts"}));
         assert_eq!(
             rx.recv().await.unwrap(),
             AppEvent::ToolCall {
+                id: "call_1".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hosts"}),
             }
@@ -139,12 +204,11 @@ mod tests {
     #[tokio::test]
     async fn receiver_drop_exits_cleanly() {
         let (tx, rx) = mpsc::channel(16);
-        drop(rx); // close the receiving end immediately
+        drop(rx);
         let events: Vec<Result<AppEvent>> = vec![
             Ok(AppEvent::Token("hi".into())),
             Ok(AppEvent::Token("there".into())),
         ];
-        // run_turn must return Ok (not panic or hang) when the receiver is gone
         let result = run_turn(stream::iter(events), &tx).await;
         assert!(result.is_ok());
     }

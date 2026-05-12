@@ -3,6 +3,7 @@
 pub enum AppEvent {
     Token(String),
     ToolCall {
+        id: String,
         name: String,
         args: serde_json::Value,
     },

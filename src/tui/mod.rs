@@ -128,7 +128,7 @@ fn handle_app_event(
             Some(ChatMessage::Agent(text)) => text.push_str(&delta),
             _ => app.messages.push(ChatMessage::Agent(delta)),
         },
-        AppEvent::ToolCall { name, args } => {
+        AppEvent::ToolCall { name, args, .. } => {
             app.messages.push(ChatMessage::ToolCall { name, args });
         }
         AppEvent::ToolResult { name, content } => {

@@ -148,6 +148,7 @@ async fn tool_call_single_chunk() {
         events,
         vec![
             AppEvent::ToolCall {
+                id: "call_abc".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hostname"}),
             },
@@ -178,6 +179,7 @@ async fn tool_call_fragmented_args() {
         events,
         vec![
             AppEvent::ToolCall {
+                id: "call_abc".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hostname"}),
             },
@@ -209,6 +211,7 @@ async fn mixed_token_and_tool_call() {
             AppEvent::Token("Thinking".into()),
             AppEvent::Token("...".into()),
             AppEvent::ToolCall {
+                id: "call_1".into(),
                 name: "shell".into(),
                 args: json!({"cmd": "ls"}),
             },

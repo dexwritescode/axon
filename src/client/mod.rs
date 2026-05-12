@@ -127,9 +127,9 @@ fn assemble_tool_calls(pending: PendingToolCalls) -> Vec<AppEvent> {
     calls.sort_by_key(|(idx, _)| *idx);
     calls
         .into_iter()
-        .map(|(_, (_, name, args_str))| {
+        .map(|(_, (id, name, args_str))| {
             let args = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
-            AppEvent::ToolCall { name, args }
+            AppEvent::ToolCall { id, name, args }
         })
         .collect()
 }
@@ -159,6 +159,7 @@ mod tests {
         assert_eq!(
             events,
             vec![AppEvent::ToolCall {
+                id: "call_abc".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hostname"}),
             }]
@@ -175,6 +176,7 @@ mod tests {
         assert_eq!(
             events[0],
             AppEvent::ToolCall {
+                id: "call_1".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hostname"})
             }
@@ -182,6 +184,7 @@ mod tests {
         assert_eq!(
             events[1],
             AppEvent::ToolCall {
+                id: "call_2".into(),
                 name: "shell".into(),
                 args: json!({"cmd": "ls"})
             }
@@ -194,6 +197,7 @@ mod tests {
         assert_eq!(
             events,
             vec![AppEvent::ToolCall {
+                id: "call_x".into(),
                 name: "read_file".into(),
                 args: serde_json::Value::Null,
             }]
@@ -206,6 +210,7 @@ mod tests {
         assert_eq!(
             events,
             vec![AppEvent::ToolCall {
+                id: "call_x".into(),
                 name: "read_file".into(),
                 args: serde_json::Value::Null,
             }]
@@ -232,6 +237,7 @@ mod tests {
         assert_eq!(
             events,
             vec![AppEvent::ToolCall {
+                id: "call_1".into(),
                 name: "read_file".into(),
                 args: json!({"path": "/etc/hostname"}),
             }]
