@@ -1,16 +1,20 @@
-use std::io::Stdout;
+use std::io::{Stdout, stdout};
 
 use anyhow::Result;
 use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
 };
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    cursor,
+    event::{
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    style::Print,
+    terminal::{self, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
@@ -23,45 +27,63 @@ use crate::{
 pub mod draw;
 
 pub async fn run() -> Result<()> {
-    let mut terminal = setup()?;
-    let result = run_loop(&mut terminal).await;
-    restore(&mut terminal)?;
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+
+    // Enable kitty keyboard enhancement so Shift+Enter is reported distinctly from Enter.
+    // Push unconditionally — terminals that don't support it ignore the sequence.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+
+    execute!(
+        stdout,
+        terminal::Clear(terminal::ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    draw::print_logo(&mut stdout)?;
+    // Jump cursor so the live area (separator + input + status = 3 rows) sits at the
+    // visible bottom. LOGO_ROWS + 1 is the minimum safe row below the logo.
+    const LOGO_ROWS: u16 = 6;
+    let (_, height) = terminal::size()?;
+    let live_start = height.saturating_sub(3).max(LOGO_ROWS + 1);
+    execute!(stdout, cursor::MoveTo(0, live_start))?;
+
+    let result = run_loop(&mut stdout).await;
+
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    disable_raw_mode()?;
+    // Move past the live area so the shell prompt appears below it.
+    execute!(stdout, Print("\r\n"))?;
+
     result
 }
 
-fn setup() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
-}
-
-fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    Ok(())
-}
-
-async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+async fn run_loop(stdout: &mut Stdout) -> Result<()> {
     let mut app = App::new();
     let mut events = EventStream::new();
     let mut tick = time::interval(Duration::from_millis(16));
     let mut inference_rx: Option<mpsc::Receiver<AppEvent>> = None;
 
+    // Initial render — no clear needed on first draw.
+    app.live_lines_to_top = draw::render_live(stdout, &app)?;
+
     while app.running {
         tokio::select! {
             _ = tick.tick() => {
-                terminal.draw(|f| draw::draw(f, &app))?;
+                redraw(stdout, &mut app)?;
             }
             Some(Ok(event)) = events.next() => {
                 if let Event::Key(key) = event
-                    && let Some(rx) = handle_key(&mut app, key)
+                    && key.kind == KeyEventKind::Press
+                    && let Some(rx) = handle_key(stdout, &mut app, key)?
                 {
                     inference_rx = Some(rx);
                 }
             }
             Some(ev) = recv_inference(&mut inference_rx) => {
-                handle_app_event(&mut app, ev, &mut inference_rx);
+                handle_app_event(stdout, &mut app, ev, &mut inference_rx)?;
             }
         }
     }
@@ -69,7 +91,6 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(
     Ok(())
 }
 
-/// Returns `pending()` when there is no active receiver, keeping the select! arm dormant.
 async fn recv_inference(rx: &mut Option<mpsc::Receiver<AppEvent>>) -> Option<AppEvent> {
     match rx {
         Some(r) => r.recv().await,
@@ -77,32 +98,64 @@ async fn recv_inference(rx: &mut Option<mpsc::Receiver<AppEvent>>) -> Option<App
     }
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Option<mpsc::Receiver<AppEvent>> {
+fn redraw(stdout: &mut Stdout, app: &mut App) -> Result<()> {
+    draw::clear_live(stdout, app.live_lines_to_top)?;
+    app.live_lines_to_top = draw::render_live(stdout, app)?;
+    Ok(())
+}
+
+fn handle_key(
+    stdout: &mut Stdout,
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Option<mpsc::Receiver<AppEvent>>> {
     match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+        (KeyCode::Char('q'), KeyModifiers::CONTROL)
+        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.running = false;
-            None
+            Ok(None)
         }
-        (KeyCode::Enter, _) => submit_message(app),
+        // Shift+Enter: proper kitty-protocol terminals send Enter+SHIFT; iTerm2 (and many
+        // others) send raw LF (0x0A), which crossterm decodes as Ctrl+J.
+        (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            app.input.push('\n');
+            redraw(stdout, app)?;
+            Ok(None)
+        }
+        (KeyCode::Enter, _) => submit_message(stdout, app),
         (KeyCode::Backspace, _) => {
             app.input.pop();
-            None
+            redraw(stdout, app)?;
+            Ok(None)
+        }
+        (KeyCode::Up, _) => {
+            // Arrow keys scroll the terminal's native scrollback — no app handling needed.
+            Ok(None)
         }
         (KeyCode::Char(c), _) => {
             app.input.push(c);
-            None
+            redraw(stdout, app)?;
+            Ok(None)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
-fn submit_message(app: &mut App) -> Option<mpsc::Receiver<AppEvent>> {
+fn submit_message(stdout: &mut Stdout, app: &mut App) -> Result<Option<mpsc::Receiver<AppEvent>>> {
     let text = app.input.trim().to_string();
     if text.is_empty() {
-        return None;
+        return Ok(None);
     }
     app.input.clear();
+
+    // Commit user message to stdout permanently.
+    draw::clear_live(stdout, app.live_lines_to_top)?;
+    draw::commit_user(stdout, &text)?;
+
     app.messages.push(ChatMessage::User(text.clone()));
+
+    // Render fresh live area (empty input, no streaming yet).
+    app.live_lines_to_top = draw::render_live(stdout, app)?;
 
     let msg = ChatCompletionRequestUserMessageArgs::default()
         .content(text)
@@ -110,32 +163,54 @@ fn submit_message(app: &mut App) -> Option<mpsc::Receiver<AppEvent>> {
         .expect("user message always valid");
     let messages = vec![ChatCompletionRequestMessage::User(msg)];
 
-    Some(inference::spawn(
+    Ok(Some(inference::spawn(
         app.client.clone(),
         messages,
-        vec![],
+        crate::tools::tool_schemas(),
         app.config.tool_approval.clone(),
-    ))
+    )))
 }
 
 fn handle_app_event(
+    stdout: &mut Stdout,
     app: &mut App,
     event: AppEvent,
     inference_rx: &mut Option<mpsc::Receiver<AppEvent>>,
-) {
+) -> Result<()> {
     match event {
-        AppEvent::Token(delta) => match app.messages.last_mut() {
-            Some(ChatMessage::Agent(text)) => text.push_str(&delta),
-            _ => app.messages.push(ChatMessage::Agent(delta)),
-        },
+        AppEvent::Token(delta) => {
+            app.streaming_text.push_str(&delta);
+            redraw(stdout, app)?;
+        }
         AppEvent::ToolCall { name, args, .. } => {
+            // Flush any streamed thinking text, then commit the tool call.
+            draw::clear_live(stdout, app.live_lines_to_top)?;
+            draw::commit_agent(stdout, &app.streaming_text)?;
+            app.streaming_text.clear();
+
+            draw::commit_tool_call(stdout, &name, &args)?;
             app.messages.push(ChatMessage::ToolCall { name, args });
+
+            app.live_lines_to_top = draw::render_live(stdout, app)?;
         }
         AppEvent::ToolResult { name, content } => {
+            draw::clear_live(stdout, app.live_lines_to_top)?;
+            draw::commit_tool_result(stdout, &name, &content)?;
             app.messages.push(ChatMessage::ToolResult { name, content });
+
+            app.live_lines_to_top = draw::render_live(stdout, app)?;
         }
         AppEvent::Done => {
+            // Commit the final agent response.
+            draw::clear_live(stdout, app.live_lines_to_top)?;
+            if !app.streaming_text.is_empty() {
+                draw::commit_agent(stdout, &app.streaming_text)?;
+                app.messages
+                    .push(ChatMessage::Agent(std::mem::take(&mut app.streaming_text)));
+            }
+            app.live_lines_to_top = draw::render_live(stdout, app)?;
             *inference_rx = None;
         }
     }
+    Ok(())
 }
