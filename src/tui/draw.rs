@@ -1,71 +1,256 @@
-use ratatui::{
-    Frame,
-    layout::{Constraint, Layout},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+use std::io::{Stdout, Write};
+
+use crossterm::{
+    cursor, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{self, ClearType},
 };
 
 use crate::app::{App, ChatMessage};
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let [conv_area, input_area, status_area] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+const INDENT: &str = "      ";
+const TRUNCATE_AT: usize = 120;
 
-    let lines: Vec<Line> = app
-        .messages
-        .iter()
-        .map(|msg| match msg {
-            ChatMessage::User(text) => Line::from(vec![
-                Span::styled("You  ", Style::default().fg(Color::Green)),
-                Span::raw(text.as_str()),
-            ]),
-            ChatMessage::Agent(text) => Line::from(vec![
-                Span::styled("Agent", Style::default().fg(Color::Cyan)),
-                Span::raw(format!(" {text}")),
-            ]),
-            ChatMessage::ToolCall { name, args } => Line::from(vec![
-                Span::styled("  →  ", Style::default().fg(Color::Yellow)),
-                Span::styled(name.as_str(), Style::default().fg(Color::Yellow)),
-                Span::raw(format!("  {args}")),
-            ]),
-            ChatMessage::ToolResult { name, content } => Line::from(vec![
-                Span::styled("  ←  ", Style::default().fg(Color::Magenta)),
-                Span::styled(name.as_str(), Style::default().fg(Color::Magenta)),
-                Span::raw(format!("  {content}")),
-            ]),
-        })
-        .collect();
+// ── live area ─────────────────────────────────────────────────────────────────
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(" Axon "))
-            .wrap(Wrap { trim: false }),
-        conv_area,
-    );
+/// Move cursor to the top of the live area and clear everything below.
+/// Must be called before render_live on every redraw after the first.
+/// Does NOT flush — caller must flush after the subsequent render_live to avoid
+/// a blank-frame flash between clear and repaint.
+pub fn clear_live(stdout: &mut Stdout, lines_to_top: u16) -> std::io::Result<()> {
+    queue!(stdout, cursor::Hide, cursor::MoveToColumn(0))?;
+    if lines_to_top > 0 {
+        queue!(stdout, cursor::MoveUp(lines_to_top))?;
+    }
+    queue!(stdout, terminal::Clear(ClearType::FromCursorDown))
+}
 
-    frame.render_widget(
-        Paragraph::new(format!(" > {}", app.input)).block(Block::bordered()),
-        input_area,
-    );
+/// Render the live area (streaming text + separator + input + status).
+/// Assumes the cursor is at the start of the live area (col 0).
+/// Leaves the cursor on the input line for display.
+/// Returns the new `live_lines_to_top` for the next clear_live call.
+pub fn render_live(stdout: &mut Stdout, app: &App) -> std::io::Result<u16> {
+    let (width, _) = terminal::size()?;
+    let mut streaming_lines = 0u16;
 
+    // Streaming agent text
+    if !app.streaming_text.is_empty() {
+        let mut parts = app.streaming_text.split('\n');
+        if let Some(first) = parts.next() {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Cyan),
+                SetAttribute(Attribute::Bold),
+                Print("Agent "),
+                SetAttribute(Attribute::Reset),
+                ResetColor,
+                Print(first),
+                Print("\r\n"),
+            )?;
+            streaming_lines += 1;
+        }
+        for cont in parts {
+            queue!(stdout, Print(INDENT), Print(cont), Print("\r\n"))?;
+            streaming_lines += 1;
+        }
+    }
+
+    // Separator
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print("─".repeat(width as usize)),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+
+    // Input line (multiline-aware)
+    let input_parts: Vec<&str> = app.input.split('\n').collect();
+    let input_line_count = input_parts.len() as u16;
+    queue!(
+        stdout,
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold),
+        Print("> "),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print(input_parts[0]),
+        Print("\r\n"),
+    )?;
+    for cont in &input_parts[1..] {
+        queue!(stdout, Print("  "), Print(cont), Print("\r\n"))?;
+    }
+
+    // Status line — last line, no trailing \r\n
     let backend = &app.config.backend;
     let model = if backend.model.is_empty() {
-        "(no model set)".to_string()
+        "(no model)".to_string()
     } else {
         backend.model.clone()
     };
-    frame.render_widget(
-        Paragraph::new(format!(
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!(
             "  {}  │  {}  │  tools: {}",
             backend.base_url,
             model,
             app.config.tool_approval.as_str()
         )),
-        status_area,
-    );
+        ResetColor,
+    )?;
+
+    // Move cursor back up to the last input line for display.
+    let last_input = input_parts.last().copied().unwrap_or("");
+    let cursor_col = 2 + last_input.len() as u16;
+    queue!(
+        stdout,
+        cursor::MoveUp(1),
+        cursor::MoveToColumn(cursor_col),
+        cursor::Show,
+    )?;
+    stdout.flush()?;
+
+    // lines_to_top = streaming lines + 1 (separator) + extra input lines above cursor.
+    Ok(streaming_lines + input_line_count)
+}
+
+// ── startup ───────────────────────────────────────────────────────────────────
+
+pub fn print_logo(stdout: &mut Stdout) -> std::io::Result<()> {
+    let lines = [
+        " █████╗ ██╗  ██╗ ██████╗ ███╗   ██╗",
+        "██╔══██╗╚██╗██╔╝██╔═══██╗████╗  ██║",
+        "███████║ ╚███╔╝ ██║   ██║██╔██╗ ██║",
+        "██╔══██║ ██╔██╗ ██║   ██║██║╚██╗██║",
+        "██║  ██║██╔╝ ██╗╚██████╔╝██║ ╚████║",
+        "╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
+    ];
+    for line in &lines {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print(line),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print("\r\n"),
+        )?;
+    }
+    stdout.flush()
+}
+
+// ── committed output ──────────────────────────────────────────────────────────
+
+pub fn commit_user(stdout: &mut Stdout, text: &str) -> std::io::Result<()> {
+    let mut parts = text.split('\n');
+    if let Some(first) = parts.next() {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Green),
+            SetAttribute(Attribute::Bold),
+            Print("You   "),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print(first),
+            Print("\r\n"),
+        )?;
+    }
+    for cont in parts {
+        queue!(stdout, Print(INDENT), Print(cont), Print("\r\n"))?;
+    }
+    stdout.flush()
+}
+
+pub fn commit_agent(stdout: &mut Stdout, text: &str) -> std::io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut parts = text.split('\n');
+    if let Some(first) = parts.next() {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print("Agent "),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print(first),
+            Print("\r\n"),
+        )?;
+    }
+    for cont in parts {
+        queue!(stdout, Print(INDENT), Print(cont), Print("\r\n"))?;
+    }
+    stdout.flush()
+}
+
+pub fn commit_tool_call(
+    stdout: &mut Stdout,
+    name: &str,
+    args: &serde_json::Value,
+) -> std::io::Result<()> {
+    let args_str = serde_json::to_string(args).unwrap_or_default();
+    let args_display = truncate(&args_str, TRUNCATE_AT);
+    queue!(
+        stdout,
+        SetForegroundColor(Color::Yellow),
+        Print("  →   "),
+        SetAttribute(Attribute::Bold),
+        Print(name),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("  {args_display}")),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+    stdout.flush()
+}
+
+pub fn commit_tool_result(stdout: &mut Stdout, name: &str, content: &str) -> std::io::Result<()> {
+    let first_line = content.lines().next().unwrap_or("");
+    let truncated = truncate(first_line, TRUNCATE_AT);
+    let suffix = if content.contains('\n') || content.len() > TRUNCATE_AT {
+        " …"
+    } else {
+        ""
+    };
+    queue!(
+        stdout,
+        SetForegroundColor(Color::Magenta),
+        Print("  ←   "),
+        SetAttribute(Attribute::Bold),
+        Print(name),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("  {truncated}{suffix}")),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+    stdout.flush()
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn truncate(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        s
+    } else {
+        let mut idx = max_chars;
+        while !s.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        &s[..idx]
+    }
+}
+
+// ── kept for inference context display (unused in rendering) ──────────────────
+#[allow(dead_code)]
+pub fn format_message(msg: &ChatMessage) -> String {
+    match msg {
+        ChatMessage::User(t) => format!("You   {t}"),
+        ChatMessage::Agent(t) => format!("Agent {t}"),
+        ChatMessage::ToolCall { name, args } => format!("  →   {name}  {args}"),
+        ChatMessage::ToolResult { name, content } => format!("  ←   {name}  {content}"),
+    }
 }
