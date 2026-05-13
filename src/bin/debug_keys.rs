@@ -4,8 +4,8 @@
 /// Usage:  cargo run --bin debug_keys
 use crossterm::{
     event::{
-        read, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        read,
     },
     execute,
     style::Print,

@@ -7,8 +7,8 @@ use async_openai::types::chat::{
 use crossterm::{
     cursor,
     event::{
-        Event, EventStream, KeyboardEnhancementFlags, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -37,7 +37,11 @@ pub async fn run() -> Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
 
-    execute!(stdout, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
+    execute!(
+        stdout,
+        terminal::Clear(terminal::ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
     draw::print_logo(&mut stdout)?;
     // Jump cursor so the live area (separator + input + status = 3 rows) sits at the
     // visible bottom. LOGO_ROWS + 1 is the minimum safe row below the logo.
@@ -137,10 +141,7 @@ fn handle_key(
     }
 }
 
-fn submit_message(
-    stdout: &mut Stdout,
-    app: &mut App,
-) -> Result<Option<mpsc::Receiver<AppEvent>>> {
+fn submit_message(stdout: &mut Stdout, app: &mut App) -> Result<Option<mpsc::Receiver<AppEvent>>> {
     let text = app.input.trim().to_string();
     if text.is_empty() {
         return Ok(None);
