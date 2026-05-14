@@ -1,11 +1,17 @@
 /// Interactive approval flow demo.
 /// Run with: cargo run --example diff_approve_demo
 ///
-/// Renders the full diff, waits for y/n, then shows what lands in the log.
+/// Renders the full diff + prompt, waits for y/n, then:
+///   y — clears the full diff and replaces it with the compact committed version
+///   n — clears the full diff and leaves the terminal clean
 use std::io::{Read, Write, stdout};
 
 use axon::tui::diff::DiffRenderer;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::{
+    cursor,
+    execute,
+    terminal::{self, disable_raw_mode, enable_raw_mode},
+};
 
 const BEFORE: &str = r#"fn greet(name: &str) {
     println!("hello, {}", name);
@@ -36,11 +42,12 @@ fn main() {
     let mut out = stdout();
     let renderer = DiffRenderer::new();
 
-    renderer
+    let diff_lines = renderer
         .render_full(&mut out, "src/main.rs", BEFORE, AFTER)
         .expect("render_full");
 
-    write!(out, "\r\n  Accept this diff? [y/n] \r\n").unwrap();
+    // Approval prompt adds 2 lines after the diff.
+    write!(out, "\r\n  Accept this diff? [y/n]\r\n").unwrap();
     out.flush().unwrap();
 
     let accepted = loop {
@@ -53,16 +60,20 @@ fn main() {
         }
     };
 
-    disable_raw_mode().ok();
-
-    write!(out, "\r\n").unwrap();
+    // Clear the full diff + prompt, then render the outcome from the same position.
+    execute!(
+        out,
+        cursor::MoveUp(diff_lines + 2),
+        terminal::Clear(terminal::ClearType::FromCursorDown),
+    )
+    .unwrap();
 
     if accepted {
         renderer
             .render_committed(&mut out, "src/main.rs", BEFORE, AFTER)
             .expect("render_committed");
-    } else {
-        writeln!(out, "\r  (diff rejected — nothing committed)\r").unwrap();
-        out.flush().unwrap();
     }
+    // rejected: nothing printed, terminal is clean
+
+    disable_raw_mode().ok();
 }
