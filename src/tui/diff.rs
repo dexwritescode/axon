@@ -111,13 +111,13 @@ impl DiffRenderer {
 
             let (bg, marker_color, marker, ln) = match tag {
                 ChangeTag::Delete => (
-                    Color::Rgb { r: 60, g: 20, b: 20 },
+                    Color::Rgb { r: 80, g: 25, b: 25 },
                     Color::Red,
                     '-',
                     format!("{:>4}       ", old_line),
                 ),
                 ChangeTag::Insert => (
-                    Color::Rgb { r: 20, g: 50, b: 20 },
+                    Color::Rgb { r: 25, g: 70, b: 25 },
                     Color::Green,
                     '+',
                     format!("      {:>4} ", new_line),
