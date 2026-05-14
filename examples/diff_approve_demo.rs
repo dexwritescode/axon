@@ -8,8 +8,7 @@ use std::io::{Read, Write, stdout};
 
 use axon::tui::diff::DiffRenderer;
 use crossterm::{
-    cursor,
-    execute,
+    cursor, execute,
     terminal::{self, disable_raw_mode, enable_raw_mode},
 };
 
