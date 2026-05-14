@@ -1,14 +1,17 @@
-/// Approval flow demo for the diff renderer.
+/// Interactive approval flow demo.
 /// Run with: cargo run --example diff_approve_demo
 ///
-/// Shows three sequential scenarios without requiring user input:
-///   1. Diff arrives   — full diff + [y/n] approval prompt
-///   2. User presses y — compact diff committed to permanent log
-///   3. User presses n — diff discarded, nothing committed
+/// Shows the full diff + [y/n] prompt, waits for a keypress, then either
+/// commits the compact diff to the log (y) or discards it silently (n).
 use std::io::{Write, stdout};
 
 use axon::{app::App, tui::diff::DiffRenderer, tui::draw};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::{
+    cursor,
+    event::{read, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 
 const BEFORE: &str = r#"fn greet(name: &str) {
     println!("hello, {}", name);
@@ -34,40 +37,46 @@ fn main() {
 }
 "#;
 
-fn banner(out: &mut impl Write, label: &str) {
-    let bar = "─".repeat(60);
-    writeln!(out, "\r\n{bar}\r\n  {label}\r\n{bar}\r").unwrap();
-}
-
 fn main() {
-    let raw = enable_raw_mode().is_ok();
+    enable_raw_mode().expect("raw mode required");
     let mut out = stdout();
     let renderer = DiffRenderer::new();
     let app = App::new();
 
-    // ── scenario 1: diff arrives ───────────────────────────────────────────────
-    banner(&mut out, "1/3  diff arrives — waiting for y/n");
-
     let diff_lines = renderer
         .render_full(&mut out, "src/main.rs", BEFORE, AFTER)
         .expect("render_full");
+    let live_lines_to_top = draw::render_approval(&mut out, &app, diff_lines)
+        .expect("render_approval");
 
-    draw::render_approval(&mut out, &app, diff_lines).expect("render_approval");
-
-    // ── scenario 2: user presses y ────────────────────────────────────────────
-    banner(&mut out, "2/3  user pressed y — committed to log");
-
-    renderer
-        .render_committed(&mut out, "src/main.rs", BEFORE, AFTER)
-        .expect("render_committed");
-
-    // ── scenario 3: user presses n ────────────────────────────────────────────
-    banner(&mut out, "3/3  user pressed n — rejected, nothing committed");
-
-    writeln!(out, "\r  (diff discarded — no output)\r").unwrap();
-    out.flush().unwrap();
-
-    if raw {
-        disable_raw_mode().ok();
+    loop {
+        let Ok(Event::Key(key)) = read() else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                draw::clear_live(&mut out, live_lines_to_top).expect("clear");
+                renderer
+                    .render_committed(&mut out, "src/main.rs", BEFORE, AFTER)
+                    .expect("render_committed");
+                execute!(out, cursor::Show).ok();
+                break;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                draw::clear_live(&mut out, live_lines_to_top).expect("clear");
+                writeln!(out, "\r  (diff rejected)\r").unwrap();
+                out.flush().unwrap();
+                execute!(out, cursor::Show).ok();
+                break;
+            }
+            KeyCode::Char('q') | KeyCode::Char('c') => {
+                execute!(out, cursor::Show).ok();
+                break;
+            }
+            _ => {}
+        }
     }
+
+    disable_raw_mode().ok();
 }
