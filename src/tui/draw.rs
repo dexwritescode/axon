@@ -140,6 +140,70 @@ pub fn print_logo(stdout: &mut Stdout) -> std::io::Result<()> {
     stdout.flush()
 }
 
+// ── approval prompt ───────────────────────────────────────────────────────────
+
+/// Render the separator + [y/n] prompt + status below a diff that is waiting
+/// for user approval. Call immediately after `DiffRenderer::render_full`.
+/// Returns the new `live_lines_to_top` for the next `clear_live` call.
+pub fn render_approval(stdout: &mut Stdout, app: &App, diff_lines: u16) -> std::io::Result<u16> {
+    let (width, _) = terminal::size()?;
+
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print("─".repeat(width as usize)),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+
+    queue!(
+        stdout,
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold),
+        Print("  [y]"),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey),
+        Print(" accept    "),
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold),
+        Print("[n]"),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey),
+        Print(" reject"),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+
+    let backend = &app.config.backend;
+    let model = if backend.model.is_empty() {
+        "(no model)".to_string()
+    } else {
+        backend.model.clone()
+    };
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!(
+            "  {}  │  {}  │  tools: {}",
+            backend.base_url,
+            model,
+            app.config.tool_approval.as_str()
+        )),
+        ResetColor,
+    )?;
+
+    queue!(
+        stdout,
+        cursor::MoveUp(1),
+        cursor::MoveToColumn(2),
+        cursor::Show
+    )?;
+    stdout.flush()?;
+
+    // diff_lines are above the separator; cursor is on the prompt line (separator + prompt above).
+    Ok(diff_lines + 1)
+}
+
 // ── committed output ──────────────────────────────────────────────────────────
 
 pub fn commit_user(stdout: &mut Stdout, text: &str) -> std::io::Result<()> {
