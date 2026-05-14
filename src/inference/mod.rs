@@ -141,7 +141,7 @@ pub(crate) async fn run_turn(
                     return Ok(tool_calls);
                 }
             }
-            AppEvent::Done | AppEvent::ToolResult { .. } => {}
+            AppEvent::Done | AppEvent::ToolResult { .. } | AppEvent::FileDiff { .. } => {}
         }
     }
 

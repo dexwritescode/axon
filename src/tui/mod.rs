@@ -24,6 +24,7 @@ use crate::{
     inference,
 };
 
+pub mod diff;
 pub mod draw;
 
 pub async fn run() -> Result<()> {
@@ -197,6 +198,20 @@ fn handle_app_event(
             draw::clear_live(stdout, app.live_lines_to_top)?;
             draw::commit_tool_result(stdout, &name, &content)?;
             app.messages.push(ChatMessage::ToolResult { name, content });
+
+            app.live_lines_to_top = draw::render_live(stdout, app)?;
+        }
+        AppEvent::FileDiff { path, before, after } => {
+            draw::clear_live(stdout, app.live_lines_to_top)?;
+            draw::commit_agent(stdout, &app.streaming_text)?;
+            app.streaming_text.clear();
+
+            let renderer = diff::DiffRenderer::new();
+            renderer.render_committed(stdout, &path, &before, &after)?;
+            app.messages.push(ChatMessage::ToolCall {
+                name: format!("edit {path}"),
+                args: serde_json::Value::Null,
+            });
 
             app.live_lines_to_top = draw::render_live(stdout, app)?;
         }

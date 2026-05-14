@@ -11,5 +11,10 @@ pub enum AppEvent {
         name: String,
         content: String,
     },
+    FileDiff {
+        path: String,
+        before: String,
+        after: String,
+    },
     Done,
 }
