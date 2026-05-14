@@ -111,13 +111,21 @@ impl DiffRenderer {
 
             let (bg, marker_color, marker, ln) = match tag {
                 ChangeTag::Delete => (
-                    Color::Rgb { r: 80, g: 25, b: 25 },
+                    Color::Rgb {
+                        r: 80,
+                        g: 25,
+                        b: 25,
+                    },
                     Color::Red,
                     '-',
                     format!("{:>4}       ", old_line),
                 ),
                 ChangeTag::Insert => (
-                    Color::Rgb { r: 25, g: 70, b: 25 },
+                    Color::Rgb {
+                        r: 25,
+                        g: 70,
+                        b: 25,
+                    },
                     Color::Green,
                     '+',
                     format!("      {:>4} ", new_line),
@@ -180,7 +188,15 @@ fn highlight_line(
             .into_iter()
             .map(|(style, text)| (style.foreground, text.to_owned()))
             .collect(),
-        Err(_) => vec![(SynColor { r: 200, g: 200, b: 200, a: 255 }, line.to_owned())],
+        Err(_) => vec![(
+            SynColor {
+                r: 200,
+                g: 200,
+                b: 200,
+                a: 255,
+            },
+            line.to_owned(),
+        )],
     }
 }
 
@@ -188,6 +204,10 @@ fn syn_to_crossterm(c: SynColor) -> Option<Color> {
     if c.a == 0 {
         None
     } else {
-        Some(Color::Rgb { r: c.r, g: c.g, b: c.b })
+        Some(Color::Rgb {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+        })
     }
 }

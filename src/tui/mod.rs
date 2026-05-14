@@ -141,9 +141,7 @@ fn handle_key(
                 }
                 app.live_lines_to_top = draw::render_live(stdout, app)?;
             }
-            KeyCode::Char('q') | KeyCode::Char('c')
-                if key.modifiers == KeyModifiers::CONTROL =>
-            {
+            KeyCode::Char('q') | KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 app.running = false;
             }
             _ => {}
@@ -242,12 +240,21 @@ fn handle_app_event(
 
             app.live_lines_to_top = draw::render_live(stdout, app)?;
         }
-        AppEvent::FileDiff { path, before, after, approval } => {
+        AppEvent::FileDiff {
+            path,
+            before,
+            after,
+            approval,
+        } => {
             draw::clear_live(stdout, app.live_lines_to_top)?;
             draw::commit_agent(stdout, &app.streaming_text)?;
             app.streaming_text.clear();
 
-            app.pending_diff = Some(PendingDiff { path, before, after });
+            app.pending_diff = Some(PendingDiff {
+                path,
+                before,
+                after,
+            });
             app.pending_approval = approval;
 
             let pd = app.pending_diff.as_ref().unwrap();

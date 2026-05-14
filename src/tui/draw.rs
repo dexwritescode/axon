@@ -192,7 +192,12 @@ pub fn render_approval(stdout: &mut Stdout, app: &App, diff_lines: u16) -> std::
         ResetColor,
     )?;
 
-    queue!(stdout, cursor::MoveUp(1), cursor::MoveToColumn(2), cursor::Show)?;
+    queue!(
+        stdout,
+        cursor::MoveUp(1),
+        cursor::MoveToColumn(2),
+        cursor::Show
+    )?;
     stdout.flush()?;
 
     // diff_lines are above the separator; cursor is on the prompt line (separator + prompt above).

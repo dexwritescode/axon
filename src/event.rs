@@ -29,12 +29,26 @@ impl PartialEq for AppEvent {
         match (self, other) {
             (Self::Token(a), Self::Token(b)) => a == b,
             (
-                Self::ToolCall { id: a, name: b, args: c },
-                Self::ToolCall { id: d, name: e, args: f },
+                Self::ToolCall {
+                    id: a,
+                    name: b,
+                    args: c,
+                },
+                Self::ToolCall {
+                    id: d,
+                    name: e,
+                    args: f,
+                },
             ) => a == d && b == e && c == f,
             (
-                Self::ToolResult { name: a, content: b },
-                Self::ToolResult { name: c, content: d },
+                Self::ToolResult {
+                    name: a,
+                    content: b,
+                },
+                Self::ToolResult {
+                    name: c,
+                    content: d,
+                },
             ) => a == c && b == d,
             (Self::Done, Self::Done) => true,
             _ => false,
