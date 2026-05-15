@@ -4,10 +4,10 @@ use async_openai::types::chat::{
 };
 use axon::client::AxonClient;
 use axon::config::{BackendConfig, ToolApproval};
-use tokio_util::sync::CancellationToken;
 use axon::event::AppEvent;
 use futures::StreamExt;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -263,5 +263,8 @@ async fn cancel_mid_stream_exits_without_hang() {
         while rx.recv().await.is_some() {}
     })
     .await;
-    assert!(closed.is_ok(), "inference task did not exit within 500ms after cancel");
+    assert!(
+        closed.is_ok(),
+        "inference task did not exit within 500ms after cancel"
+    );
 }
