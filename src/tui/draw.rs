@@ -294,6 +294,17 @@ pub fn commit_tool_result(stdout: &mut Stdout, name: &str, content: &str) -> std
     stdout.flush()
 }
 
+pub fn commit_cancelled(stdout: &mut Stdout) -> std::io::Result<()> {
+    queue!(
+        stdout,
+        SetForegroundColor(Color::Red),
+        Print("  ✗   cancelled"),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+    stdout.flush()
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn truncate(s: &str, max_chars: usize) -> &str {

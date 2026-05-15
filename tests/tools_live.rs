@@ -274,8 +274,15 @@ async fn run_agent(
     working_dir: &Path,
 ) {
     use axon::config::ToolApproval;
-    let mut rx =
-        axon::inference::spawn_in(client, messages, tools, ToolApproval::Allow, working_dir);
+    use tokio_util::sync::CancellationToken;
+    let mut rx = axon::inference::spawn_in(
+        client,
+        messages,
+        tools,
+        ToolApproval::Allow,
+        working_dir,
+        CancellationToken::new(),
+    );
     while let Some(ev) = rx.recv().await {
         let done = matches!(ev, AppEvent::Done);
         let _ = tx.send(ev).await;

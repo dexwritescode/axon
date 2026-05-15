@@ -18,6 +18,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     app::{App, ChatMessage, PendingDiff},
     event::AppEvent,
@@ -152,7 +154,15 @@ fn handle_key(
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::CONTROL)
         | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            app.running = false;
+            if let Some(cancel) = app.cancel_inference.take() {
+                cancel.cancel();
+                draw::clear_live(stdout, app.live_lines_to_top)?;
+                draw::commit_cancelled(stdout)?;
+                app.streaming_text.clear();
+                app.live_lines_to_top = draw::render_live(stdout, app)?;
+            } else {
+                app.running = false;
+            }
             Ok(None)
         }
         // Shift+Enter: proper kitty-protocol terminals send Enter+SHIFT; iTerm2 (and many
@@ -203,11 +213,15 @@ fn submit_message(stdout: &mut Stdout, app: &mut App) -> Result<Option<mpsc::Rec
         .expect("user message always valid");
     let messages = vec![ChatCompletionRequestMessage::User(msg)];
 
+    let cancel = CancellationToken::new();
+    app.cancel_inference = Some(cancel.clone());
+
     Ok(Some(inference::spawn(
         app.client.clone(),
         messages,
         crate::tools::tool_schemas(),
         app.config.tool_approval.clone(),
+        cancel,
     )))
 }
 
@@ -268,6 +282,7 @@ fn handle_app_event(
                 app.messages
                     .push(ChatMessage::Agent(std::mem::take(&mut app.streaming_text)));
             }
+            app.cancel_inference = None;
             app.live_lines_to_top = draw::render_live(stdout, app)?;
             *inference_rx = None;
         }

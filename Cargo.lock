@@ -139,6 +139,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "two-face",
  "wiremock",
 ]
