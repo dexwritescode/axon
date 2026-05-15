@@ -1,0 +1,61 @@
+name: Release Binary
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  check-release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Check for new release
+        id: tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 \
+            --json tagName,publishedAt \
+            | jq -r --arg t "${{ github.event.workflow_run.run_started_at }}" \
+            '[.[] | select(.publishedAt > $t)] | .[0].tagName // ""')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-binary:
+    needs: check-release
+    if: needs.check-release.outputs.tag != ''
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: macos-26
+            suffix: macos-arm64
+          - os: ubuntu-latest
+            suffix: linux-amd64
+          - os: ubuntu-24.04-arm
+            suffix: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.suffix }}
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Upload binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-release.outputs.tag }}
+        run: |
+          BINARY="axon-${TAG}-${{ matrix.suffix }}"
+          cp target/release/axon "$BINARY"
+          gh release upload "$TAG" "$BINARY"
