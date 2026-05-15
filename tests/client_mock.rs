@@ -3,7 +3,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent,
 };
 use axon::client::AxonClient;
-use axon::config::BackendConfig;
+use axon::config::{BackendConfig, ToolApproval};
+use tokio_util::sync::CancellationToken;
 use axon::event::AppEvent;
 use futures::StreamExt;
 use serde_json::json;
@@ -218,4 +219,49 @@ async fn mixed_token_and_tool_call() {
             AppEvent::Done,
         ]
     );
+}
+
+#[tokio::test]
+async fn cancel_mid_stream_exits_without_hang() {
+    use tokio::time::{Duration, timeout};
+
+    let server = MockServer::start().await;
+
+    // One token then no [DONE] — the stream hangs indefinitely.
+    let mut body = format!("data: {}\n\n", chunk("hello"));
+    body.push_str("data: [INCOMPLETE]");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_bytes(body.into_bytes()),
+        )
+        .mount(&server)
+        .await;
+
+    let cancel = CancellationToken::new();
+    let mut rx = axon::inference::spawn_in(
+        AxonClient::new(&backend(&format!("{}/v1", server.uri()))),
+        vec![user_message("test")],
+        vec![],
+        ToolApproval::Allow,
+        std::env::temp_dir(),
+        cancel.clone(),
+    );
+
+    // Wait for at least one token so the stream has started.
+    let first = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for first token");
+    assert!(matches!(first, Some(AppEvent::Token(_))));
+
+    // Cancel and assert the channel closes promptly.
+    cancel.cancel();
+    let closed = timeout(Duration::from_millis(500), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "inference task did not exit within 500ms after cancel");
 }

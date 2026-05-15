@@ -1,4 +1,5 @@
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::{client::AxonClient, config::Config};
 
@@ -40,6 +41,8 @@ pub struct App {
     /// Oneshot to signal the inference task when the user decides. `None` when
     /// the diff was sent in allow mode (auto-commit, no blocking).
     pub pending_approval: Option<oneshot::Sender<bool>>,
+    /// Cancel token for the active inference task. `None` when idle.
+    pub cancel_inference: Option<CancellationToken>,
 }
 
 impl Default for App {
@@ -62,6 +65,7 @@ impl App {
             live_lines_to_top: 1,
             pending_diff: None,
             pending_approval: None,
+            cancel_inference: None,
         }
     }
 }

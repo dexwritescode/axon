@@ -8,6 +8,7 @@ use async_openai::types::chat::{
 use futures::StreamExt;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{client::AxonClient, config::ToolApproval, event::AppEvent, tools::ToolExecutor};
 
@@ -19,6 +20,7 @@ pub fn spawn(
     messages: Vec<ChatCompletionRequestMessage>,
     tools: Vec<ChatCompletionTools>,
     tool_approval: ToolApproval,
+    cancel: CancellationToken,
 ) -> mpsc::Receiver<AppEvent> {
     spawn_in(
         client,
@@ -26,6 +28,7 @@ pub fn spawn(
         tools,
         tool_approval,
         std::env::current_dir().unwrap_or_default(),
+        cancel,
     )
 }
 
@@ -36,11 +39,12 @@ pub fn spawn_in(
     tools: Vec<ChatCompletionTools>,
     _tool_approval: ToolApproval,
     working_dir: impl Into<PathBuf>,
+    cancel: CancellationToken,
 ) -> mpsc::Receiver<AppEvent> {
     let (tx, rx) = mpsc::channel(64);
     let executor = ToolExecutor::new(working_dir);
     tokio::spawn(async move {
-        run(client, messages, tools, tx, executor).await;
+        run(client, messages, tools, tx, executor, cancel).await;
     });
     rx
 }
@@ -51,12 +55,17 @@ async fn run(
     tools: Vec<ChatCompletionTools>,
     tx: mpsc::Sender<AppEvent>,
     executor: ToolExecutor,
+    cancel: CancellationToken,
 ) {
     for _ in 0..MAX_TURNS {
         let stream = client.stream_chat(messages.clone(), tools.clone());
-        let tool_calls = match run_turn(stream, &tx).await {
-            Ok(calls) => calls,
-            Err(_) => break,
+        let tool_calls = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = run_turn(stream, &tx) => match result {
+                Ok(calls) => calls,
+                Err(_) => break,
+            },
         };
 
         if tool_calls.is_empty() {
@@ -217,5 +226,33 @@ mod tests {
         ];
         let result = run_turn(stream::iter(events), &tx).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_during_pending_stream_exits_without_hang() {
+        use futures::stream;
+        use tokio::time::{Duration, timeout};
+        use tokio_util::sync::CancellationToken;
+
+        let cancel = CancellationToken::new();
+        // A stream that never resolves — simulates waiting on the next SSE token.
+        let never_stream = stream::pending::<Result<AppEvent>>();
+
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let (tx, _rx) = mpsc::channel(1);
+            tokio::select! {
+                biased;
+                _ = cancel_clone.cancelled() => {}
+                _ = run_turn(never_stream, &tx) => {}
+            }
+        });
+
+        cancel.cancel();
+
+        timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("task did not exit within 100ms after cancel")
+            .expect("task panicked");
     }
 }
