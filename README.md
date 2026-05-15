@@ -71,6 +71,6 @@ Type your goal and press **Enter**. Use **Shift+Enter** for multi-line input. **
 
 ## What Axon is not
 
-- Not a GUI (that is the [Neurons](https://github.com/dexwritescode/neurons) desktop app)
+- Not a replacement for the `neurons` CLI — `neurons` handles model serving, management, and testing (`neurons server <model>`)
+- Not a GUI — the [Neurons](https://github.com/dexwritescode/neurons) desktop app (macOS) covers that use case
 - Not coupled to any specific model or provider
-- Not a replacement for `nctl` (service management / model testing)
