@@ -1,8 +1,8 @@
-//! End-to-end integration tests for tool execution against a real neuron server.
+//! End-to-end integration tests for tool execution against a real neurons server.
 //! Skipped automatically when AXON_TEST_BASE_URL is not set.
 //!
 //! To run locally:
-//!   neuron server -m mlx-community/Qwen3-8B-4bit --http-port 8080 &
+//!   neurons server -m mlx-community/Qwen3-8B-4bit --http-port 8080 &
 //!   AXON_TEST_BASE_URL=http://127.0.0.1:8080/v1 \
 //!   AXON_TEST_MODEL=mlx-community/Qwen3-8B-4bit \
 //!   cargo test --test tools_live -- --nocapture --test-threads=1
