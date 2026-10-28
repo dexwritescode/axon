@@ -1,17 +1,20 @@
-fn main() {
-    println!("{}", greeting());
-}
+use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeRequest, InitializeResponse};
+use agent_client_protocol::{Agent, Result, Stdio};
 
-fn greeting() -> &'static str {
-    "Hello, world!"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn greeting_is_hello_world() {
-        assert_eq!(greeting(), "Hello, world!");
-    }
+#[tokio::main]
+async fn main() -> Result<()> {
+    Agent
+        .builder()
+        .name("Axon")
+        .on_receive_request(
+            async move |initialize: InitializeRequest, responder, _connection| {
+                responder.respond(
+                    InitializeResponse::new(initialize.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_to(Stdio::new())
+        .await
 }
