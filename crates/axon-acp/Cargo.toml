@@ -1,0 +1,9 @@
+[package]
+name = "axon-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axon-protocol.workspace = true
+agent-client-protocol.workspace = true
