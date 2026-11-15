@@ -30,7 +30,7 @@ pub enum TuiError {
 
 /// Run one session in the terminal until the user quits.
 pub async fn run(factory: &dyn SessionFactory) -> Result<(), TuiError> {
-    let session = factory.new_session()?;
+    let session = factory.new_session(std::env::current_dir()?)?;
     let _terminal = RawTerminal::enter()?;
     run_loop(&mut io::stdout(), session).await
 }
@@ -181,13 +181,16 @@ mod tests {
         let delta = Event::TextDelta {
             text: "Hello".into(),
         };
+        let end = Event::TurnEnded {
+            stop: axon_protocol::StopReason::EndTurn,
+        };
 
         assert_eq!(
             step(&mut app, &commands, Input::Session(Some(delta))).await,
             Some(Vec::new())
         );
         assert_eq!(
-            step(&mut app, &commands, Input::Session(Some(Event::TurnEnded))).await,
+            step(&mut app, &commands, Input::Session(Some(end))).await,
             Some(vec![Committed::Agent("Hello".into())])
         );
     }

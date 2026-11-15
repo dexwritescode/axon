@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use axon_protocol::Event;
+use axon_protocol::{Event, StopReason, ToolStatus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Default)]
@@ -25,6 +25,15 @@ pub(crate) enum Action {
 pub(crate) enum Committed {
     User(String),
     Agent(String),
+    ToolCall {
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        name: String,
+        status: ToolStatus,
+        output: String,
+    },
     Error(String),
 }
 
@@ -68,14 +77,34 @@ impl App {
                 self.streaming_text.push_str(&text);
                 Vec::new()
             }
+            Event::ToolCallStarted { name, args } => {
+                let mut committed = self.take_reply();
+                committed.push(Committed::ToolCall { name, args });
+                committed
+            }
+            Event::ToolCallFinished {
+                name,
+                status,
+                output,
+            } => vec![Committed::ToolResult {
+                name,
+                status,
+                output,
+            }],
             Event::Error { message } => {
                 let mut committed = self.take_reply();
                 committed.push(Committed::Error(message));
                 committed
             }
-            Event::TurnEnded => {
+            Event::TurnEnded { stop } => {
                 self.busy = false;
-                self.take_reply()
+                let mut committed = self.take_reply();
+                if stop == StopReason::MaxTurnRequests {
+                    committed.push(Committed::Error(
+                        "stopped: too many model requests for one prompt".into(),
+                    ));
+                }
+                committed
             }
         }
     }
@@ -112,6 +141,10 @@ mod tests {
     fn delta(text: &str) -> Event {
         Event::TextDelta { text: text.into() }
     }
+
+    const END: Event = Event::TurnEnded {
+        stop: StopReason::EndTurn,
+    };
 
     #[test]
     fn enter_submits_the_trimmed_input_and_marks_busy() {
@@ -196,10 +229,7 @@ mod tests {
         assert!(app.on_event(delta("lo")).is_empty());
         assert_eq!(app.streaming_text, "Hello");
 
-        assert_eq!(
-            app.on_event(Event::TurnEnded),
-            [Committed::Agent("Hello".into())]
-        );
+        assert_eq!(app.on_event(END), [Committed::Agent("Hello".into())]);
         assert_eq!(app.streaming_text, "");
         assert!(!app.busy);
     }
@@ -225,10 +255,54 @@ mod tests {
         let mut app = App::default();
         app.on_event(delta("\n\nHello\n"));
 
+        assert_eq!(app.on_event(END), [Committed::Agent("Hello".into())]);
+    }
+
+    #[test]
+    fn tool_call_commits_the_text_before_it_then_the_call_and_result() {
+        let mut app = App::default();
+        app.on_event(delta("Let me look."));
+
         assert_eq!(
-            app.on_event(Event::TurnEnded),
-            [Committed::Agent("Hello".into())]
+            app.on_event(Event::ToolCallStarted {
+                name: "list_dir".into(),
+                args: "{}".into()
+            }),
+            [
+                Committed::Agent("Let me look.".into()),
+                Committed::ToolCall {
+                    name: "list_dir".into(),
+                    args: "{}".into()
+                }
+            ]
         );
+        assert_eq!(
+            app.on_event(Event::ToolCallFinished {
+                name: "list_dir".into(),
+                status: ToolStatus::Completed,
+                output: "src/\n".into()
+            }),
+            [Committed::ToolResult {
+                name: "list_dir".into(),
+                status: ToolStatus::Completed,
+                output: "src/\n".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn turn_limit_is_explained() {
+        let mut app = App {
+            busy: true,
+            ..App::default()
+        };
+
+        let committed = app.on_event(Event::TurnEnded {
+            stop: StopReason::MaxTurnRequests,
+        });
+
+        assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("too many")));
+        assert!(!app.busy);
     }
 
     #[test]
@@ -238,7 +312,7 @@ mod tests {
             ..App::default()
         };
 
-        assert!(app.on_event(Event::TurnEnded).is_empty());
+        assert!(app.on_event(END).is_empty());
         assert!(!app.busy);
     }
 }

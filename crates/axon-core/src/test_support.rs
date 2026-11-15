@@ -4,7 +4,12 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::model::ModelConfig;
+use std::path::Path;
+
+use axon_protocol::{Command, Event, SessionHandle};
+
+use crate::model::{ModelClient, ModelConfig};
+use crate::turn::Agent;
 
 pub(crate) fn config(base_url: String) -> ModelConfig {
     ModelConfig {
@@ -62,4 +67,67 @@ pub(crate) async fn respond(server: &MockServer, response: ResponseTemplate) {
         .up_to_n_times(1)
         .mount(server)
         .await;
+}
+
+/// A 200 SSE response in which the model makes these `(id, name, args)` tool
+/// calls, each one's arguments split across two chunks.
+pub(crate) fn tool_calls(calls: &[(&str, &str, &str)]) -> ResponseTemplate {
+    let mut chunks = Vec::new();
+    for (index, (id, name, args)) in calls.iter().enumerate() {
+        let (head, tail) = args.split_at(args.len() / 2);
+        chunks.push(chunk(
+            json!({"tool_calls": [{"index": index, "id": id, "type": "function",
+                "function": {"name": name, "arguments": head}}]}),
+            None,
+        ));
+        chunks.push(chunk(
+            json!({"tool_calls": [{"index": index, "function": {"arguments": tail}}]}),
+            None,
+        ));
+    }
+    chunks.push(chunk(json!({}), Some("tool_calls")));
+    sse(&chunks)
+}
+
+/// An agent talking to `server`, working in `cwd`.
+pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
+    Agent {
+        client: ModelClient::new(&config(api_url(server))),
+        cwd: cwd.canonicalize().unwrap(),
+        max_requests: 25,
+    }
+}
+
+/// Send a prompt and collect events up to and including `TurnEnded`.
+pub(crate) async fn prompt(handle: &mut SessionHandle, text: &str) -> Vec<Event> {
+    handle
+        .commands
+        .send(Command::Prompt { text: text.into() })
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = handle.events.recv().await {
+        let done = matches!(event, Event::TurnEnded { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+/// The `messages` of each request the server received, after the system prompt.
+pub(crate) async fn sent_messages(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let body: Value = request.body_json().unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages[0]["role"], "system");
+            Value::Array(messages[1..].to_vec())
+        })
+        .collect()
 }

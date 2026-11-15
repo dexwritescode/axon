@@ -1,51 +1,43 @@
 //! One conversation: a task that owns the history and runs a turn per prompt.
 
-use std::pin::pin;
-
-use anyhow::Result;
 use async_openai::types::chat::ChatCompletionRequestMessage;
-use axon_protocol::{Command, Event, SessionHandle};
-use futures::StreamExt;
+use axon_protocol::{Command, Event, SessionHandle, StopReason};
 use tokio::sync::mpsc;
 
-use crate::model::ModelClient;
+use crate::turn::Agent;
 
 const COMMAND_BUFFER: usize = 16;
 const EVENT_BUFFER: usize = 64;
 
 /// Start a session task and return the frontend's end of it.
-pub(crate) fn spawn(client: ModelClient) -> SessionHandle {
+pub(crate) fn spawn(agent: Agent) -> SessionHandle {
     let (commands, command_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, events) = mpsc::channel(EVENT_BUFFER);
-    tokio::spawn(run(client, command_rx, event_tx));
+    tokio::spawn(run(agent, command_rx, event_tx));
     SessionHandle { commands, events }
 }
 
 /// Runs until the frontend drops its command sender or its event receiver.
-async fn run(
-    client: ModelClient,
-    mut commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<Event>,
-) {
+async fn run(agent: Agent, mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
     let mut history: Vec<ChatCompletionRequestMessage> = Vec::new();
 
     while let Some(command) = commands.recv().await {
         match command {
             Command::Prompt { text } => {
+                let before = history.len();
                 history.push(ChatCompletionRequestMessage::User(text.into()));
-                match turn(&client, &history, &events).await {
-                    Ok(reply) => {
-                        history.push(ChatCompletionRequestMessage::Assistant(reply.into()))
-                    }
+                let stop = match agent.turn(&mut history, &events).await {
+                    Ok(stop) => stop,
                     Err(e) => {
-                        history.pop();
+                        history.truncate(before);
                         let message = format!("{e:#}");
                         if events.send(Event::Error { message }).await.is_err() {
                             return;
                         }
+                        StopReason::EndTurn
                     }
-                }
-                if events.send(Event::TurnEnded).await.is_err() {
+                };
+                if events.send(Event::TurnEnded { stop }).await.is_err() {
                     return;
                 }
             }
@@ -53,62 +45,22 @@ async fn run(
     }
 }
 
-/// Stream one model reply to the frontend and return its full text.
-async fn turn(
-    client: &ModelClient,
-    history: &[ChatCompletionRequestMessage],
-    events: &mpsc::Sender<Event>,
-) -> Result<String> {
-    let mut stream = pin!(client.stream_text(history.to_vec()).await?);
-    let mut reply = String::new();
-    while let Some(delta) = stream.next().await {
-        let text = delta?;
-        reply.push_str(&text);
-        events.send(Event::TextDelta { text }).await?;
-    }
-    Ok(reply)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{api_url, client_error, config, reply, respond};
-    use serde_json::{Value, json};
+    use crate::test_support::{agent, client_error, prompt, reply, respond, sent_messages};
+    use serde_json::json;
+    use std::path::Path;
     use std::time::Duration;
     use wiremock::MockServer;
 
     fn session(server: &MockServer) -> SessionHandle {
-        spawn(ModelClient::new(&config(api_url(server))))
+        spawn(agent(server, Path::new(".")))
     }
 
-    /// Send a prompt and collect events up to and including `TurnEnded`.
-    async fn prompt(handle: &mut SessionHandle, text: &str) -> Vec<Event> {
-        handle
-            .commands
-            .send(Command::Prompt { text: text.into() })
-            .await
-            .unwrap();
-        let mut events = Vec::new();
-        while let Some(event) = handle.events.recv().await {
-            let done = event == Event::TurnEnded;
-            events.push(event);
-            if done {
-                break;
-            }
-        }
-        events
-    }
-
-    /// The `messages` of each request the server received, in order.
-    async fn sent_messages(server: &MockServer) -> Vec<Value> {
-        server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|request| request.body_json::<Value>().unwrap()["messages"].clone())
-            .collect()
-    }
+    const END: Event = Event::TurnEnded {
+        stop: StopReason::EndTurn,
+    };
 
     fn delta(text: &str) -> Event {
         Event::TextDelta { text: text.into() }
@@ -122,7 +74,7 @@ mod tests {
 
         assert_eq!(
             prompt(&mut handle, "hi").await,
-            [delta("Hello"), delta(", world"), Event::TurnEnded]
+            [delta("Hello"), delta(", world"), END]
         );
     }
 
@@ -135,14 +87,11 @@ mod tests {
 
         let events = prompt(&mut handle, "first").await;
         assert!(
-            matches!(events[..], [Event::Error { .. }, Event::TurnEnded]),
+            matches!(events[..], [Event::Error { .. }, END]),
             "{events:?}"
         );
 
-        assert_eq!(
-            prompt(&mut handle, "second").await,
-            [delta("ok"), Event::TurnEnded]
-        );
+        assert_eq!(prompt(&mut handle, "second").await, [delta("ok"), END]);
         assert_eq!(
             sent_messages(&server).await[1],
             json!([{"role": "user", "content": "second"}])

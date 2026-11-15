@@ -1,14 +1,18 @@
 //! Streaming client for OpenAI-compatible chat completion servers.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use anyhow::Result;
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    types::chat::{ChatCompletionRequestMessage, CreateChatCompletionRequestArgs},
+    types::chat::{
+        ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage, ChatCompletionTools,
+        CreateChatCompletionRequestArgs,
+    },
 };
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 
 /// Where to find the model and which one to use.
 pub struct ModelConfig {
@@ -24,6 +28,48 @@ impl fmt::Debug for ModelConfig {
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
             .finish()
+    }
+}
+
+/// A piece of a streamed reply.
+#[derive(Debug)]
+pub(crate) enum Delta {
+    Text(String),
+    /// A fragment of a tool call; `ToolCalls` puts them back together.
+    ToolCall(ChatCompletionMessageToolCallChunk),
+}
+
+/// A complete tool call. `args` is the JSON text as the model sent it.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) args: String,
+}
+
+/// Assembles tool calls from their streamed fragments.
+#[derive(Default)]
+pub(crate) struct ToolCalls(BTreeMap<u32, ToolCall>);
+
+impl ToolCalls {
+    pub(crate) fn push(&mut self, chunk: ChatCompletionMessageToolCallChunk) {
+        let call = self.0.entry(chunk.index).or_default();
+        if let Some(id) = chunk.id {
+            call.id = id;
+        }
+        if let Some(function) = chunk.function {
+            if let Some(name) = function.name {
+                call.name = name;
+            }
+            if let Some(args) = function.arguments {
+                call.args.push_str(&args);
+            }
+        }
+    }
+
+    /// The calls in the order the model made them.
+    pub(crate) fn finish(self) -> Vec<ToolCall> {
+        self.0.into_values().collect()
     }
 }
 
@@ -43,31 +89,38 @@ impl ModelClient {
         }
     }
 
-    /// Stream the text of the model's reply, one delta at a time.
+    /// Stream the model's reply: text deltas and tool-call fragments, in order.
     /// Dropping the stream cancels the request.
-    pub(crate) async fn stream_text(
+    pub(crate) async fn stream_turn(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
-    ) -> Result<impl Stream<Item = Result<String>> + use<>> {
+        tools: Vec<ChatCompletionTools>,
+    ) -> Result<impl Stream<Item = Result<Delta>> + use<>> {
         let request = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages(messages)
+            .tools(tools)
             .stream(true)
             .build()?;
         let stream = self.inner.chat().create_stream(request).await?;
 
-        Ok(stream.filter_map(|chunk| async move {
-            match chunk {
-                Err(e) => Some(Err(e.into())),
-                Ok(chunk) => {
-                    let text: String = chunk
-                        .choices
-                        .into_iter()
-                        .filter_map(|choice| choice.delta.content)
-                        .collect();
-                    (!text.is_empty()).then_some(Ok(text))
-                }
-            }
+        Ok(stream.flat_map(|chunk| {
+            let deltas: Vec<Result<Delta>> = match chunk {
+                Err(e) => vec![Err(e.into())],
+                Ok(chunk) => chunk
+                    .choices
+                    .into_iter()
+                    .flat_map(|choice| {
+                        let text = choice.delta.content.filter(|text| !text.is_empty());
+                        let calls = choice.delta.tool_calls.unwrap_or_default();
+                        text.map(Delta::Text)
+                            .into_iter()
+                            .chain(calls.into_iter().map(Delta::ToolCall))
+                    })
+                    .map(Ok)
+                    .collect(),
+            };
+            stream::iter(deltas)
         }))
     }
 }
@@ -96,10 +149,27 @@ mod tests {
         (server, client)
     }
 
-    /// Run a request to the end, collecting the text deltas or the first error.
-    async fn collect(client: &ModelClient) -> Result<Vec<String>> {
-        let stream = client.stream_text(vec![user("hi")]).await?;
-        stream.collect::<Vec<_>>().await.into_iter().collect()
+    /// Run a request to the end: its text deltas and assembled tool calls,
+    /// or the first error.
+    async fn collect(client: &ModelClient) -> Result<(Vec<String>, Vec<ToolCall>)> {
+        let stream = client.stream_turn(vec![user("hi")], Vec::new()).await?;
+        let mut texts = Vec::new();
+        let mut calls = ToolCalls::default();
+        for delta in stream.collect::<Vec<_>>().await {
+            match delta? {
+                Delta::Text(text) => texts.push(text),
+                Delta::ToolCall(chunk) => calls.push(chunk),
+            }
+        }
+        Ok((texts, calls.finish()))
+    }
+
+    fn call(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: args.into(),
+        }
     }
 
     #[test]
@@ -120,7 +190,39 @@ mod tests {
         ]))
         .await;
 
-        assert_eq!(collect(&client).await.unwrap(), ["Hello", ", ", "world"]);
+        let (texts, calls) = collect(&client).await.unwrap();
+        assert_eq!(texts, ["Hello", ", ", "world"]);
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_call_fragments_are_assembled_in_index_order() {
+        let fragment = |index: u32, rest: serde_json::Value| {
+            let mut call = json!({"index": index});
+            call.as_object_mut()
+                .unwrap()
+                .extend(rest.as_object().unwrap().clone());
+            chunk(json!({"tool_calls": [call]}), None)
+        };
+        let (_server, client) = client_for(sse(&[
+            chunk(json!({"content": "Looking"}), None),
+            fragment(1, json!({"id": "b", "type": "function", "function": {"name": "list_dir", "arguments": ""}})),
+            fragment(0, json!({"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{\"pa"}})),
+            fragment(1, json!({"function": {"arguments": "{}"}})),
+            fragment(0, json!({"function": {"arguments": "th\":\"x\"}"}})),
+            chunk(json!({}), Some("tool_calls")),
+        ]))
+        .await;
+
+        let (texts, calls) = collect(&client).await.unwrap();
+        assert_eq!(texts, ["Looking"]);
+        assert_eq!(
+            calls,
+            [
+                call("a", "read_file", r#"{"path":"x"}"#),
+                call("b", "list_dir", "{}")
+            ]
+        );
     }
 
     #[tokio::test]
