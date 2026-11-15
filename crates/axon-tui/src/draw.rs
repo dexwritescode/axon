@@ -11,12 +11,13 @@ use crossterm::{
 
 use axon_protocol::ToolStatus;
 
-use crate::app::{App, Committed};
+use crate::app::{Activity, App, Committed, Turn};
 
 const AGENT: &str = "Agent ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Tool lines show at most this many chars of args or output.
 const TOOL_PREVIEW: usize = 120;
 
@@ -53,6 +54,16 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
         Committed::User(text) => ("You   ", Color::Green, text),
         Committed::Agent(text) => (AGENT, Color::Cyan, text),
         Committed::Error(text) => ("Error ", Color::Red, text),
+        Committed::Cancelled => {
+            queue!(
+                out,
+                SetForegroundColor(Color::Red),
+                Print("  ✗   cancelled"),
+                ResetColor,
+                Print("\r\n"),
+            )?;
+            return Ok(());
+        }
         Committed::ToolCall { name, args } => {
             return tool_line(out, "  →   ", Color::Yellow, name, &preview(args));
         }
@@ -127,7 +138,8 @@ pub(crate) fn render_live(
         .split('\n')
         .map(|line| rows(PROMPT.len() + line.chars().count(), width))
         .sum();
-    let room = usize::from(height).saturating_sub(input_rows + 1);
+    let activity_rows = usize::from(app.turn.is_some());
+    let room = usize::from(height).saturating_sub(input_rows + activity_rows + 1);
     let reply = wrap(app.streaming_text.trim_start(), width);
     let skip = reply.len().saturating_sub(room);
 
@@ -140,6 +152,20 @@ pub(crate) fn render_live(
             None => queue!(out, Print(row))?,
         }
         queue!(out, Print("\r\n"))?;
+    }
+
+    if let Some(turn) = &app.turn {
+        let text: String = activity(turn).chars().take(width).collect();
+        let (spinner, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
+        queue!(
+            out,
+            SetForegroundColor(Color::Cyan),
+            Print(spinner),
+            SetForegroundColor(Color::DarkGrey),
+            Print(rest),
+            ResetColor,
+            Print("\r\n"),
+        )?;
     }
 
     queue!(
@@ -161,7 +187,18 @@ pub(crate) fn render_live(
     queue!(out, cursor::Show)?;
     out.flush()?;
 
-    Ok((reply.len() - skip + input_rows) as u16)
+    Ok((reply.len() - skip + activity_rows + input_rows) as u16)
+}
+
+/// The activity row's text, starting with the spinner.
+fn activity(turn: &Turn) -> String {
+    let spinner = SPINNER[turn.frame % SPINNER.len()];
+    let secs = turn.elapsed.as_secs();
+    match &turn.activity {
+        Activity::Thinking => format!("{spinner} Thinking… {secs}s · Esc to cancel"),
+        Activity::Running(tool) => format!("{spinner} Running {tool}… {secs}s · Esc to cancel"),
+        Activity::Cancelling => format!("{spinner} Cancelling…"),
+    }
 }
 
 /// Split the reply into screen rows, prefixed like a committed agent line.
@@ -206,11 +243,22 @@ mod tests {
         (String::from_utf8(out).unwrap(), lines_to_top)
     }
 
+    fn busy_turn() -> Turn {
+        let mut app = App {
+            input: "x".into(),
+            ..App::default()
+        };
+        app.on_key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Enter,
+        ));
+        app.turn.unwrap()
+    }
+
     fn app(streaming_text: &str, input: &str) -> App {
         App {
             input: input.into(),
             streaming_text: streaming_text.into(),
-            busy: false,
+            turn: None,
         }
     }
 
@@ -249,6 +297,31 @@ mod tests {
         assert!(!out.contains("line7\r\n"));
         assert!(out.contains("line8\r\n") && out.contains("line10\r\n"));
         assert_eq!(lines_to_top, 4);
+    }
+
+    #[test]
+    fn running_turn_adds_an_activity_row_above_the_separator() {
+        let mut app = app("", "");
+        app.turn = Some(busy_turn());
+        let (out, lines_to_top) = render(&app, 40, 10);
+
+        assert!(out.contains("⠋"));
+        assert!(
+            out.contains(" Thinking… 0s · Esc to cancel\u{1b}"),
+            "{out:?}"
+        );
+        assert_eq!(lines_to_top, 2);
+    }
+
+    #[test]
+    fn activity_row_shows_the_tool_and_cancelling() {
+        let mut turn = busy_turn();
+        turn.frame = 11;
+        turn.activity = Activity::Running("list_dir".into());
+        assert_eq!(activity(&turn), "⠙ Running list_dir… 0s · Esc to cancel");
+
+        turn.activity = Activity::Cancelling;
+        assert_eq!(activity(&turn), "⠙ Cancelling…");
     }
 
     #[test]

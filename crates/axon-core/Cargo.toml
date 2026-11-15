@@ -12,6 +12,7 @@ futures.workspace = true
 ignore.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

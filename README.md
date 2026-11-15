@@ -11,7 +11,7 @@ Axon talks to any OpenAI-compatible server. By default it uses LM Studio's local
 
 ```sh
 lms server start                  # OpenAI-compatible server on localhost:1234
-lms load qwen/qwen3.6-35b-a3b
+lms load qwen/qwen3.6-35b-a3b     # pass --context-length 32768 to set the context size
 lms ps                            # what's loaded
 cargo run                         # the TUI
 lms unload --all && lms server stop
