@@ -4,6 +4,7 @@ mod app;
 mod draw;
 
 use std::io::{self, Stdout, Write};
+use std::time::{Duration, Instant};
 
 use app::{Action, App, Committed};
 use axon_protocol::{Command, Event, SessionError, SessionFactory, SessionHandle};
@@ -58,10 +59,15 @@ impl Drop for RawTerminal {
     }
 }
 
+/// How often the activity row animates.
+const TICK: Duration = Duration::from_millis(100);
+
 /// Something the loop woke up for.
 enum Input {
     Key(KeyEvent),
     Session(Option<Event>),
+    /// Time to animate the activity row.
+    Tick,
     /// Anything else from the terminal, such as a resize.
     Redraw,
 }
@@ -73,6 +79,7 @@ async fn run_loop(out: &mut Stdout, session: SessionHandle) -> Result<(), TuiErr
     } = session;
     let mut app = App::default();
     let mut keys = EventStream::new();
+    let mut ticks = tokio::time::interval(TICK);
 
     execute!(out, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     draw::print_logo(out)?;
@@ -94,6 +101,7 @@ async fn run_loop(out: &mut Stdout, session: SessionHandle) -> Result<(), TuiErr
                 None => return Ok(()),
             },
             event = events.recv() => Input::Session(event),
+            _ = ticks.tick(), if app.turn.is_some() => Input::Tick,
         };
         let Some(committed) = step(&mut app, &commands, input).await else {
             return Ok(());
@@ -111,6 +119,10 @@ async fn step(
     match input {
         Input::Key(key) => match app.on_key(key) {
             Some(Action::Quit) => None,
+            Some(Action::Cancel) => {
+                commands.send(Command::Cancel).await.ok()?;
+                Some(Vec::new())
+            }
             Some(Action::Submit(text)) => {
                 let prompt = Command::Prompt { text: text.clone() };
                 commands.send(prompt).await.ok()?;
@@ -119,23 +131,32 @@ async fn step(
             None => Some(Vec::new()),
         },
         Input::Session(event) => Some(app.on_event(event?)),
+        Input::Tick => {
+            app.on_tick(Instant::now());
+            Some(Vec::new())
+        }
         Input::Redraw => Some(Vec::new()),
     }
 }
 
 /// Replace the live area: commit finished lines above it, then draw it again.
+/// The frame is written in one go, since stdout would flush at every newline.
 fn redraw(
     out: &mut impl Write,
     app: &App,
     lines_to_top: u16,
     committed: &[Committed],
 ) -> io::Result<u16> {
-    draw::clear_live(out, lines_to_top)?;
+    let mut frame = Vec::new();
+    draw::clear_live(&mut frame, lines_to_top)?;
     for line in committed {
-        draw::commit(out, line)?;
+        draw::commit(&mut frame, line)?;
     }
     let (width, height) = terminal::size()?;
-    draw::render_live(out, app, width, height)
+    let lines_to_top = draw::render_live(&mut frame, app, width, height)?;
+    out.write_all(&frame)?;
+    out.flush()?;
+    Ok(lines_to_top)
 }
 
 #[cfg(test)]
@@ -196,12 +217,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn esc_during_a_turn_sends_cancel() {
+        let (commands, mut sent) = mpsc::channel(2);
+        let mut app = app_with_input("hi");
+        step(&mut app, &commands, key(KeyCode::Enter)).await;
+
+        assert_eq!(
+            step(&mut app, &commands, key(KeyCode::Esc)).await,
+            Some(Vec::new())
+        );
+
+        sent.recv().await;
+        assert!(matches!(sent.recv().await, Some(Command::Cancel)));
+    }
+
+    #[tokio::test]
     async fn closed_session_and_quit_exit() {
         let (commands, _sent) = mpsc::channel(1);
         let mut app = App::default();
 
         assert_eq!(step(&mut app, &commands, Input::Session(None)).await, None);
-        let quit = Input::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let quit = Input::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert_eq!(step(&mut app, &commands, quit).await, None);
     }
 }

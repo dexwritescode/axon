@@ -12,6 +12,7 @@ use async_openai::types::chat::{
 use axon_protocol::{Event, StopReason, ToolStatus};
 use futures::StreamExt;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
 use crate::{prompt, tools};
@@ -27,23 +28,38 @@ pub(crate) struct Agent {
 
 impl Agent {
     /// Run one turn, adding its messages to `history`.
+    ///
+    /// When `cancel` fires, the turn stops at the next safe point and leaves
+    /// `history` valid: a partial reply is kept without its tool calls, and
+    /// tool calls not yet run are answered with "cancelled by user".
     pub(crate) async fn turn(
         &self,
         history: &mut Vec<ChatCompletionRequestMessage>,
         events: &mpsc::Sender<Event>,
+        cancel: &CancellationToken,
     ) -> Result<StopReason> {
         let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
         for _ in 0..self.max_requests {
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
                 .collect();
-            let (text, calls) = self.stream_reply(messages, events).await?;
-            history.push(assistant_message(text, &calls)?);
-            if calls.is_empty() {
+            let reply = self.stream_reply(messages, events, cancel).await?;
+            if reply.cancelled {
+                if !reply.text.is_empty() {
+                    history.push(assistant_message(reply.text, &[])?);
+                }
+                return Ok(StopReason::Cancelled);
+            }
+            history.push(assistant_message(reply.text, &reply.calls)?);
+            if reply.calls.is_empty() {
                 return Ok(StopReason::EndTurn);
             }
-            for call in calls {
-                let output = self.run_tool(&call, events).await?;
+            for call in reply.calls {
+                let output = if cancel.is_cancelled() {
+                    "cancelled by user".to_string()
+                } else {
+                    self.run_tool(&call, events).await?
+                };
                 history.push(
                     ChatCompletionRequestToolMessageArgs::default()
                         .content(output)
@@ -52,29 +68,54 @@ impl Agent {
                         .into(),
                 );
             }
+            if cancel.is_cancelled() {
+                return Ok(StopReason::Cancelled);
+            }
         }
         Ok(StopReason::MaxTurnRequests)
     }
 
-    /// Stream one model reply, forwarding its text; returns the text and tool calls.
+    /// Stream one model reply, forwarding its text. On cancel, the request is
+    /// dropped (which closes the connection) and the text so far is returned.
     async fn stream_reply(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         events: &mpsc::Sender<Event>,
-    ) -> Result<(String, Vec<ToolCall>)> {
-        let mut stream = pin!(self.client.stream_turn(messages, tools::schemas()).await?);
-        let mut text = String::new();
+        cancel: &CancellationToken,
+    ) -> Result<Reply> {
+        let mut reply = Reply::default();
+        let stream = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                reply.cancelled = true;
+                return Ok(reply);
+            }
+            stream = self.client.stream_turn(messages, tools::schemas()) => stream?,
+        };
+        let mut stream = pin!(stream);
         let mut calls = ToolCalls::default();
-        while let Some(delta) = stream.next().await {
-            match delta? {
+        loop {
+            let delta = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    reply.cancelled = true;
+                    return Ok(reply);
+                }
+                delta = stream.next() => match delta {
+                    Some(delta) => delta?,
+                    None => break,
+                },
+            };
+            match delta {
                 Delta::Text(delta) => {
-                    text.push_str(&delta);
+                    reply.text.push_str(&delta);
                     events.send(Event::TextDelta { text: delta }).await?;
                 }
                 Delta::ToolCall(chunk) => calls.push(chunk),
             }
         }
-        Ok((text, calls.finish()))
+        reply.calls = calls.finish();
+        Ok(reply)
     }
 
     /// Run a tool call, reporting it to the frontend; returns what the model sees.
@@ -100,6 +141,13 @@ impl Agent {
             .await?;
         Ok(output)
     }
+}
+
+#[derive(Default)]
+struct Reply {
+    text: String,
+    calls: Vec<ToolCall>,
+    cancelled: bool,
 }
 
 fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionRequestMessage> {
@@ -135,6 +183,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
     use wiremock::MockServer;
 
     /// A session working in a temp dir that holds `notes.txt`.
@@ -258,5 +307,86 @@ mod tests {
             sent_messages(&server).await[2],
             json!([{"role": "user", "content": "second"}])
         );
+    }
+
+    /// Run a turn directly with a one-slot event channel, cancelling as soon
+    /// as the first event arrives. Returns the stop reason, the events and
+    /// the history.
+    async fn cancel_after_first_event(
+        agent: &Agent,
+    ) -> (StopReason, Vec<Event>, Vec<ChatCompletionRequestMessage>) {
+        let (events, mut received) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let mut history = vec![ChatCompletionRequestMessage::User("go".into())];
+        let mut seen = Vec::new();
+        let stop = {
+            let mut turn = pin!(agent.turn(&mut history, &events, &cancel));
+            loop {
+                tokio::select! {
+                    stop = &mut turn => break stop.unwrap(),
+                    Some(event) = received.recv() => {
+                        seen.push(event);
+                        cancel.cancel();
+                    }
+                }
+            }
+        };
+        while let Ok(event) = received.try_recv() {
+            seen.push(event);
+        }
+        (stop, seen, history)
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_stream_keeps_the_text_shown_so_far() {
+        let server = MockServer::start().await;
+        let deltas: Vec<String> = (0..10).map(|n| format!("{n} ")).collect();
+        let deltas: Vec<&str> = deltas.iter().map(String::as_str).collect();
+        respond(&server, reply(&deltas)).await;
+        let dir = TempDir::new().unwrap();
+
+        let (stop, seen, history) = cancel_after_first_event(&agent(&server, dir.path())).await;
+
+        assert_eq!(stop, StopReason::Cancelled);
+        let shown: String = seen
+            .iter()
+            .map(|event| match event {
+                Event::TextDelta { text } => text.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(seen.len() < deltas.len(), "{seen:?}");
+        let last = serde_json::to_value(history.last().unwrap()).unwrap();
+        assert_eq!(last, json!({"role": "assistant", "content": shown}));
+    }
+
+    #[tokio::test]
+    async fn cancel_between_tool_calls_answers_the_rest_as_cancelled() {
+        let (server, dir, _handle) = session_with_notes(25).await;
+        respond(
+            &server,
+            tool_calls(&[
+                ("c1", "read_file", r#"{"path":"notes.txt"}"#),
+                ("c2", "list_dir", "{}"),
+            ]),
+        )
+        .await;
+
+        let (stop, _seen, history) = cancel_after_first_event(&agent(&server, dir.path())).await;
+
+        assert_eq!(stop, StopReason::Cancelled);
+        let tool_results: Vec<_> = history[2..]
+            .iter()
+            .map(|message| serde_json::to_value(message).unwrap())
+            .map(|message| (message["tool_call_id"].clone(), message["content"].clone()))
+            .collect();
+        assert_eq!(
+            tool_results,
+            [
+                (json!("c1"), json!("remember the milk\n")),
+                (json!("c2"), json!("cancelled by user"))
+            ]
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

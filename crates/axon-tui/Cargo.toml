@@ -9,7 +9,7 @@ axon-protocol.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "sync"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt"] }

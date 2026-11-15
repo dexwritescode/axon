@@ -1,6 +1,7 @@
 //! UI state and how keys and session events change it. No terminal I/O.
 
 use std::mem;
+use std::time::{Duration, Instant};
 
 use axon_protocol::{Event, StopReason, ToolStatus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,13 +11,44 @@ pub(crate) struct App {
     pub(crate) input: String,
     /// The reply streaming in for the current turn.
     pub(crate) streaming_text: String,
-    /// A turn is running; Enter does nothing until it ends.
-    pub(crate) busy: bool,
+    /// The running turn; Enter does nothing until it ends.
+    pub(crate) turn: Option<Turn>,
+}
+
+/// What the activity row shows while a turn runs.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Turn {
+    started: Instant,
+    /// Time since the prompt was sent, as of the last tick.
+    pub(crate) elapsed: Duration,
+    /// Advances on every tick; picks the spinner frame.
+    pub(crate) frame: usize,
+    pub(crate) activity: Activity,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum Activity {
+    Thinking,
+    Running(String),
+    /// Cancel was sent; the turn ends when the session confirms it.
+    Cancelling,
+}
+
+impl Turn {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            elapsed: Duration::ZERO,
+            frame: 0,
+            activity: Activity::Thinking,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Action {
     Submit(String),
+    Cancel,
     Quit,
 }
 
@@ -35,12 +67,17 @@ pub(crate) enum Committed {
         output: String,
     },
     Error(String),
+    Cancelled,
 }
 
 impl App {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c' | 'q'), KeyModifiers::CONTROL) => Some(Action::Quit),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => Some(Action::Quit),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) if self.turn.is_none() => {
+                Some(Action::Quit)
+            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => self.cancel(),
             // Terminals without the kitty keyboard protocol send Shift+Enter as
             // a line feed, which crossterm reports as Ctrl+J.
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
@@ -62,13 +99,40 @@ impl App {
 
     fn submit(&mut self) -> Option<Action> {
         let text = self.input.trim();
-        if self.busy || text.is_empty() {
+        if self.turn.is_some() || text.is_empty() {
             return None;
         }
         let text = text.to_string();
         self.input.clear();
-        self.busy = true;
+        self.turn = Some(Turn::new(Instant::now()));
         Some(Action::Submit(text))
+    }
+
+    /// Ask to cancel the running turn, once.
+    fn cancel(&mut self) -> Option<Action> {
+        let turn = self.turn.as_mut()?;
+        if turn.activity == Activity::Cancelling {
+            return None;
+        }
+        turn.activity = Activity::Cancelling;
+        Some(Action::Cancel)
+    }
+
+    /// Animate the activity row.
+    pub(crate) fn on_tick(&mut self, now: Instant) {
+        if let Some(turn) = &mut self.turn {
+            turn.frame += 1;
+            turn.elapsed = now.saturating_duration_since(turn.started);
+        }
+    }
+
+    /// Show `activity` unless a cancel is already under way.
+    fn set_activity(&mut self, activity: Activity) {
+        if let Some(turn) = &mut self.turn
+            && turn.activity != Activity::Cancelling
+        {
+            turn.activity = activity;
+        }
     }
 
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
@@ -78,6 +142,7 @@ impl App {
                 Vec::new()
             }
             Event::ToolCallStarted { name, args } => {
+                self.set_activity(Activity::Running(name.clone()));
                 let mut committed = self.take_reply();
                 committed.push(Committed::ToolCall { name, args });
                 committed
@@ -86,23 +151,28 @@ impl App {
                 name,
                 status,
                 output,
-            } => vec![Committed::ToolResult {
-                name,
-                status,
-                output,
-            }],
+            } => {
+                self.set_activity(Activity::Thinking);
+                vec![Committed::ToolResult {
+                    name,
+                    status,
+                    output,
+                }]
+            }
             Event::Error { message } => {
                 let mut committed = self.take_reply();
                 committed.push(Committed::Error(message));
                 committed
             }
             Event::TurnEnded { stop } => {
-                self.busy = false;
+                self.turn = None;
                 let mut committed = self.take_reply();
-                if stop == StopReason::MaxTurnRequests {
-                    committed.push(Committed::Error(
+                match stop {
+                    StopReason::EndTurn => {}
+                    StopReason::MaxTurnRequests => committed.push(Committed::Error(
                         "stopped: too many model requests for one prompt".into(),
-                    ));
+                    )),
+                    StopReason::Cancelled => committed.push(Committed::Cancelled),
                 }
                 committed
             }
@@ -132,6 +202,17 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    fn busy_app() -> App {
+        App {
+            turn: Some(Turn::new(Instant::now())),
+            ..App::default()
+        }
+    }
+
+    fn activity(app: &App) -> &Activity {
+        &app.turn.as_ref().unwrap().activity
+    }
+
     fn type_text(app: &mut App, text: &str) {
         for c in text.chars() {
             app.on_key(key(KeyCode::Char(c)));
@@ -156,7 +237,7 @@ mod tests {
             Some(Action::Submit("hi".into()))
         );
         assert_eq!(app.input, "");
-        assert!(app.busy);
+        assert!(app.turn.is_some());
     }
 
     #[test]
@@ -165,15 +246,12 @@ mod tests {
         type_text(&mut app, "  ");
 
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert!(!app.busy);
+        assert!(app.turn.is_none());
     }
 
     #[test]
     fn enter_while_busy_keeps_the_input() {
-        let mut app = App {
-            busy: true,
-            ..App::default()
-        };
+        let mut app = busy_app();
         type_text(&mut app, "next");
 
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
@@ -211,19 +289,81 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_and_ctrl_q_quit() {
+    fn ctrl_c_and_ctrl_q_quit_while_idle() {
         let mut app = App::default();
 
         assert_eq!(app.on_key(ctrl('c')), Some(Action::Quit));
         assert_eq!(app.on_key(ctrl('q')), Some(Action::Quit));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+    }
+
+    #[test]
+    fn esc_or_ctrl_c_cancels_a_turn_once() {
+        for cancel_key in [key(KeyCode::Esc), ctrl('c')] {
+            let mut app = busy_app();
+
+            assert_eq!(app.on_key(cancel_key), Some(Action::Cancel));
+            assert_eq!(*activity(&app), Activity::Cancelling);
+            assert_eq!(app.on_key(cancel_key), None);
+        }
+    }
+
+    #[test]
+    fn ctrl_q_quits_during_a_turn() {
+        assert_eq!(busy_app().on_key(ctrl('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn activity_follows_tool_calls_but_cancelling_sticks() {
+        let mut app = busy_app();
+        let started = || Event::ToolCallStarted {
+            name: "list_dir".into(),
+            args: "{}".into(),
+        };
+        let finished = || Event::ToolCallFinished {
+            name: "list_dir".into(),
+            status: ToolStatus::Completed,
+            output: String::new(),
+        };
+
+        app.on_event(started());
+        assert_eq!(*activity(&app), Activity::Running("list_dir".into()));
+        app.on_event(finished());
+        assert_eq!(*activity(&app), Activity::Thinking);
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_event(started());
+        assert_eq!(*activity(&app), Activity::Cancelling);
+    }
+
+    #[test]
+    fn ticks_advance_the_spinner_and_the_clock() {
+        let mut app = busy_app();
+        let started = app.turn.as_ref().unwrap().started;
+
+        app.on_tick(started + Duration::from_secs(3));
+
+        let turn = app.turn.as_ref().unwrap();
+        assert_eq!((turn.frame, turn.elapsed), (1, Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn cancelled_turn_commits_the_partial_reply_then_cancelled() {
+        let mut app = busy_app();
+        app.on_event(delta("partial"));
+
+        assert_eq!(
+            app.on_event(Event::TurnEnded {
+                stop: StopReason::Cancelled
+            }),
+            [Committed::Agent("partial".into()), Committed::Cancelled]
+        );
+        assert!(app.turn.is_none());
     }
 
     #[test]
     fn deltas_stream_then_turn_end_commits_the_reply() {
-        let mut app = App {
-            busy: true,
-            ..App::default()
-        };
+        let mut app = busy_app();
 
         assert!(app.on_event(delta("Hel")).is_empty());
         assert!(app.on_event(delta("lo")).is_empty());
@@ -231,7 +371,7 @@ mod tests {
 
         assert_eq!(app.on_event(END), [Committed::Agent("Hello".into())]);
         assert_eq!(app.streaming_text, "");
-        assert!(!app.busy);
+        assert!(app.turn.is_none());
     }
 
     #[test]
@@ -292,27 +432,21 @@ mod tests {
 
     #[test]
     fn turn_limit_is_explained() {
-        let mut app = App {
-            busy: true,
-            ..App::default()
-        };
+        let mut app = busy_app();
 
         let committed = app.on_event(Event::TurnEnded {
             stop: StopReason::MaxTurnRequests,
         });
 
         assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("too many")));
-        assert!(!app.busy);
+        assert!(app.turn.is_none());
     }
 
     #[test]
     fn turn_end_without_text_commits_nothing() {
-        let mut app = App {
-            busy: true,
-            ..App::default()
-        };
+        let mut app = busy_app();
 
         assert!(app.on_event(END).is_empty());
-        assert!(!app.busy);
+        assert!(app.turn.is_none());
     }
 }

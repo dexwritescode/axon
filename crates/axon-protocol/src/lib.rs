@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 pub enum Command {
     /// Run a turn for this user message.
     Prompt { text: String },
+    /// Stop the running turn; it ends with `StopReason::Cancelled`.
+    /// Does nothing while idle.
+    Cancel,
 }
 
 /// Sent by a session to its frontend.
@@ -46,6 +49,8 @@ pub enum StopReason {
     EndTurn,
     /// The model kept calling tools until the per-turn request limit.
     MaxTurnRequests,
+    /// The frontend sent `Command::Cancel`.
+    Cancelled,
 }
 
 /// What a frontend holds: a session's command sender and event receiver.
