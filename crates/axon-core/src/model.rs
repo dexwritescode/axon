@@ -75,7 +75,7 @@ impl ModelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{api_url, chunk, config, respond, sse};
+    use crate::test_support::{api_url, chunk, client_error, config, respond, sse};
     use async_openai::types::chat::{
         ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
     };
@@ -91,7 +91,7 @@ mod tests {
 
     async fn client_for(response: ResponseTemplate) -> (MockServer, ModelClient) {
         let server = MockServer::start().await;
-        respond(&server, response, 1).await;
+        respond(&server, response).await;
         let client = ModelClient::new(&config(api_url(&server)));
         (server, client)
     }
@@ -125,8 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_error_is_returned_as_an_error() {
-        // Not 5xx: async-openai's default retry layer retries those with backoff.
-        let (_server, client) = client_for(ResponseTemplate::new(400)).await;
+        let (_server, client) = client_for(client_error()).await;
 
         assert!(collect(&client).await.is_err());
     }

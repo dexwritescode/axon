@@ -47,7 +47,7 @@ mod tests {
     #[tokio::test]
     async fn new_session_streams_a_reply_from_the_configured_model() {
         let server = MockServer::start().await;
-        respond(&server, reply(&["Hello"]), 1).await;
+        respond(&server, reply(&["Hello"])).await;
         let mut handle = CoreFactory::new(config(api_url(&server)))
             .new_session()
             .unwrap();

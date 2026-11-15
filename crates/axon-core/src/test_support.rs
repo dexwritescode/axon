@@ -49,12 +49,17 @@ pub(crate) fn reply(deltas: &[&str]) -> ResponseTemplate {
     sse(&chunks)
 }
 
-/// Answer the next `times` chat completion requests with `response`.
-pub(crate) async fn respond(server: &MockServer, response: ResponseTemplate, times: u64) {
+/// A 400. Not a 5xx: async-openai's default retry layer retries those with backoff.
+pub(crate) fn client_error() -> ResponseTemplate {
+    ResponseTemplate::new(400)
+}
+
+/// Answer the next chat completion request with `response`.
+pub(crate) async fn respond(server: &MockServer, response: ResponseTemplate) {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(response)
-        .up_to_n_times(times)
+        .up_to_n_times(1)
         .mount(server)
         .await;
 }

@@ -43,7 +43,7 @@ impl App {
                 self.input.pop();
                 None
             }
-            (KeyCode::Char(c), _) => {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.input.push(c);
                 None
             }
@@ -165,6 +165,16 @@ mod tests {
         app.on_key(key(KeyCode::Backspace));
 
         assert_eq!(app.input, "h");
+    }
+
+    #[test]
+    fn shift_types_and_other_modifiers_do_not() {
+        let mut app = App::default();
+        app.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        app.on_key(ctrl('a'));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+
+        assert_eq!(app.input, "A");
     }
 
     #[test]
