@@ -10,15 +10,18 @@ use tokio::sync::mpsc;
 
 use crate::model::ModelClient;
 
+const COMMAND_BUFFER: usize = 16;
+const EVENT_BUFFER: usize = 64;
+
 /// Start a session task and return the frontend's end of it.
 pub(crate) fn spawn(client: ModelClient) -> SessionHandle {
-    let (commands, command_rx) = mpsc::channel(16);
-    let (event_tx, events) = mpsc::channel(64);
+    let (commands, command_rx) = mpsc::channel(COMMAND_BUFFER);
+    let (event_tx, events) = mpsc::channel(EVENT_BUFFER);
     tokio::spawn(run(client, command_rx, event_tx));
     SessionHandle { commands, events }
 }
 
-/// Runs until the frontend drops its command sender.
+/// Runs until the frontend drops its command sender or its event receiver.
 async fn run(
     client: ModelClient,
     mut commands: mpsc::Receiver<Command>,
@@ -36,14 +39,15 @@ async fn run(
                     }
                     Err(e) => {
                         history.pop();
-                        let _ = events
-                            .send(Event::Error {
-                                message: format!("{e:#}"),
-                            })
-                            .await;
+                        let message = format!("{e:#}");
+                        if events.send(Event::Error { message }).await.is_err() {
+                            return;
+                        }
                     }
                 }
-                let _ = events.send(Event::TurnEnded).await;
+                if events.send(Event::TurnEnded).await.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -60,7 +64,7 @@ async fn turn(
     while let Some(delta) = stream.next().await {
         let text = delta?;
         reply.push_str(&text);
-        let _ = events.send(Event::TextDelta { text }).await;
+        events.send(Event::TextDelta { text }).await?;
     }
     Ok(reply)
 }
@@ -68,46 +72,13 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelConfig;
+    use crate::test_support::{api_url, config, reply, respond};
     use serde_json::{Value, json};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// A 200 SSE response streaming these text deltas.
-    fn reply(deltas: &[&str]) -> ResponseTemplate {
-        let mut body = String::new();
-        for delta in deltas {
-            let chunk = json!({
-                "id": "chatcmpl-test",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "test-model",
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
-            });
-            body.push_str(&format!("data: {chunk}\n\n"));
-        }
-        body.push_str("data: [DONE]\n\n");
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "text/event-stream")
-            .set_body_string(body)
-    }
-
-    /// Answer the next `times` requests with `response`.
-    async fn respond(server: &MockServer, response: ResponseTemplate, times: u64) {
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(response)
-            .up_to_n_times(times)
-            .mount(server)
-            .await;
-    }
+    use std::time::Duration;
+    use wiremock::{MockServer, ResponseTemplate};
 
     fn session(server: &MockServer) -> SessionHandle {
-        spawn(ModelClient::new(&ModelConfig {
-            base_url: format!("{}/v1", server.uri()),
-            api_key: "test".into(),
-            model: "test-model".into(),
-        }))
+        spawn(ModelClient::new(&config(api_url(server))))
     }
 
     /// Send a prompt and collect events up to and including `TurnEnded`.
@@ -158,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn failed_turn_reports_an_error_and_is_left_out_of_history() {
         let server = MockServer::start().await;
-        // Not 5xx: async-openai retries those itself.
+        // Not 5xx: async-openai's default retry layer retries those with backoff.
         respond(&server, ResponseTemplate::new(400), 1).await;
         respond(&server, reply(&["ok"]), 1).await;
         let mut handle = session(&server);
@@ -197,5 +168,22 @@ mod tests {
                 {"role": "user", "content": "bye"}
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn session_stops_when_the_event_receiver_is_dropped() {
+        let server = MockServer::start().await;
+        respond(&server, reply(&["Hello"]), 1).await;
+        let SessionHandle { commands, events } = session(&server);
+        drop(events);
+
+        commands
+            .send(Command::Prompt { text: "hi".into() })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), commands.closed())
+            .await
+            .expect("session should stop");
     }
 }
