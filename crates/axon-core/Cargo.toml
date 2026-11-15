@@ -9,9 +9,11 @@ axon-protocol.workspace = true
 anyhow.workspace = true
 async-openai.workspace = true
 futures.workspace = true
+ignore.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "time"] }
 wiremock.workspace = true

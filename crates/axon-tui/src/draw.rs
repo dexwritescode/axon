@@ -9,12 +9,16 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 
+use axon_protocol::ToolStatus;
+
 use crate::app::{App, Committed};
 
 const AGENT: &str = "Agent ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
+/// Tool lines show at most this many chars of args or output.
+const TOOL_PREVIEW: usize = 120;
 
 pub(crate) const LOGO: [&str; 6] = [
     " █████╗ ██╗  ██╗ ██████╗ ███╗   ██╗",
@@ -49,6 +53,20 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
         Committed::User(text) => ("You   ", Color::Green, text),
         Committed::Agent(text) => (AGENT, Color::Cyan, text),
         Committed::Error(text) => ("Error ", Color::Red, text),
+        Committed::ToolCall { name, args } => {
+            return tool_line(out, "  →   ", Color::Yellow, name, &preview(args));
+        }
+        Committed::ToolResult {
+            name,
+            status,
+            output,
+        } => {
+            let color = match status {
+                ToolStatus::Completed => Color::Magenta,
+                ToolStatus::Failed => Color::Red,
+            };
+            return tool_line(out, "  ←   ", color, name, &preview(output));
+        }
     };
     for (i, part) in text.split('\n').enumerate() {
         if i == 0 {
@@ -59,6 +77,38 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
         queue!(out, Print(part), Print("\r\n"))?;
     }
     Ok(())
+}
+
+fn tool_line(
+    out: &mut impl Write,
+    arrow: &str,
+    color: Color,
+    name: &str,
+    detail: &str,
+) -> io::Result<()> {
+    queue!(
+        out,
+        SetForegroundColor(color),
+        Print(arrow),
+        SetAttribute(Attribute::Bold),
+        Print(name),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("  {detail}")),
+        ResetColor,
+        Print("\r\n"),
+    )
+}
+
+/// The first line of `text`, cut to `TOOL_PREVIEW` chars, with `…` if anything was left out.
+fn preview(text: &str) -> String {
+    let text = text.trim();
+    let first = text.lines().next().unwrap_or("");
+    let mut out: String = first.chars().take(TOOL_PREVIEW).collect();
+    if out.len() < text.len() {
+        out.push_str(" …");
+    }
+    out
 }
 
 /// Draw the live area at the cursor and leave the cursor at the end of the input.
@@ -199,6 +249,34 @@ mod tests {
         assert!(!out.contains("line7\r\n"));
         assert!(out.contains("line8\r\n") && out.contains("line10\r\n"));
         assert_eq!(lines_to_top, 4);
+    }
+
+    #[test]
+    fn preview_shows_the_first_line_and_marks_the_rest() {
+        assert_eq!(preview("one line\n"), "one line");
+        assert_eq!(preview("src/\nCargo.toml\n"), "src/ …");
+        assert_eq!(
+            preview(&"x".repeat(200)),
+            format!("{} …", "x".repeat(TOOL_PREVIEW))
+        );
+    }
+
+    #[test]
+    fn tool_lines_show_name_and_preview() {
+        let mut out = Vec::new();
+        commit(
+            &mut out,
+            &Committed::ToolResult {
+                name: "list_dir".into(),
+                status: ToolStatus::Failed,
+                output: "error: nope".into(),
+            },
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.contains("←") && out.contains("list_dir") && out.contains("error: nope"));
+        assert!(out.ends_with("\r\n"));
     }
 
     #[test]

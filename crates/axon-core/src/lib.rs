@@ -1,13 +1,23 @@
-//! The Axon core: sessions that stream model replies to a frontend.
-//! Knows nothing about any frontend.
+//! The Axon core: sessions that run an agent loop with read-only tools
+//! and stream it to a frontend. Knows nothing about any frontend.
 
+mod jail;
 mod model;
+mod prompt;
 mod session;
 #[cfg(test)]
 mod test_support;
+mod tools;
+mod turn;
+
+use std::path::PathBuf;
 
 use axon_protocol::{SessionError, SessionFactory, SessionHandle};
 use model::ModelClient;
+use turn::Agent;
+
+/// Model requests per prompt before a turn stops.
+const MAX_TURN_REQUESTS: usize = 25;
 
 pub use model::ModelConfig;
 
@@ -24,46 +34,60 @@ impl CoreFactory {
 
 impl SessionFactory for CoreFactory {
     /// Must be called inside a tokio runtime; the session runs as a task on it.
-    fn new_session(&self) -> Result<SessionHandle, SessionError> {
+    fn new_session(&self, cwd: PathBuf) -> Result<SessionHandle, SessionError> {
         tokio::runtime::Handle::try_current().map_err(|e| SessionError::Start(e.to_string()))?;
-        Ok(session::spawn(ModelClient::new(&self.config)))
+        let cwd = cwd
+            .canonicalize()
+            .map_err(|e| SessionError::Start(format!("{}: {e}", cwd.display())))?;
+        Ok(session::spawn(Agent {
+            client: ModelClient::new(&self.config),
+            cwd,
+            max_requests: MAX_TURN_REQUESTS,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{api_url, config, reply, respond};
-    use axon_protocol::{Command, Event};
+    use crate::test_support::{api_url, config, prompt, reply, respond};
+    use axon_protocol::{Event, StopReason};
     use wiremock::MockServer;
+
+    fn factory(base_url: String) -> CoreFactory {
+        CoreFactory::new(config(base_url))
+    }
 
     #[test]
     fn new_session_outside_a_runtime_is_an_error() {
-        let result = CoreFactory::new(config("http://unused".into())).new_session();
+        let result = factory("http://unused".into()).new_session(".".into());
 
         assert!(matches!(result, Err(SessionError::Start(_))));
+    }
+
+    #[tokio::test]
+    async fn new_session_in_a_missing_directory_is_an_error() {
+        let result = factory("http://unused".into()).new_session("/no/such/dir".into());
+
+        assert!(matches!(result, Err(SessionError::Start(e)) if e.starts_with("/no/such/dir")));
     }
 
     #[tokio::test]
     async fn new_session_streams_a_reply_from_the_configured_model() {
         let server = MockServer::start().await;
         respond(&server, reply(&["Hello"])).await;
-        let mut handle = CoreFactory::new(config(api_url(&server)))
-            .new_session()
-            .unwrap();
-
-        handle
-            .commands
-            .send(Command::Prompt { text: "hi".into() })
-            .await
-            .unwrap();
+        let mut handle = factory(api_url(&server)).new_session(".".into()).unwrap();
 
         assert_eq!(
-            handle.events.recv().await,
-            Some(Event::TextDelta {
-                text: "Hello".into()
-            })
+            prompt(&mut handle, "hi").await,
+            [
+                Event::TextDelta {
+                    text: "Hello".into()
+                },
+                Event::TurnEnded {
+                    stop: StopReason::EndTurn
+                }
+            ]
         );
-        assert_eq!(handle.events.recv().await, Some(Event::TurnEnded));
     }
 }
