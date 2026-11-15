@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 axon-protocol.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "sync"] }

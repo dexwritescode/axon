@@ -8,5 +8,5 @@ license.workspace = true
 axon-core.workspace = true
 axon-acp.workspace = true
 axon-tui.workspace = true
-agent-client-protocol.workspace = true
+anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

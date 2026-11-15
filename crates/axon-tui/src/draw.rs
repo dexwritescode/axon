@@ -1,0 +1,213 @@
+//! Inline drawing. Finished lines go into the terminal's scrollback; below
+//! them, the live area (streaming reply, separator, input) is redrawn in place.
+
+use std::io::{self, Write};
+
+use crossterm::{
+    cursor, queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType},
+};
+
+use crate::app::{App, Committed};
+
+const AGENT: &str = "Agent ";
+const INDENT: &str = "      ";
+const PROMPT: &str = "> ";
+const PROMPT_INDENT: &str = "  ";
+
+pub(crate) const LOGO: [&str; 6] = [
+    " █████╗ ██╗  ██╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗╚██╗██╔╝██╔═══██╗████╗  ██║",
+    "███████║ ╚███╔╝ ██║   ██║██╔██╗ ██║",
+    "██╔══██║ ██╔██╗ ██║   ██║██║╚██╗██║",
+    "██║  ██║██╔╝ ██╗╚██████╔╝██║ ╚████║",
+    "╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝",
+];
+
+pub(crate) fn print_logo(out: &mut impl Write) -> io::Result<()> {
+    for line in LOGO {
+        label(out, line, Color::Cyan)?;
+        queue!(out, Print("\r\n"))?;
+    }
+    out.flush()
+}
+
+/// Move to the top of the live area and clear everything below it.
+/// Doesn't flush, so the clear and the repaint after it show as one frame.
+pub(crate) fn clear_live(out: &mut impl Write, lines_to_top: u16) -> io::Result<()> {
+    queue!(out, cursor::Hide, cursor::MoveToColumn(0))?;
+    if lines_to_top > 0 {
+        queue!(out, cursor::MoveUp(lines_to_top))?;
+    }
+    queue!(out, Clear(ClearType::FromCursorDown))
+}
+
+/// Print a finished line into the scrollback, at the top of a cleared live area.
+pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
+    let (name, color, text) = match line {
+        Committed::User(text) => ("You   ", Color::Green, text),
+        Committed::Agent(text) => (AGENT, Color::Cyan, text),
+        Committed::Error(text) => ("Error ", Color::Red, text),
+    };
+    for (i, part) in text.split('\n').enumerate() {
+        if i == 0 {
+            label(out, name, color)?;
+        } else {
+            queue!(out, Print(INDENT))?;
+        }
+        queue!(out, Print(part), Print("\r\n"))?;
+    }
+    Ok(())
+}
+
+/// Draw the live area at the cursor and leave the cursor at the end of the input.
+/// Only the tail of the reply that fits on screen is shown; all of it is
+/// committed when the turn ends.
+/// Returns how many rows the cursor is below the top of the live area.
+pub(crate) fn render_live(
+    out: &mut impl Write,
+    app: &App,
+    width: u16,
+    height: u16,
+) -> io::Result<u16> {
+    let width = usize::from(width.max(1));
+    let input_rows: usize = app
+        .input
+        .split('\n')
+        .map(|line| rows(PROMPT.len() + line.chars().count(), width))
+        .sum();
+    let room = usize::from(height).saturating_sub(input_rows + 1);
+    let reply = wrap(app.streaming_text.trim_start(), width);
+    let skip = reply.len().saturating_sub(room);
+
+    for (i, row) in reply.iter().enumerate().skip(skip) {
+        match row.strip_prefix(AGENT).filter(|_| i == 0) {
+            Some(rest) => {
+                label(out, AGENT, Color::Cyan)?;
+                queue!(out, Print(rest))?;
+            }
+            None => queue!(out, Print(row))?,
+        }
+        queue!(out, Print("\r\n"))?;
+    }
+
+    queue!(
+        out,
+        SetForegroundColor(Color::DarkGrey),
+        Print("─".repeat(width)),
+        ResetColor,
+        Print("\r\n"),
+    )?;
+
+    for (i, line) in app.input.split('\n').enumerate() {
+        if i == 0 {
+            label(out, PROMPT, Color::White)?;
+        } else {
+            queue!(out, Print("\r\n"), Print(PROMPT_INDENT))?;
+        }
+        queue!(out, Print(line))?;
+    }
+    queue!(out, cursor::Show)?;
+    out.flush()?;
+
+    Ok((reply.len() - skip + input_rows) as u16)
+}
+
+/// Split the reply into screen rows, prefixed like a committed agent line.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, line) in text.split('\n').enumerate() {
+        let prefix = if i == 0 { AGENT } else { INDENT };
+        let chars: Vec<char> = format!("{prefix}{}", line.replace('\t', "    "))
+            .chars()
+            .collect();
+        out.extend(chars.chunks(width).map(|row| row.iter().collect()));
+    }
+    out
+}
+
+/// Screen rows taken by a line of `len` chars.
+fn rows(len: usize, width: usize) -> usize {
+    len.div_ceil(width).max(1)
+}
+
+fn label(out: &mut impl Write, text: &str, color: Color) -> io::Result<()> {
+    queue!(
+        out,
+        SetForegroundColor(color),
+        SetAttribute(Attribute::Bold),
+        Print(text),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(app: &App, width: u16, height: u16) -> (String, u16) {
+        let mut out = Vec::new();
+        let lines_to_top = render_live(&mut out, app, width, height).unwrap();
+        (String::from_utf8(out).unwrap(), lines_to_top)
+    }
+
+    fn app(streaming_text: &str, input: &str) -> App {
+        App {
+            input: input.into(),
+            streaming_text: streaming_text.into(),
+            busy: false,
+        }
+    }
+
+    #[test]
+    fn idle_live_area_is_a_separator_and_the_input() {
+        let (out, lines_to_top) = render(&app("", "hi"), 20, 10);
+
+        assert!(out.contains(&"─".repeat(20)));
+        assert!(out.ends_with(&format!("hi{}", "\u{1b}[?25h")), "{out:?}");
+        assert_eq!(lines_to_top, 1);
+    }
+
+    #[test]
+    fn multiline_reply_and_input_count_every_row() {
+        let (out, lines_to_top) = render(&app("one\ntwo", "a\nb"), 20, 10);
+
+        assert!(out.contains("one\r\n      two\r\n"));
+        assert!(out.contains("a\r\n  b"));
+        assert_eq!(lines_to_top, 2 + 1 + 1);
+    }
+
+    #[test]
+    fn long_lines_count_the_rows_they_wrap_to() {
+        let (_, lines_to_top) = render(&app(&"x".repeat(30), &"y".repeat(15)), 10, 20);
+
+        // "Agent " + 30 chars = 4 rows; "> " + 15 chars = 2 rows; cursor is on the last.
+        assert_eq!(lines_to_top, 4 + 1 + 1);
+    }
+
+    #[test]
+    fn reply_taller_than_the_screen_shows_only_its_tail() {
+        let reply: Vec<String> = (1..=10).map(|n| format!("line{n}")).collect();
+        let (out, lines_to_top) = render(&app(&reply.join("\n"), ""), 20, 5);
+
+        // 5 rows: 3 reply rows, the separator and the input.
+        assert!(!out.contains("line7\r\n"));
+        assert!(out.contains("line8\r\n") && out.contains("line10\r\n"));
+        assert_eq!(lines_to_top, 4);
+    }
+
+    #[test]
+    fn commit_indents_continuation_lines() {
+        let mut out = Vec::new();
+        commit(&mut out, &Committed::User("a\nb".into())).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(out.contains("You   "));
+        assert!(out.ends_with("a\r\n      b\r\n"), "{out:?}");
+    }
+}
