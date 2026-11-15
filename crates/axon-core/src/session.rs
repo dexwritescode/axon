@@ -72,10 +72,10 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{api_url, config, reply, respond};
+    use crate::test_support::{api_url, client_error, config, reply, respond};
     use serde_json::{Value, json};
     use std::time::Duration;
-    use wiremock::{MockServer, ResponseTemplate};
+    use wiremock::MockServer;
 
     fn session(server: &MockServer) -> SessionHandle {
         spawn(ModelClient::new(&config(api_url(server))))
@@ -117,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_streams_deltas_then_ends_the_turn() {
         let server = MockServer::start().await;
-        respond(&server, reply(&["Hello", ", world"]), 1).await;
+        respond(&server, reply(&["Hello", ", world"])).await;
         let mut handle = session(&server);
 
         assert_eq!(
@@ -129,9 +129,8 @@ mod tests {
     #[tokio::test]
     async fn failed_turn_reports_an_error_and_is_left_out_of_history() {
         let server = MockServer::start().await;
-        // Not 5xx: async-openai's default retry layer retries those with backoff.
-        respond(&server, ResponseTemplate::new(400), 1).await;
-        respond(&server, reply(&["ok"]), 1).await;
+        respond(&server, client_error()).await;
+        respond(&server, reply(&["ok"])).await;
         let mut handle = session(&server);
 
         let events = prompt(&mut handle, "first").await;
@@ -153,8 +152,8 @@ mod tests {
     #[tokio::test]
     async fn next_prompt_sends_the_previous_exchange() {
         let server = MockServer::start().await;
-        respond(&server, reply(&["Hel", "lo"]), 1).await;
-        respond(&server, reply(&["Bye"]), 1).await;
+        respond(&server, reply(&["Hel", "lo"])).await;
+        respond(&server, reply(&["Bye"])).await;
         let mut handle = session(&server);
 
         prompt(&mut handle, "hi").await;
@@ -173,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn session_stops_when_the_event_receiver_is_dropped() {
         let server = MockServer::start().await;
-        respond(&server, reply(&["Hello"]), 1).await;
+        respond(&server, reply(&["Hello"])).await;
         let SessionHandle { commands, events } = session(&server);
         drop(events);
 
