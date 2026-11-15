@@ -1,8 +1,10 @@
-//! The Axon harness: session actor, agent loop, model client, tools and
-//! approval policy. Knows nothing about any frontend.
+//! The Axon core: sessions that stream model replies to a frontend.
+//! Knows nothing about any frontend.
 
 mod model;
 mod session;
+#[cfg(test)]
+mod test_support;
 
 use axon_protocol::{SessionError, SessionFactory, SessionHandle};
 use model::ModelClient;
@@ -31,35 +33,22 @@ impl SessionFactory for CoreFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{api_url, config, reply, respond};
     use axon_protocol::{Command, Event};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn factory(base_url: String) -> CoreFactory {
-        CoreFactory::new(ModelConfig {
-            base_url,
-            api_key: "test".into(),
-            model: "test-model".into(),
-        })
-    }
+    use wiremock::MockServer;
 
     #[test]
     fn new_session_outside_a_runtime_is_an_error() {
-        let result = factory("http://unused".into()).new_session();
+        let result = CoreFactory::new(config("http://unused".into())).new_session();
 
         assert!(matches!(result, Err(SessionError::Start(_))));
     }
 
     #[tokio::test]
-    async fn new_session_runs_a_turn_against_the_model() {
+    async fn new_session_streams_a_reply_from_the_configured_model() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(400))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut handle = factory(format!("{}/v1", server.uri()))
+        respond(&server, reply(&["Hello"]), 1).await;
+        let mut handle = CoreFactory::new(config(api_url(&server)))
             .new_session()
             .unwrap();
 
@@ -69,10 +58,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             handle.events.recv().await,
-            Some(Event::Error { .. })
-        ));
+            Some(Event::TextDelta {
+                text: "Hello".into()
+            })
+        );
         assert_eq!(handle.events.recv().await, Some(Event::TurnEnded));
     }
 }

@@ -1,1 +1,1 @@
-//! Terminal frontend: renders a session inline in the terminal's scrollback.
+//! Terminal frontend. Nothing here yet.

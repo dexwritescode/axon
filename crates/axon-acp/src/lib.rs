@@ -1,4 +1,4 @@
-//! ACP (Agent Client Protocol) frontend: serves an Axon agent over stdio.
+//! ACP (Agent Client Protocol) frontend: answers `initialize` over stdio.
 
 use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeRequest, InitializeResponse};
 use agent_client_protocol::{Agent, Result, Stdio};
@@ -9,7 +9,7 @@ pub async fn serve() -> Result<()> {
         .builder()
         .name("Axon")
         .on_receive_request(
-            async move |initialize: InitializeRequest, responder, _connection| {
+            async |initialize: InitializeRequest, responder, _connection| {
                 responder.respond(
                     InitializeResponse::new(initialize.protocol_version)
                         .agent_capabilities(AgentCapabilities::new()),

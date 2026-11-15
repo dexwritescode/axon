@@ -1,18 +1,18 @@
-//! Commands, events and ids exchanged between the Axon core and its frontends.
+//! Commands and events exchanged between the Axon core and its frontends.
 //!
 //! Everything here is frontend-agnostic: no model-provider, ACP or UI types.
 
 use tokio::sync::mpsc;
 
 /// Sent by a frontend to a session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub enum Command {
     /// Run a turn for this user message.
     Prompt { text: String },
 }
 
 /// Sent by a session to its frontend.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Event {
     /// A piece of the model's reply, in order.
     TextDelta { text: String },
@@ -28,8 +28,10 @@ pub struct SessionHandle {
     pub events: mpsc::Receiver<Event>,
 }
 
+/// Why a `SessionFactory` could not create a session.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    /// The session could not be started; the message says why.
     #[error("could not start a session: {0}")]
     Start(String),
 }
