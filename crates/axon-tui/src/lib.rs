@@ -4,6 +4,7 @@
 mod app;
 mod diff;
 mod draw;
+mod theme;
 
 use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};
