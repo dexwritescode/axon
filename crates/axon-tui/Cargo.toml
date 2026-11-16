@@ -8,8 +8,11 @@ license.workspace = true
 axon-protocol.workspace = true
 crossterm.workspace = true
 futures.workspace = true
+similar.workspace = true
+syntect.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
+two-face.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt"] }

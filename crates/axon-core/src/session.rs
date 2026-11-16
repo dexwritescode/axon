@@ -8,7 +8,7 @@ use axon_protocol::{Command, Event, SessionHandle, StopReason};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn::Agent;
+use crate::turn::{Agent, Approval};
 
 const COMMAND_BUFFER: usize = 16;
 const EVENT_BUFFER: usize = 64;
@@ -46,13 +46,14 @@ async fn run(agent: Agent, mut commands: mpsc::Receiver<Command>, events: mpsc::
                     return;
                 }
             }
-            Command::Cancel => {}
+            Command::Cancel | Command::Approval { .. } => {}
         }
     }
 }
 
-/// Run a turn while still serving commands: `Cancel` stops it, and a second
-/// `Prompt` is refused. If the frontend goes away, the turn is cancelled.
+/// Run a turn while still serving commands: `Cancel` stops it, approvals go
+/// to it, and a second `Prompt` is refused. If the frontend goes away, the
+/// turn is cancelled.
 async fn turn(
     agent: &Agent,
     history: &mut Vec<ChatCompletionRequestMessage>,
@@ -60,13 +61,17 @@ async fn turn(
     events: &mpsc::Sender<Event>,
 ) -> Result<StopReason> {
     let cancel = CancellationToken::new();
-    let mut turn = pin!(agent.turn(history, events, &cancel));
+    let (approve, mut approvals) = mpsc::unbounded_channel();
+    let mut turn = pin!(agent.turn(history, events, &mut approvals, &cancel));
     let mut frontend_open = true;
     loop {
         tokio::select! {
             result = &mut turn => return result,
             command = commands.recv(), if frontend_open => match command {
                 Some(Command::Cancel) => cancel.cancel(),
+                Some(Command::Approval { id, approve: yes }) => {
+                    let _ = approve.send(Approval { id, approve: yes });
+                }
                 Some(Command::Prompt { .. }) => {
                     let message = "a turn is already running".to_string();
                     let _ = events.send(Event::Error { message }).await;

@@ -100,6 +100,15 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
 
 /// Send a prompt and collect events up to and including `TurnEnded`.
 pub(crate) async fn prompt(handle: &mut SessionHandle, text: &str) -> Vec<Event> {
+    prompt_answering(handle, text, None).await
+}
+
+/// Like `prompt`, answering every `ApprovalRequested` with `approve`, if given.
+pub(crate) async fn prompt_answering(
+    handle: &mut SessionHandle,
+    text: &str,
+    approve: Option<bool>,
+) -> Vec<Event> {
     handle
         .commands
         .send(Command::Prompt { text: text.into() })
@@ -107,6 +116,10 @@ pub(crate) async fn prompt(handle: &mut SessionHandle, text: &str) -> Vec<Event>
         .unwrap();
     let mut events = Vec::new();
     while let Some(event) = handle.events.recv().await {
+        if let (Event::ApprovalRequested { id, .. }, Some(approve)) = (&event, approve) {
+            let answer = Command::Approval { id: *id, approve };
+            handle.commands.send(answer).await.unwrap();
+        }
         let done = matches!(event, Event::TurnEnded { .. });
         events.push(event);
         if done {

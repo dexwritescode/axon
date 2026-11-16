@@ -5,6 +5,9 @@ mod grep;
 mod list;
 mod read;
 mod walk;
+mod write;
+
+pub(crate) use write::Write;
 
 use std::path::Path;
 
@@ -54,6 +57,32 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
             }),
         ),
         schema(
+            "write_file",
+            "Create a file or replace its whole content; missing directories are created. The user approves every write. To change part of an existing file, use edit_file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the working directory"},
+                    "content": {"type": "string", "description": "The complete new content of the file"}
+                },
+                "required": ["path", "content"]
+            }),
+        ),
+        schema(
+            "edit_file",
+            "Replace exact text in an existing file. old_string must match the file exactly, including whitespace, and only once unless replace_all is set; read the file first. The user approves every edit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the working directory"},
+                    "old_string": {"type": "string", "description": "The exact text to replace"},
+                    "new_string": {"type": "string", "description": "The text to put in its place"},
+                    "replace_all": {"type": "boolean", "description": "Replace every match instead of requiring a unique one; defaults to false"}
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        ),
+        schema(
             "find",
             "Find files by name or path with a glob, skipping those ignored by .gitignore.",
             json!({
@@ -79,18 +108,29 @@ fn schema(name: &str, description: &str, parameters: Value) -> ChatCompletionToo
     })
 }
 
-/// Run a tool call inside `cwd`: its output, or an error message for the model.
-pub(crate) fn run(cwd: &Path, name: &str, args: &str) -> Result<String, String> {
+/// What a tool call produced.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Action {
+    /// The tool ran; this is its output.
+    Output(String),
+    /// The tool wants to change a file, once the user approves.
+    Write(Write),
+}
+
+/// Run a tool call inside `cwd`: what it produced, or an error message for the model.
+pub(crate) fn run(cwd: &Path, name: &str, args: &str) -> Result<Action, String> {
     let args: Value = if args.trim().is_empty() {
         json!({})
     } else {
         serde_json::from_str(args).map_err(|e| format!("arguments were not valid JSON: {e}"))?
     };
     match name {
-        "read_file" => read::run(cwd, &args),
-        "list_dir" => list::run(cwd, &args),
-        "grep" => grep::run(cwd, &args),
-        "find" => find::run(cwd, &args),
+        "read_file" => read::run(cwd, &args).map(Action::Output),
+        "list_dir" => list::run(cwd, &args).map(Action::Output),
+        "grep" => grep::run(cwd, &args).map(Action::Output),
+        "find" => find::run(cwd, &args).map(Action::Output),
+        "write_file" => write::write_file(cwd, &args).map(Action::Write),
+        "edit_file" => write::edit_file(cwd, &args).map(Action::Write),
         _ => Err(format!("unknown tool: {name}")),
     }
 }

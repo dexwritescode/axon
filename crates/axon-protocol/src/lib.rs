@@ -14,6 +14,8 @@ pub enum Command {
     /// Stop the running turn; it ends with `StopReason::Cancelled`.
     /// Does nothing while idle.
     Cancel,
+    /// Answer the `ApprovalRequested` event with this `id`.
+    Approval { id: u64, approve: bool },
 }
 
 /// Sent by a session to its frontend.
@@ -23,6 +25,9 @@ pub enum Event {
     TextDelta { text: String },
     /// The model called a tool; `args` is the JSON text it sent.
     ToolCallStarted { name: String, args: String },
+    /// The tool call started last wants to make `change`; it waits for a
+    /// `Command::Approval` with the same `id`, or for `Command::Cancel`.
+    ApprovalRequested { id: u64, change: Change },
     /// The tool call started last has finished.
     ToolCallFinished {
         name: String,
@@ -35,11 +40,25 @@ pub enum Event {
     TurnEnded { stop: StopReason },
 }
 
+/// A change a tool call wants to make, shown to the user for approval.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Create or replace the file at `path` (relative to the working
+    /// directory); `old_text` is `None` when the file doesn't exist yet.
+    WriteFile {
+        path: String,
+        old_text: Option<String>,
+        new_text: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToolStatus {
     Completed,
     /// The tool reported an error; `output` says what went wrong.
     Failed,
+    /// The user rejected the change, or cancelled the turn while asked.
+    Rejected,
 }
 
 /// Why a turn ended.

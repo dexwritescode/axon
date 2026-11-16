@@ -1,5 +1,7 @@
 //! Inline drawing. Finished lines go into the terminal's scrollback; below
 //! them, the live area (streaming reply, separator, input) is redrawn in place.
+//! While a change waits for approval, its diff and a y/n prompt replace the
+//! reply and the input.
 
 use std::io::{self, Write};
 
@@ -12,6 +14,7 @@ use crossterm::{
 use axon_protocol::ToolStatus;
 
 use crate::app::{Activity, App, Committed, Turn};
+use crate::diff;
 
 const AGENT: &str = "Agent ";
 const INDENT: &str = "      ";
@@ -20,6 +23,9 @@ const PROMPT_INDENT: &str = "  ";
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Tool lines show at most this many chars of args or output.
 const TOOL_PREVIEW: usize = 120;
+/// An accepted change keeps at most this many rows of its diff in the scrollback.
+const COMMITTED_DIFF_ROWS: usize = 20;
+const APPROVAL_PROMPT: &str = "  [y] accept  [n] reject  · Esc cancels";
 
 pub(crate) const LOGO: [&str; 6] = [
     " █████╗ ██╗  ██╗ ██████╗ ███╗   ██╗",
@@ -49,7 +55,7 @@ pub(crate) fn clear_live(out: &mut impl Write, lines_to_top: u16) -> io::Result<
 }
 
 /// Print a finished line into the scrollback, at the top of a cleared live area.
-pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
+pub(crate) fn commit(out: &mut impl Write, line: &Committed, width: u16) -> io::Result<()> {
     let (name, color, text) = match line {
         Committed::User(text) => ("You   ", Color::Green, text),
         Committed::Agent(text) => (AGENT, Color::Cyan, text),
@@ -64,6 +70,15 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
             )?;
             return Ok(());
         }
+        Committed::Diff(change) => {
+            diff::draw(out, change, usize::from(width.max(1)), COMMITTED_DIFF_ROWS)?;
+            return Ok(());
+        }
+        Committed::ToolResult {
+            name,
+            status: ToolStatus::Rejected,
+            ..
+        } => return tool_line(out, "  ✗   ", Color::Red, name, "rejected"),
         Committed::ToolCall { name, args } => {
             return tool_line(out, "  →   ", Color::Yellow, name, &preview(args));
         }
@@ -74,7 +89,7 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed) -> io::Result<()> {
         } => {
             let color = match status {
                 ToolStatus::Completed => Color::Magenta,
-                ToolStatus::Failed => Color::Red,
+                ToolStatus::Failed | ToolStatus::Rejected => Color::Red,
             };
             return tool_line(out, "  ←   ", color, name, &preview(output));
         }
@@ -133,15 +148,25 @@ pub(crate) fn render_live(
     height: u16,
 ) -> io::Result<u16> {
     let width = usize::from(width.max(1));
-    let input_rows: usize = app
-        .input
-        .split('\n')
-        .map(|line| rows(PROMPT.len() + line.chars().count(), width))
-        .sum();
+    let input_rows: usize = if app.approval.is_some() {
+        1
+    } else {
+        app.input
+            .split('\n')
+            .map(|line| rows(PROMPT.len() + line.chars().count(), width))
+            .sum()
+    };
     let activity_rows = usize::from(app.turn.is_some());
     let room = usize::from(height).saturating_sub(input_rows + activity_rows + 1);
-    let reply = wrap(app.streaming_text.trim_start(), width);
+    let reply = match &app.approval {
+        Some(_) => Vec::new(),
+        None => wrap(app.streaming_text.trim_start(), width),
+    };
     let skip = reply.len().saturating_sub(room);
+    let diff_rows = match &app.approval {
+        Some(approval) => diff::draw(out, &approval.change, width, room)?,
+        None => 0,
+    };
 
     for (i, row) in reply.iter().enumerate().skip(skip) {
         match row.strip_prefix(AGENT).filter(|_| i == 0) {
@@ -176,18 +201,22 @@ pub(crate) fn render_live(
         Print("\r\n"),
     )?;
 
-    for (i, line) in app.input.split('\n').enumerate() {
-        if i == 0 {
-            label(out, PROMPT, Color::White)?;
-        } else {
-            queue!(out, Print("\r\n"), Print(PROMPT_INDENT))?;
+    if app.approval.is_some() {
+        let prompt: String = APPROVAL_PROMPT.chars().take(width).collect();
+        label(out, &prompt, Color::Yellow)?;
+    } else {
+        for (i, line) in app.input.split('\n').enumerate() {
+            if i == 0 {
+                label(out, PROMPT, Color::White)?;
+            } else {
+                queue!(out, Print("\r\n"), Print(PROMPT_INDENT))?;
+            }
+            queue!(out, Print(line))?;
         }
-        queue!(out, Print(line))?;
+        queue!(out, cursor::Show)?;
     }
-    queue!(out, cursor::Show)?;
-    out.flush()?;
 
-    Ok((reply.len() - skip + activity_rows + input_rows) as u16)
+    Ok((diff_rows + reply.len() - skip + activity_rows + input_rows) as u16)
 }
 
 /// The activity row's text, starting with the spinner.
@@ -197,6 +226,7 @@ fn activity(turn: &Turn) -> String {
     match &turn.activity {
         Activity::Thinking => format!("{spinner} Thinking… {secs}s · Esc to cancel"),
         Activity::Running(tool) => format!("{spinner} Running {tool}… {secs}s · Esc to cancel"),
+        Activity::Approving => format!("{spinner} Waiting for approval… {secs}s"),
         Activity::Cancelling => format!("{spinner} Cancelling…"),
     }
 }
@@ -258,7 +288,7 @@ mod tests {
         App {
             input: input.into(),
             streaming_text: streaming_text.into(),
-            turn: None,
+            ..App::default()
         }
     }
 
@@ -344,6 +374,7 @@ mod tests {
                 status: ToolStatus::Failed,
                 output: "nope".into(),
             },
+            80,
         )
         .unwrap();
         let out = String::from_utf8(out).unwrap();
@@ -355,10 +386,62 @@ mod tests {
     #[test]
     fn commit_indents_continuation_lines() {
         let mut out = Vec::new();
-        commit(&mut out, &Committed::User("a\nb".into())).unwrap();
+        commit(&mut out, &Committed::User("a\nb".into()), 80).unwrap();
         let out = String::from_utf8(out).unwrap();
 
         assert!(out.contains("You   "));
         assert!(out.ends_with("a\r\n      b\r\n"), "{out:?}");
+    }
+
+    fn asked_app() -> App {
+        let mut app = app("I'll write it.", "draft");
+        app.turn = Some(busy_turn());
+        app.on_event(axon_protocol::Event::ApprovalRequested {
+            id: 1,
+            change: axon_protocol::Change::WriteFile {
+                path: "a.txt".into(),
+                old_text: None,
+                new_text: (1..=30).map(|n| format!("{n}\n")).collect(),
+            },
+        });
+        app
+    }
+
+    #[test]
+    fn approval_shows_the_diff_and_prompt_in_place_of_reply_and_input() {
+        let (out, lines_to_top) = render(&asked_app(), 40, 12);
+
+        assert!(out.contains("a.txt (new file)"));
+        assert!(out.contains("Waiting for approval"));
+        assert!(out.contains("[y] accept  [n] reject"));
+        assert!(!out.contains("draft"), "the input is hidden");
+        // 12 rows: 9 diff rows, the activity row, the separator, the prompt.
+        assert!(out.contains("more lines"));
+        assert_eq!(lines_to_top, 9 + 1 + 1);
+    }
+
+    #[test]
+    fn rejected_and_accepted_changes_commit_their_own_lines() {
+        let mut out = Vec::new();
+        let rejected = Committed::ToolResult {
+            name: "edit_file".into(),
+            status: ToolStatus::Rejected,
+            output: "the user rejected this change".into(),
+        };
+        commit(&mut out, &rejected, 80).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("✗") && text.contains("edit_file") && text.contains("rejected"));
+        assert!(!text.contains("the user"));
+
+        let mut out = Vec::new();
+        let new_text: String = (1..=50).map(|n| format!("{n}\n")).collect();
+        let accepted = Committed::Diff(axon_protocol::Change::WriteFile {
+            path: "a.txt".into(),
+            old_text: None,
+            new_text,
+        });
+        commit(&mut out, &accepted, 80).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("\r\n").count(), COMMITTED_DIFF_ROWS);
     }
 }
