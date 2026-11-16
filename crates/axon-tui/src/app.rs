@@ -3,7 +3,7 @@
 use std::mem;
 use std::time::{Duration, Instant};
 
-use axon_protocol::{Event, StopReason, ToolStatus};
+use axon_protocol::{Change, Event, StopReason, ToolStatus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Default)]
@@ -13,6 +13,16 @@ pub(crate) struct App {
     pub(crate) streaming_text: String,
     /// The running turn; Enter does nothing until it ends.
     pub(crate) turn: Option<Turn>,
+    /// A change waiting for y or n; the live area shows it instead of the input.
+    pub(crate) approval: Option<Approval>,
+    /// The change the user accepted, committed as a diff once it's written.
+    pub(crate) accepted: Option<Change>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct Approval {
+    id: u64,
+    pub(crate) change: Change,
 }
 
 /// What the activity row shows while a turn runs.
@@ -30,6 +40,7 @@ pub(crate) struct Turn {
 pub(crate) enum Activity {
     Thinking,
     Running(String),
+    Approving,
     /// Cancel was sent; the turn ends when the session confirms it.
     Cancelling,
 }
@@ -48,6 +59,7 @@ impl Turn {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Action {
     Submit(String),
+    Answer { id: u64, approve: bool },
     Cancel,
     Quit,
 }
@@ -66,12 +78,17 @@ pub(crate) enum Committed {
         status: ToolStatus,
         output: String,
     },
+    /// A change the user accepted, as written.
+    Diff(Change),
     Error(String),
     Cancelled,
 }
 
 impl App {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.approval.is_some() {
+            return self.on_approval_key(key);
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => Some(Action::Quit),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if self.turn.is_none() => {
@@ -95,6 +112,26 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    /// While a change waits, only y, n, cancel and quit do anything.
+    fn on_approval_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let approve = match (key.code, key.modifiers) {
+            (KeyCode::Char('y' | 'Y'), KeyModifiers::NONE | KeyModifiers::SHIFT) => true,
+            (KeyCode::Char('n' | 'N'), KeyModifiers::NONE | KeyModifiers::SHIFT) => false,
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Some(Action::Quit),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                self.approval = None;
+                return self.cancel();
+            }
+            _ => return None,
+        };
+        let Approval { id, change } = self.approval.take()?;
+        if approve {
+            self.accepted = Some(change);
+        }
+        self.set_activity(Activity::Thinking);
+        Some(Action::Answer { id, approve })
     }
 
     fn submit(&mut self) -> Option<Action> {
@@ -147,17 +184,30 @@ impl App {
                 committed.push(Committed::ToolCall { name, args });
                 committed
             }
+            Event::ApprovalRequested { id, change } => {
+                self.set_activity(Activity::Approving);
+                self.approval = Some(Approval { id, change });
+                self.take_reply()
+            }
             Event::ToolCallFinished {
                 name,
                 status,
                 output,
             } => {
                 self.set_activity(Activity::Thinking);
-                vec![Committed::ToolResult {
+                self.approval = None;
+                let mut committed = Vec::new();
+                if let Some(change) = self.accepted.take()
+                    && status == ToolStatus::Completed
+                {
+                    committed.push(Committed::Diff(change));
+                }
+                committed.push(Committed::ToolResult {
                     name,
                     status,
                     output,
-                }]
+                });
+                committed
             }
             Event::Error { message } => {
                 let mut committed = self.take_reply();
@@ -166,6 +216,8 @@ impl App {
             }
             Event::TurnEnded { stop } => {
                 self.turn = None;
+                self.approval = None;
+                self.accepted = None;
                 let mut committed = self.take_reply();
                 match stop {
                     StopReason::EndTurn => {}
@@ -448,5 +500,111 @@ mod tests {
 
         assert!(app.on_event(END).is_empty());
         assert!(app.turn.is_none());
+    }
+
+    fn change() -> Change {
+        Change::WriteFile {
+            path: "a.txt".into(),
+            old_text: None,
+            new_text: "hi\n".into(),
+        }
+    }
+
+    fn asked_app() -> App {
+        let mut app = busy_app();
+        app.on_event(Event::ApprovalRequested {
+            id: 7,
+            change: change(),
+        });
+        app
+    }
+
+    fn finished(status: ToolStatus) -> Event {
+        Event::ToolCallFinished {
+            name: "write_file".into(),
+            status,
+            output: "out".into(),
+        }
+    }
+
+    #[test]
+    fn approval_request_commits_the_reply_and_waits() {
+        let mut app = busy_app();
+        app.on_event(delta("I'll write it."));
+
+        let committed = app.on_event(Event::ApprovalRequested {
+            id: 7,
+            change: change(),
+        });
+
+        assert_eq!(committed, [Committed::Agent("I'll write it.".into())]);
+        assert_eq!(*activity(&app), Activity::Approving);
+        assert_eq!(app.approval.as_ref().map(|a| &a.change), Some(&change()));
+    }
+
+    #[test]
+    fn y_accepts_and_the_diff_is_committed_when_written() {
+        let mut app = asked_app();
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            Some(Action::Answer {
+                id: 7,
+                approve: true
+            })
+        );
+        assert!(app.approval.is_none());
+        assert_eq!(
+            app.on_event(finished(ToolStatus::Completed)),
+            [
+                Committed::Diff(change()),
+                Committed::ToolResult {
+                    name: "write_file".into(),
+                    status: ToolStatus::Completed,
+                    output: "out".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn n_rejects_and_commits_no_diff() {
+        let mut app = asked_app();
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('n'))),
+            Some(Action::Answer {
+                id: 7,
+                approve: false
+            })
+        );
+        let committed = app.on_event(finished(ToolStatus::Rejected));
+        assert!(matches!(
+            &committed[..],
+            [Committed::ToolResult {
+                status: ToolStatus::Rejected,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn other_keys_are_ignored_while_asked() {
+        let mut app = asked_app();
+
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.on_key(ctrl('y')), None);
+        assert_eq!(app.input, "");
+        assert!(app.approval.is_some());
+    }
+
+    #[test]
+    fn esc_while_asked_cancels_the_turn() {
+        let mut app = asked_app();
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Cancel));
+        assert!(app.approval.is_none());
+        assert_eq!(*activity(&app), Activity::Cancelling);
     }
 }

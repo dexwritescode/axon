@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods, reason = "the TUI owns stdout")]
 
 mod app;
+mod diff;
 mod draw;
 
 use std::io::{self, Stdout, Write};
@@ -124,6 +125,13 @@ async fn step(
                 commands.send(Command::Cancel).await.ok()?;
                 Some(Vec::new())
             }
+            Some(Action::Answer { id, approve }) => {
+                commands
+                    .send(Command::Approval { id, approve })
+                    .await
+                    .ok()?;
+                Some(Vec::new())
+            }
             Some(Action::Submit(text)) => {
                 let prompt = Command::Prompt { text: text.clone() };
                 commands.send(prompt).await.ok()?;
@@ -148,12 +156,12 @@ fn redraw(
     lines_to_top: u16,
     committed: &[Committed],
 ) -> io::Result<u16> {
+    let (width, height) = terminal::size()?;
     let mut frame = Vec::new();
     draw::clear_live(&mut frame, lines_to_top)?;
     for line in committed {
-        draw::commit(&mut frame, line)?;
+        draw::commit(&mut frame, line, width)?;
     }
-    let (width, height) = terminal::size()?;
     let lines_to_top = draw::render_live(&mut frame, app, width, height)?;
     out.write_all(&frame)?;
     out.flush()?;

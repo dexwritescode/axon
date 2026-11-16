@@ -9,13 +9,24 @@ use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs, FunctionCall,
 };
-use axon_protocol::{Event, StopReason, ToolStatus};
+use axon_protocol::{Change, Event, StopReason, ToolStatus};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
-use crate::{prompt, tools};
+use crate::prompt;
+use crate::tools::{self, Action, Write};
+
+const CANCELLED: &str = "cancelled by user";
+const REJECTED: &str = "the user rejected this change";
+const SKIPPED: &str = "not run: the user rejected an earlier change";
+
+/// The user's answer to an `ApprovalRequested` event.
+pub(crate) struct Approval {
+    pub(crate) id: u64,
+    pub(crate) approve: bool,
+}
 
 /// What a turn needs besides the history.
 pub(crate) struct Agent {
@@ -32,13 +43,17 @@ impl Agent {
     /// When `cancel` fires, the turn stops at the next safe point and leaves
     /// `history` valid: a partial reply is kept without its tool calls, and
     /// tool calls not yet run are answered with "cancelled by user".
+    /// File changes wait for an answer on `approvals`; a rejection ends the
+    /// turn, so the user can say what they want instead.
     pub(crate) async fn turn(
         &self,
         history: &mut Vec<ChatCompletionRequestMessage>,
         events: &mpsc::Sender<Event>,
+        approvals: &mut mpsc::UnboundedReceiver<Approval>,
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
         let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
+        let mut next_approval = 0;
         for _ in 0..self.max_requests {
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
@@ -54,11 +69,22 @@ impl Agent {
             if reply.calls.is_empty() {
                 return Ok(StopReason::EndTurn);
             }
+            let mut rejected = false;
             for call in reply.calls {
                 let output = if cancel.is_cancelled() {
-                    "cancelled by user".to_string()
+                    CANCELLED.to_string()
+                } else if rejected {
+                    SKIPPED.to_string()
                 } else {
-                    self.run_tool(&call, events).await?
+                    next_approval += 1;
+                    let asking = Asking {
+                        id: next_approval,
+                        approvals: &mut *approvals,
+                        cancel,
+                    };
+                    let (status, output) = self.run_tool(&call, events, asking).await?;
+                    rejected = status == ToolStatus::Rejected;
+                    output
                 };
                 history.push(
                     ChatCompletionRequestToolMessageArgs::default()
@@ -70,6 +96,9 @@ impl Agent {
             }
             if cancel.is_cancelled() {
                 return Ok(StopReason::Cancelled);
+            }
+            if rejected {
+                return Ok(StopReason::EndTurn);
             }
         }
         Ok(StopReason::MaxTurnRequests)
@@ -118,8 +147,14 @@ impl Agent {
         Ok(reply)
     }
 
-    /// Run a tool call, reporting it to the frontend; returns what the model sees.
-    async fn run_tool(&self, call: &ToolCall, events: &mpsc::Sender<Event>) -> Result<String> {
+    /// Run a tool call, reporting it to the frontend and asking before any
+    /// file change; returns how it ended and what the model sees.
+    async fn run_tool(
+        &self,
+        call: &ToolCall,
+        events: &mpsc::Sender<Event>,
+        asking: Asking<'_>,
+    ) -> Result<(ToolStatus, String)> {
         events
             .send(Event::ToolCallStarted {
                 name: call.name.clone(),
@@ -127,19 +162,106 @@ impl Agent {
             })
             .await?;
         let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
-        let result = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
-        let (status, output, for_model) = match result {
-            Ok(output) => (ToolStatus::Completed, output.clone(), output),
-            Err(error) => (ToolStatus::Failed, error.clone(), format!("error: {error}")),
+        let action = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
+        let outcome = match action {
+            Ok(Action::Output(output)) => Outcome::completed(output),
+            Ok(Action::Write(write)) => approve_and_write(write, events, asking).await?,
+            Err(error) => Outcome::failed(error),
         };
         events
             .send(Event::ToolCallFinished {
                 name: call.name.clone(),
-                status,
-                output,
+                status: outcome.status,
+                output: outcome.output,
             })
             .await?;
-        Ok(for_model)
+        Ok((outcome.status, outcome.for_model))
+    }
+}
+
+/// How a tool call ended.
+struct Outcome {
+    status: ToolStatus,
+    /// For the frontend.
+    output: String,
+    for_model: String,
+}
+
+impl Outcome {
+    fn completed(output: String) -> Self {
+        Self {
+            status: ToolStatus::Completed,
+            for_model: output.clone(),
+            output,
+        }
+    }
+
+    fn failed(error: String) -> Self {
+        Self {
+            status: ToolStatus::Failed,
+            for_model: format!("error: {error}"),
+            output: error,
+        }
+    }
+
+    fn rejected(why: &str) -> Self {
+        Self {
+            status: ToolStatus::Rejected,
+            output: why.into(),
+            for_model: why.into(),
+        }
+    }
+}
+
+/// Show the change, wait for the user, and write the file if they approve.
+async fn approve_and_write(
+    write: Write,
+    events: &mpsc::Sender<Event>,
+    asking: Asking<'_>,
+) -> Result<Outcome> {
+    let change = Change::WriteFile {
+        path: write.path.clone(),
+        old_text: write.old_text.clone(),
+        new_text: write.new_text.clone(),
+    };
+    events
+        .send(Event::ApprovalRequested {
+            id: asking.id,
+            change,
+        })
+        .await?;
+    Ok(match asking.answer().await {
+        Some(true) => match tokio::task::spawn_blocking(move || write.apply()).await? {
+            Ok(output) => Outcome::completed(output),
+            Err(error) => Outcome::failed(error),
+        },
+        Some(false) => Outcome::rejected(REJECTED),
+        None => Outcome::rejected(CANCELLED),
+    })
+}
+
+/// One approval request: its id and where the answer comes from.
+struct Asking<'a> {
+    id: u64,
+    approvals: &'a mut mpsc::UnboundedReceiver<Approval>,
+    cancel: &'a CancellationToken,
+}
+
+impl Asking<'_> {
+    /// The user's answer, or `None` if the turn is cancelled first.
+    /// Answers to other requests are ignored.
+    async fn answer(self) -> Option<bool> {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return None,
+                approval = self.approvals.recv() => match approval {
+                    Some(approval) if approval.id == self.id => return Some(approval.approve),
+                    Some(_) => {}
+                    None => return None,
+                },
+            }
+        }
     }
 }
 
@@ -178,10 +300,14 @@ fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionR
 mod tests {
     use super::*;
     use crate::session;
-    use crate::test_support::{agent, prompt, reply, respond, sent_messages, tool_calls};
+    use crate::test_support::{
+        agent, prompt, prompt_answering, reply, respond, sent_messages, tool_calls,
+    };
     use axon_protocol::SessionHandle;
+    use axon_protocol::{Change, Command};
     use serde_json::json;
     use std::fs;
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
     use wiremock::MockServer;
@@ -321,9 +447,10 @@ mod tests {
         let (events, mut received) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let mut history = vec![ChatCompletionRequestMessage::User("go".into())];
+        let (_approve, mut approvals) = mpsc::unbounded_channel();
         let mut seen = Vec::new();
         let stop = {
-            let mut turn = pin!(agent.turn(&mut history, &events, &cancel));
+            let mut turn = pin!(agent.turn(&mut history, &events, &mut approvals, &cancel));
             loop {
                 tokio::select! {
                     stop = &mut turn => break stop.unwrap(),
@@ -391,5 +518,170 @@ mod tests {
             ]
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    fn finished(name: &str, status: ToolStatus, output: &str) -> Event {
+        Event::ToolCallFinished {
+            name: name.into(),
+            status,
+            output: output.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_write_creates_the_file_and_tells_the_model() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"path":"sub/new.txt","content":"hi\n"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        respond(&server, reply(&["Done."])).await;
+
+        let events = prompt_answering(&mut handle, "write", Some(true)).await;
+
+        assert_eq!(
+            events[1..3],
+            [
+                Event::ApprovalRequested {
+                    id: 1,
+                    change: Change::WriteFile {
+                        path: "sub/new.txt".into(),
+                        old_text: None,
+                        new_text: "hi\n".into()
+                    }
+                },
+                finished("write_file", ToolStatus::Completed, "wrote sub/new.txt"),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("sub/new.txt")).unwrap(),
+            "hi\n"
+        );
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "wrote sub/new.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_edit_changes_the_file() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"path":"notes.txt","old_string":"milk","new_string":"eggs"}"#;
+        respond(&server, tool_calls(&[("c1", "edit_file", args)])).await;
+        respond(&server, reply(&["Done."])).await;
+
+        let events = prompt_answering(&mut handle, "edit", Some(true)).await;
+
+        assert_eq!(
+            events[1],
+            Event::ApprovalRequested {
+                id: 1,
+                change: Change::WriteFile {
+                    path: "notes.txt".into(),
+                    old_text: Some("remember the milk\n".into()),
+                    new_text: "remember the eggs\n".into()
+                }
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "remember the eggs\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_leaves_the_file_skips_the_rest_and_ends_the_turn() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"path":"notes.txt","old_string":"milk","new_string":"eggs"}"#;
+        respond(
+            &server,
+            tool_calls(&[("c1", "edit_file", args), ("c2", "list_dir", "{}")]),
+        )
+        .await;
+        respond(&server, reply(&["Ok."])).await;
+
+        let events = prompt_answering(&mut handle, "edit", Some(false)).await;
+
+        assert_eq!(
+            events[2..],
+            [
+                finished("edit_file", ToolStatus::Rejected, REJECTED),
+                end(StopReason::EndTurn)
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "remember the milk\n"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        prompt(&mut handle, "use bread instead").await;
+        let sent = &sent_messages(&server).await[1];
+        assert_eq!(sent[2]["content"], REJECTED);
+        assert_eq!(sent[3]["content"], SKIPPED);
+        assert_eq!(sent[4]["content"], "use bread instead");
+    }
+
+    #[tokio::test]
+    async fn invalid_change_fails_without_asking() {
+        let (server, _dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"path":"../escape.txt","content":"x"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        respond(&server, reply(&["Ok."])).await;
+
+        let events = prompt(&mut handle, "write").await;
+
+        assert!(
+            matches!(&events[1], Event::ToolCallFinished { status: ToolStatus::Failed, output, .. } if output.contains("outside")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_to_other_requests_are_ignored_and_cancel_rejects() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"path":"new.txt","content":"x"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        let commands = handle.commands.clone();
+        commands
+            .send(Command::Prompt {
+                text: "write".into(),
+            })
+            .await
+            .unwrap();
+        commands
+            .send(Command::Approval {
+                id: 99,
+                approve: true,
+            })
+            .await
+            .unwrap();
+
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            loop {
+                let event = handle.events.recv().await.unwrap();
+                if matches!(event, Event::ApprovalRequested { .. }) {
+                    handle.commands.send(Command::Cancel).await.unwrap();
+                }
+                let done = matches!(event, Event::TurnEnded { .. });
+                events.push(event);
+                if done {
+                    break events;
+                }
+            }
+        })
+        .await
+        .expect("cancel should end the wait");
+        assert!(
+            matches!(events[1], Event::ApprovalRequested { id: 1, .. }),
+            "{events:?}"
+        );
+        assert_eq!(
+            events[2..],
+            [
+                finished("write_file", ToolStatus::Rejected, CANCELLED),
+                end(StopReason::Cancelled)
+            ]
+        );
+        assert!(!dir.path().join("new.txt").exists());
     }
 }

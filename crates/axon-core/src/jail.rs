@@ -16,6 +16,31 @@ pub(crate) fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Resolve a `path` that may not exist yet: its nearest existing ancestor
+/// must be inside `cwd`. The missing part can't contain `..`.
+pub(crate) fn resolve_new(cwd: &Path, path: &str) -> Result<PathBuf, String> {
+    let joined = cwd.join(path);
+    let mut existing = joined.as_path();
+    let mut missing = Vec::new();
+    // A dangling symlink counts as existing, so `resolve` rejects it.
+    while existing.symlink_metadata().is_err() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| format!("{path}: not a valid file path"))?;
+        missing.push(name);
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("{path}: not a valid file path"))?;
+    }
+    let base = existing
+        .canonicalize()
+        .map_err(|e| format!("{path}: {e}"))?;
+    if !base.starts_with(cwd) {
+        return Err(format!("{path}: outside the working directory"));
+    }
+    Ok(missing.iter().rev().fold(base, |dir, name| dir.join(name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +100,56 @@ mod tests {
                 .unwrap_err()
                 .starts_with("nope.rs: ")
         );
+    }
+
+    #[test]
+    fn new_paths_resolve_under_their_existing_ancestor() {
+        let (_root, cwd) = setup();
+
+        assert_eq!(
+            resolve_new(&cwd, "src/new/deep.rs"),
+            Ok(cwd.join("src/new/deep.rs"))
+        );
+        assert_eq!(
+            resolve_new(&cwd, "src/main.rs"),
+            Ok(cwd.join("src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn new_paths_cannot_escape() {
+        let (root, cwd) = setup();
+
+        assert!(
+            resolve_new(&cwd, "../new.rs")
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(
+            resolve_new(&cwd, "src/new/../../../x")
+                .unwrap_err()
+                .contains("not a valid file path")
+        );
+        let outside = root.path().join("elsewhere/new.rs");
+        assert!(
+            resolve_new(&cwd, outside.to_str().unwrap())
+                .unwrap_err()
+                .contains("outside")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_paths_through_a_symlinked_dir_or_dangling_link_are_rejected() {
+        let (root, cwd) = setup();
+        std::os::unix::fs::symlink(root.path(), cwd.join("up")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("gone"), cwd.join("dangling")).unwrap();
+
+        assert!(
+            resolve_new(&cwd, "up/new.rs")
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(resolve_new(&cwd, "dangling").is_err());
     }
 }
