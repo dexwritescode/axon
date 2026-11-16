@@ -342,13 +342,13 @@ mod tests {
             &Committed::ToolResult {
                 name: "list_dir".into(),
                 status: ToolStatus::Failed,
-                output: "error: nope".into(),
+                output: "nope".into(),
             },
         )
         .unwrap();
         let out = String::from_utf8(out).unwrap();
 
-        assert!(out.contains("←") && out.contains("list_dir") && out.contains("error: nope"));
+        assert!(out.contains("←") && out.contains("list_dir") && out.contains("nope"));
         assert!(out.ends_with("\r\n"));
     }
 

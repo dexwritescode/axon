@@ -186,7 +186,6 @@ name = "axon-acp"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "axon-protocol",
 ]
 
 [[package]]

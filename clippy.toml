@@ -1,0 +1,8 @@
+disallowed-macros = [
+    { path = "std::print", reason = "stdout is the ACP transport; only axon-tui writes to it" },
+    { path = "std::println", reason = "stdout is the ACP transport; only axon-tui writes to it" },
+    { path = "std::dbg", reason = "leftover debugging" },
+]
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "stdout is the ACP transport; only axon-tui writes to it" },
+]

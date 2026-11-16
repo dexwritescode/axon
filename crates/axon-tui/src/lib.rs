@@ -1,4 +1,5 @@
 //! Terminal frontend: draws a session inline in the terminal's scrollback.
+#![allow(clippy::disallowed_methods, reason = "the TUI owns stdout")]
 
 mod app;
 mod draw;

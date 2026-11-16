@@ -128,18 +128,18 @@ impl Agent {
             .await?;
         let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
         let result = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
-        let (status, output) = match result {
-            Ok(output) => (ToolStatus::Completed, output),
-            Err(error) => (ToolStatus::Failed, format!("error: {error}")),
+        let (status, output, for_model) = match result {
+            Ok(output) => (ToolStatus::Completed, output.clone(), output),
+            Err(error) => (ToolStatus::Failed, error.clone(), format!("error: {error}")),
         };
         events
             .send(Event::ToolCallFinished {
                 name: call.name.clone(),
                 status,
-                output: output.clone(),
+                output,
             })
             .await?;
-        Ok(output)
+        Ok(for_model)
     }
 }
 
@@ -270,12 +270,12 @@ mod tests {
         };
         assert_eq!(*status, ToolStatus::Failed);
         assert!(
-            output.starts_with("error: arguments were not valid JSON"),
+            output.starts_with("arguments were not valid JSON"),
             "{output}"
         );
         assert_eq!(
             sent_messages(&server).await[1][2]["content"],
-            output.as_str()
+            format!("error: {output}")
         );
     }
 
