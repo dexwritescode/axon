@@ -254,7 +254,10 @@ mod tests {
                 .unwrap()
                 .contains(cwd.to_str().unwrap())
         );
-        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["tools"].as_array().unwrap().len(),
+            tools::schemas().len()
+        );
     }
 
     #[tokio::test]
