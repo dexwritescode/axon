@@ -1,7 +1,10 @@
 //! The tools the model can call, and their schemas.
 
+mod find;
+mod grep;
 mod list;
 mod read;
+mod walk;
 
 use std::path::Path;
 
@@ -35,6 +38,33 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
                 }
             }),
         ),
+        schema(
+            "grep",
+            "Search file contents with a regex, skipping files ignored by .gitignore. Use it to find where something is instead of reading every file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex to search for (Rust regex syntax)"},
+                    "path": {"type": "string", "description": "File or directory to search; defaults to the working directory"},
+                    "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs; a glob with / matches the path from the working directory"},
+                    "ignore_case": {"type": "boolean", "description": "Match case-insensitively; defaults to false"},
+                    "output": {"type": "string", "enum": ["lines", "count", "files"], "description": "lines: path:line: text for each match (default); count: matching lines per file; files: paths only"}
+                },
+                "required": ["pattern"]
+            }),
+        ),
+        schema(
+            "find",
+            "Find files by name or path with a glob, skipping those ignored by .gitignore.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob such as *.rs (matches file names) or crates/*/src/*.rs (matches the path from the working directory)"},
+                    "path": {"type": "string", "description": "Directory to search; defaults to the working directory"}
+                },
+                "required": ["pattern"]
+            }),
+        ),
     ]
 }
 
@@ -59,6 +89,8 @@ pub(crate) fn run(cwd: &Path, name: &str, args: &str) -> Result<String, String> 
     match name {
         "read_file" => read::run(cwd, &args),
         "list_dir" => list::run(cwd, &args),
+        "grep" => grep::run(cwd, &args),
+        "find" => find::run(cwd, &args),
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -70,6 +102,16 @@ fn optional_usize(args: &Value, name: &str) -> Result<Option<usize>, String> {
             .as_u64()
             .map(|n| Some(n as usize))
             .ok_or_else(|| format!("{name} must be a non-negative integer")),
+    }
+}
+
+fn optional_bool(args: &Value, name: &str) -> Result<Option<bool>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("{name} must be true or false")),
     }
 }
 

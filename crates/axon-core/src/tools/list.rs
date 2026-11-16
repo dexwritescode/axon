@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use ignore::WalkBuilder;
 use serde_json::Value;
 
+use super::walk::{listing, relative, walk};
 use super::{optional_str, optional_usize};
 use crate::jail;
 
@@ -23,43 +23,22 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
         return Err(format!("{path}: not a directory"));
     }
 
-    let walk = WalkBuilder::new(&dir)
-        .max_depth(Some(depth))
-        .hidden(false)
-        .require_git(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .build();
-
     let mut entries = Vec::new();
-    for entry in walk {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let Ok(relative) = entry.path().strip_prefix(&dir) else {
-            continue;
-        };
-        if relative.as_os_str().is_empty() {
+    for entry in walk(&dir, Some(depth)) {
+        let entry = entry.map_err(|e| format!("{path}: {e}"))?;
+        if entry.path() == dir {
             continue;
         }
         let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
         let suffix = if is_dir { "/" } else { "" };
-        entries.push(format!("{}{suffix}", relative.display()));
+        entries.push(format!("{}{suffix}", relative(cwd, entry.path())));
     }
-
-    let total = entries.len();
-    if total == 0 {
-        return Ok("(empty)\n".into());
-    }
-    let mut out: String = entries
-        .iter()
-        .take(MAX_ENTRIES)
-        .map(|entry| format!("{entry}\n"))
-        .collect();
-    if total > MAX_ENTRIES {
-        out.push_str(&format!(
-            "[showing {MAX_ENTRIES} of {total} entries; list a subdirectory or lower the depth]\n"
-        ));
-    }
-    Ok(out)
+    Ok(listing(
+        &entries,
+        MAX_ENTRIES,
+        "(empty)",
+        "list a subdirectory or lower the depth",
+    ))
 }
 
 #[cfg(test)]
@@ -102,7 +81,7 @@ mod tests {
 
         assert_eq!(
             list(&dir, json!({"path": "src", "depth": 1})),
-            Ok("deep/\nmain.rs\n".into())
+            Ok("src/deep/\nsrc/main.rs\n".into())
         );
     }
 
@@ -115,9 +94,7 @@ mod tests {
 
         let out = list(&dir, json!({})).unwrap();
         assert_eq!(out.lines().count(), MAX_ENTRIES + 1);
-        assert!(
-            out.ends_with("[showing 500 of 510 entries; list a subdirectory or lower the depth]\n")
-        );
+        assert!(out.ends_with("[showing 500 of 510; list a subdirectory or lower the depth]\n"));
     }
 
     #[test]
