@@ -14,7 +14,7 @@ use crossterm::{
 use axon_protocol::ToolStatus;
 
 use crate::app::{Activity, App, Committed, Turn};
-use crate::diff;
+use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
 const INDENT: &str = "      ";
@@ -25,7 +25,12 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 const TOOL_PREVIEW: usize = 120;
 /// An accepted change keeps at most this many rows of its diff in the scrollback.
 const COMMITTED_DIFF_ROWS: usize = 20;
-const APPROVAL_PROMPT: &str = "  [y] accept  [n] reject  · Esc cancels";
+/// The y/n prompt, in parts of one colour each.
+const APPROVAL_PROMPT: [(&str, Color, bool); 3] = [
+    ("  [y] accept", theme::ACCEPT, true),
+    ("  [n] reject", theme::REJECT, true),
+    ("  · Esc cancels", theme::MUTED, false),
+];
 
 pub(crate) const LOGO: [&str; 6] = [
     " █████╗ ██╗  ██╗ ██████╗ ███╗   ██╗",
@@ -38,7 +43,7 @@ pub(crate) const LOGO: [&str; 6] = [
 
 pub(crate) fn print_logo(out: &mut impl Write) -> io::Result<()> {
     for line in LOGO {
-        label(out, line, Color::Cyan)?;
+        label(out, line, theme::AGENT)?;
         queue!(out, Print("\r\n"))?;
     }
     out.flush()
@@ -57,13 +62,13 @@ pub(crate) fn clear_live(out: &mut impl Write, lines_to_top: u16) -> io::Result<
 /// Print a finished line into the scrollback, at the top of a cleared live area.
 pub(crate) fn commit(out: &mut impl Write, line: &Committed, width: u16) -> io::Result<()> {
     let (name, color, text) = match line {
-        Committed::User(text) => ("You   ", Color::Green, text),
-        Committed::Agent(text) => (AGENT, Color::Cyan, text),
-        Committed::Error(text) => ("Error ", Color::Red, text),
+        Committed::User(text) => ("You   ", theme::USER, text),
+        Committed::Agent(text) => (AGENT, theme::AGENT, text),
+        Committed::Error(text) => ("Error ", theme::ERROR, text),
         Committed::Cancelled => {
             queue!(
                 out,
-                SetForegroundColor(Color::Red),
+                SetForegroundColor(theme::ERROR),
                 Print("  ✗   cancelled"),
                 ResetColor,
                 Print("\r\n"),
@@ -78,9 +83,9 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed, width: u16) -> io::
             name,
             status: ToolStatus::Rejected,
             ..
-        } => return tool_line(out, "  ✗   ", Color::Red, name, "rejected"),
+        } => return tool_line(out, "  ✗   ", theme::REJECTED, name, "rejected"),
         Committed::ToolCall { name, args } => {
-            return tool_line(out, "  →   ", Color::Yellow, name, &preview(args));
+            return tool_line(out, "  →   ", theme::TOOL, name, &preview(args));
         }
         Committed::ToolResult {
             name,
@@ -88,8 +93,8 @@ pub(crate) fn commit(out: &mut impl Write, line: &Committed, width: u16) -> io::
             output,
         } => {
             let color = match status {
-                ToolStatus::Completed => Color::Magenta,
-                ToolStatus::Failed | ToolStatus::Rejected => Color::Red,
+                ToolStatus::Completed => theme::TOOL,
+                ToolStatus::Failed | ToolStatus::Rejected => theme::ERROR,
             };
             return tool_line(out, "  ←   ", color, name, &preview(output));
         }
@@ -115,11 +120,11 @@ fn tool_line(
     queue!(
         out,
         SetForegroundColor(color),
-        Print(arrow),
         SetAttribute(Attribute::Bold),
+        Print(arrow),
         Print(name),
         SetAttribute(Attribute::Reset),
-        SetForegroundColor(Color::DarkGrey),
+        SetForegroundColor(color),
         Print(format!("  {detail}")),
         ResetColor,
         Print("\r\n"),
@@ -171,7 +176,7 @@ pub(crate) fn render_live(
     for (i, row) in reply.iter().enumerate().skip(skip) {
         match row.strip_prefix(AGENT).filter(|_| i == 0) {
             Some(rest) => {
-                label(out, AGENT, Color::Cyan)?;
+                label(out, AGENT, theme::AGENT)?;
                 queue!(out, Print(rest))?;
             }
             None => queue!(out, Print(row))?,
@@ -184,9 +189,9 @@ pub(crate) fn render_live(
         let (spinner, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
         queue!(
             out,
-            SetForegroundColor(Color::Cyan),
+            SetForegroundColor(theme::AGENT),
             Print(spinner),
-            SetForegroundColor(Color::DarkGrey),
+            SetForegroundColor(theme::MUTED),
             Print(rest),
             ResetColor,
             Print("\r\n"),
@@ -195,19 +200,27 @@ pub(crate) fn render_live(
 
     queue!(
         out,
-        SetForegroundColor(Color::DarkGrey),
+        SetForegroundColor(theme::MUTED),
         Print("─".repeat(width)),
         ResetColor,
         Print("\r\n"),
     )?;
 
     if app.approval.is_some() {
-        let prompt: String = APPROVAL_PROMPT.chars().take(width).collect();
-        label(out, &prompt, Color::Yellow)?;
+        let mut room = width;
+        for (text, color, bold) in APPROVAL_PROMPT {
+            let text: String = text.chars().take(room).collect();
+            room -= text.chars().count();
+            if bold {
+                label(out, &text, color)?;
+            } else {
+                queue!(out, SetForegroundColor(color), Print(text), ResetColor)?;
+            }
+        }
     } else {
         for (i, line) in app.input.split('\n').enumerate() {
             if i == 0 {
-                label(out, PROMPT, Color::White)?;
+                label(out, PROMPT, theme::INPUT)?;
             } else {
                 queue!(out, Print("\r\n"), Print(PROMPT_INDENT))?;
             }
@@ -413,7 +426,7 @@ mod tests {
 
         assert!(out.contains("a.txt (new file)"));
         assert!(out.contains("Waiting for approval"));
-        assert!(out.contains("[y] accept  [n] reject"));
+        assert!(out.contains("[y] accept") && out.contains("[n] reject"));
         assert!(!out.contains("draft"), "the input is hidden");
         // 12 rows: 9 diff rows, the activity row, the separator, the prompt.
         assert!(out.contains("more lines"));

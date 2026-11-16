@@ -1,8 +1,10 @@
 //! Syntax-highlighted diffs of a proposed file change, one screen row per line.
 
 use std::io::{self, Write};
+use std::ops::Range;
 use std::sync::LazyLock;
 
+use crate::theme;
 use axon_protocol::Change;
 use crossterm::{
     queue,
@@ -13,7 +15,7 @@ use crossterm::{
 use similar::{ChangeTag, TextDiff};
 use syntect::{
     easy::HighlightLines,
-    highlighting::{Theme, ThemeSet},
+    highlighting::Theme,
     parsing::{SyntaxReference, SyntaxSet},
 };
 
@@ -23,8 +25,7 @@ const CONTEXT: usize = 3;
 const GUTTER: usize = 12;
 
 static SYNTAX: LazyLock<(SyntaxSet, Theme)> = LazyLock::new(|| {
-    let mut themes = ThemeSet::load_defaults().themes;
-    let theme = themes.remove("base16-ocean.dark").unwrap_or_default();
+    let theme = two_face::theme::extra().get(theme::SYNTAX_THEME).clone();
     (two_face::syntax::extra_newlines(), theme)
 });
 
@@ -38,6 +39,8 @@ enum Row {
         old: Option<usize>,
         new: Option<usize>,
         text: String,
+        /// Byte ranges of `text` that changed within the line.
+        words: Vec<Range<usize>>,
     },
     /// Rows cut off to fit.
     More(usize),
@@ -89,15 +92,22 @@ fn rows(path: &str, old_text: Option<&str>, new_text: &str) -> Vec<Row> {
             rows.push(Row::Gap);
         }
         for op in group {
-            for change in diff.iter_changes(op) {
+            for change in diff.iter_inline_changes(op) {
+                let mut text = String::new();
+                let mut words = Vec::new();
+                for (changed, part) in change.iter_strings_lossy() {
+                    let start = text.len();
+                    text.push_str(&part.trim_end_matches(['\n', '\r']).replace('\t', "    "));
+                    if changed && text.len() > start {
+                        words.push(start..text.len());
+                    }
+                }
                 rows.push(Row::Line {
                     tag: change.tag(),
                     old: change.old_index().map(|n| n + 1),
                     new: change.new_index().map(|n| n + 1),
-                    text: change
-                        .value()
-                        .trim_end_matches(['\n', '\r'])
-                        .replace('\t', "    "),
+                    text,
+                    words,
                 });
             }
         }
@@ -118,6 +128,7 @@ fn draw_row(
         old,
         new,
         text,
+        words,
     } = row
     else {
         return match row {
@@ -135,28 +146,20 @@ fn draw_row(
     let (marker, color, background) = match tag {
         ChangeTag::Delete => (
             '-',
-            Color::Red,
-            Some(Color::Rgb {
-                r: 80,
-                g: 25,
-                b: 25,
-            }),
+            theme::DIFF_REMOVED,
+            Some((theme::DIFF_REMOVED_BG, theme::DIFF_REMOVED_WORDS_BG)),
         ),
         ChangeTag::Insert => (
             '+',
-            Color::Green,
-            Some(Color::Rgb {
-                r: 25,
-                g: 70,
-                b: 25,
-            }),
+            theme::DIFF_ADDED,
+            Some((theme::DIFF_ADDED_BG, theme::DIFF_ADDED_WORDS_BG)),
         ),
-        ChangeTag::Equal => (' ', Color::DarkGrey, None),
+        ChangeTag::Equal => (' ', theme::DIFF_CONTEXT, None),
     };
     let number = |n: &Option<usize>| n.map_or(String::new(), |n| n.to_string());
     let gutter = format!("{marker} {:>4} {:>4} ", number(old), number(new));
-    if let Some(background) = background {
-        queue!(out, SetBackgroundColor(background))?;
+    if let Some((line_bg, _)) = background {
+        queue!(out, SetBackgroundColor(line_bg))?;
     }
     queue!(
         out,
@@ -170,9 +173,8 @@ fn draw_row(
     let pieces = highlighter
         .highlight_line(&line, syntaxes)
         .unwrap_or_default();
+    let mut at = 0;
     for (style, piece) in pieces {
-        let piece: String = piece.trim_end_matches('\n').chars().take(room).collect();
-        room -= piece.chars().count();
         let c = style.foreground;
         queue!(
             out,
@@ -180,16 +182,30 @@ fn draw_row(
                 r: c.r,
                 g: c.g,
                 b: c.b
-            }),
-            Print(piece)
+            })
         )?;
+        for ch in piece.trim_end_matches('\n').chars() {
+            if room == 0 {
+                return Ok(());
+            }
+            if let Some((line_bg, words_bg)) = background {
+                let changed = words.iter().any(|w| w.contains(&at));
+                queue!(
+                    out,
+                    SetBackgroundColor(if changed { words_bg } else { line_bg })
+                )?;
+            }
+            queue!(out, Print(ch))?;
+            at += ch.len_utf8();
+            room -= 1;
+        }
     }
     Ok(())
 }
 
 fn note(out: &mut impl Write, text: &str, width: usize) -> io::Result<()> {
     let text: String = text.chars().take(width).collect();
-    queue!(out, SetForegroundColor(Color::DarkGrey), Print(text))
+    queue!(out, SetForegroundColor(theme::MUTED), Print(text))
 }
 
 #[cfg(test)]
@@ -202,6 +218,15 @@ mod tests {
             old,
             new,
             text: text.into(),
+            words: Vec::new(),
+        }
+    }
+
+    /// The changed words of a line row.
+    fn words(row: &Row) -> Vec<&str> {
+        match row {
+            Row::Line { text, words, .. } => words.iter().map(|w| &text[w.clone()]).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -259,10 +284,22 @@ mod tests {
 
         assert_eq!(rows[0], Row::Header("n.txt".into()));
         assert_eq!(rows[1], line(ChangeTag::Equal, Some(1), Some(1), "1"));
-        assert_eq!(rows[2], line(ChangeTag::Delete, Some(2), None, "2"));
-        assert_eq!(rows[3], line(ChangeTag::Insert, None, Some(2), "two"));
+        assert_eq!(words(&rows[2]), ["2"]);
+        assert_eq!(words(&rows[3]), ["two"]);
         assert!(rows.contains(&Row::Gap));
         assert!(!rows.contains(&line(ChangeTag::Equal, Some(10), Some(10), "10")));
+    }
+
+    #[test]
+    fn changed_words_are_marked_within_a_line() {
+        let rows = rows(
+            "a.rs",
+            Some("let name = \"world\";\n"),
+            "let name = \"Dex\";\n",
+        );
+
+        assert_eq!(words(&rows[1]), ["\"world\";"]);
+        assert_eq!(words(&rows[2]), ["\"Dex\";"]);
     }
 
     #[test]
