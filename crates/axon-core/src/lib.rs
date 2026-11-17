@@ -4,6 +4,8 @@
 
 mod context;
 mod jail;
+#[cfg(test)]
+mod live;
 mod model;
 mod prompt;
 mod session;
