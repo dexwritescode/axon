@@ -1,16 +1,13 @@
 //! Syntax-highlighted diffs of a proposed file change, one screen row per line.
 
-use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::LazyLock;
 
 use crate::theme;
 use axon_protocol::Change;
-use crossterm::{
-    queue,
-    style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    },
+use ratatui::{
+    style::{Color, Style, Stylize},
+    text::{Line, Span},
 };
 use similar::{ChangeTag, TextDiff};
 use syntect::{
@@ -46,14 +43,8 @@ enum Row {
     More(usize),
 }
 
-/// Draw `change` in at most `max_rows` rows (at least two) of `width`
-/// columns; returns how many rows it took.
-pub(crate) fn draw(
-    out: &mut impl Write,
-    change: &Change,
-    width: usize,
-    max_rows: usize,
-) -> io::Result<usize> {
+/// `change` in at most `max_rows` lines (at least two) of `width` columns.
+pub(crate) fn lines(change: &Change, width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let Change::WriteFile {
         path,
         old_text,
@@ -73,11 +64,9 @@ pub(crate) fn draw(
         .ok()
         .flatten()
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
-    for row in &rows {
-        draw_row(out, row, width, syntax, syntaxes, theme)?;
-        queue!(out, ResetColor, Print("\r\n"))?;
-    }
-    Ok(rows.len())
+    rows.iter()
+        .map(|row| line(row, width, syntax, syntaxes, theme))
+        .collect()
 }
 
 fn rows(path: &str, old_text: Option<&str>, new_text: &str) -> Vec<Row> {
@@ -115,32 +104,24 @@ fn rows(path: &str, old_text: Option<&str>, new_text: &str) -> Vec<Row> {
     rows
 }
 
-fn draw_row(
-    out: &mut impl Write,
+fn line(
     row: &Row,
     width: usize,
     syntax: &SyntaxReference,
     syntaxes: &SyntaxSet,
     theme: &Theme,
-) -> io::Result<()> {
-    let Row::Line {
-        tag,
-        old,
-        new,
-        text,
-        words,
-    } = row
-    else {
-        return match row {
-            Row::Header(header) => {
-                queue!(out, SetAttribute(Attribute::Bold))?;
-                note(out, &format!("  {header}"), width)?;
-                queue!(out, SetAttribute(Attribute::Reset))
-            }
-            Row::Gap => note(out, "  ⋯", width),
-            Row::More(n) => note(out, &format!("  … {n} more lines"), width),
-            Row::Line { .. } => unreachable!(),
-        };
+) -> Line<'static> {
+    let (tag, old, new, text, words) = match row {
+        Row::Header(header) => return note(format!("  {header}"), width).bold(),
+        Row::Gap => return note("  ⋯".into(), width),
+        Row::More(n) => return note(format!("  … {n} more lines"), width),
+        Row::Line {
+            tag,
+            old,
+            new,
+            text,
+            words,
+        } => (tag, old, new, text, words),
     };
 
     let (marker, color, background) = match tag {
@@ -158,14 +139,14 @@ fn draw_row(
     };
     let number = |n: &Option<usize>| n.map_or(String::new(), |n| n.to_string());
     let gutter = format!("{marker} {:>4} {:>4} ", number(old), number(new));
+    let mut gutter_style = Style::new().fg(color);
     if let Some((line_bg, _)) = background {
-        queue!(out, SetBackgroundColor(line_bg))?;
+        gutter_style = gutter_style.bg(line_bg);
     }
-    queue!(
-        out,
-        SetForegroundColor(color),
-        Print(gutter.chars().take(width).collect::<String>())
-    )?;
+    let mut spans = vec![Span::styled(
+        gutter.chars().take(width).collect::<String>(),
+        gutter_style,
+    )];
 
     let mut room = width.saturating_sub(GUTTER);
     let mut highlighter = HighlightLines::new(syntax, theme);
@@ -176,36 +157,29 @@ fn draw_row(
     let mut at = 0;
     for (style, piece) in pieces {
         let c = style.foreground;
-        queue!(
-            out,
-            SetForegroundColor(Color::Rgb {
-                r: c.r,
-                g: c.g,
-                b: c.b
-            })
-        )?;
+        let fg = Color::Rgb(c.r, c.g, c.b);
         for ch in piece.trim_end_matches('\n').chars() {
             if room == 0 {
-                return Ok(());
+                return Line::from(spans);
             }
+            let mut style = Style::new().fg(fg);
             if let Some((line_bg, words_bg)) = background {
                 let changed = words.iter().any(|w| w.contains(&at));
-                queue!(
-                    out,
-                    SetBackgroundColor(if changed { words_bg } else { line_bg })
-                )?;
+                style = style.bg(if changed { words_bg } else { line_bg });
             }
-            queue!(out, Print(ch))?;
+            match spans.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push(ch),
+                _ => spans.push(Span::styled(ch.to_string(), style)),
+            }
             at += ch.len_utf8();
             room -= 1;
         }
     }
-    Ok(())
+    Line::from(spans)
 }
 
-fn note(out: &mut impl Write, text: &str, width: usize) -> io::Result<()> {
-    let text: String = text.chars().take(width).collect();
-    queue!(out, SetForegroundColor(theme::MUTED), Print(text))
+fn note(text: String, width: usize) -> Line<'static> {
+    Line::from(text.chars().take(width).collect::<String>()).fg(theme::MUTED)
 }
 
 #[cfg(test)]
@@ -238,23 +212,8 @@ mod tests {
         }
     }
 
-    /// The drawn text without escape sequences.
-    fn plain(bytes: Vec<u8>) -> String {
-        let text = String::from_utf8(bytes).unwrap();
-        let mut out = String::new();
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     #[test]
@@ -303,17 +262,16 @@ mod tests {
     }
 
     #[test]
-    fn draw_fits_rows_and_width() {
+    fn lines_fit_rows_and_width() {
         let new: String = (1..=50)
             .map(|n| format!("line {n} {}\n", "x".repeat(100)))
             .collect();
-        let mut out = Vec::new();
 
-        let used = draw(&mut out, &change(None, &new), 40, 10).unwrap();
+        let lines: Vec<String> = lines(&change(None, &new), 40, 10)
+            .iter()
+            .map(text)
+            .collect();
 
-        let text = plain(out);
-        let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
-        assert_eq!(used, 10);
         assert_eq!(lines.len(), 10);
         assert!(lines.iter().all(|l| l.chars().count() <= 40), "{lines:?}");
         assert_eq!(lines[0], "  src/lib.rs (new file)");
@@ -323,5 +281,23 @@ mod tests {
             "{:?}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn changed_words_get_their_own_background() {
+        let change = change(Some("let a = 1;\n"), "let a = 2;\n");
+
+        let lines = lines(&change, 80, 10);
+
+        let added = &lines[2];
+        let bg_of = |s: &str| {
+            added
+                .spans
+                .iter()
+                .find(|span| span.content == s)
+                .map(|span| span.style.bg)
+        };
+        assert_eq!(bg_of("2"), Some(Some(theme::DIFF_ADDED_WORDS_BG)));
+        assert!(added.spans[1..].iter().all(|s| s.style.bg.is_some()));
     }
 }

@@ -4,7 +4,11 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use axon_protocol::{Change, Event, StopReason, ToolStatus};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use chrono::{DateTime, Local};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+
+/// History rows one wheel notch scrolls.
+const WHEEL_ROWS: u32 = 3;
 
 #[derive(Default)]
 pub(crate) struct App {
@@ -13,16 +17,29 @@ pub(crate) struct App {
     pub(crate) streaming_text: String,
     /// The running turn; Enter does nothing until it ends.
     pub(crate) turn: Option<Turn>,
-    /// A change waiting for y or n; the live area shows it instead of the input.
-    pub(crate) approval: Option<Approval>,
-    /// The change the user accepted, committed as a diff once it's written.
-    pub(crate) accepted: Option<Change>,
+    /// How the last turn ended, shown in the activity row until the next one.
+    pub(crate) finished: Option<Finished>,
+    /// The id of a change waiting for y or n; its diff is already in the
+    /// history and the y/n prompt replaces the input.
+    pub(crate) approval: Option<u64>,
+    /// The first history row shown, or `None` to follow the bottom.
+    pub(crate) scroll: Option<u32>,
+    /// The history pane as last drawn.
+    pub(crate) view: View,
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) struct Approval {
-    id: u64,
-    pub(crate) change: Change,
+/// The size of the history pane and of what it holds, in rows.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct View {
+    pub(crate) height: u16,
+    pub(crate) rows: u32,
+}
+
+impl View {
+    /// The first row shown when following the bottom.
+    pub(crate) fn bottom(self) -> u32 {
+        self.rows.saturating_sub(u32::from(self.height))
+    }
 }
 
 /// What the activity row shows while a turn runs.
@@ -34,6 +51,13 @@ pub(crate) struct Turn {
     /// Advances on every tick; picks the spinner frame.
     pub(crate) frame: usize,
     pub(crate) activity: Activity,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct Finished {
+    pub(crate) stop: StopReason,
+    pub(crate) at: DateTime<Local>,
+    pub(crate) took: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -64,7 +88,7 @@ pub(crate) enum Action {
     Quit,
 }
 
-/// A finished line for the scrollback.
+/// A finished line for the history.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Committed {
     User(String),
@@ -78,7 +102,7 @@ pub(crate) enum Committed {
         status: ToolStatus,
         output: String,
     },
-    /// A change the user accepted, as written.
+    /// A change asked for approval, kept whatever the answer.
     Diff(Change),
     Error(String),
     Cancelled,
@@ -86,6 +110,12 @@ pub(crate) enum Committed {
 
 impl App {
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::PageUp => return self.scroll_by(-i64::from(self.view.height)),
+            KeyCode::PageDown => return self.scroll_by(i64::from(self.view.height)),
+            KeyCode::End => return self.scroll_by(i64::from(self.view.rows)),
+            _ => {}
+        }
         if self.approval.is_some() {
             return self.on_approval_key(key);
         }
@@ -126,10 +156,7 @@ impl App {
             }
             _ => return None,
         };
-        let Approval { id, change } = self.approval.take()?;
-        if approve {
-            self.accepted = Some(change);
-        }
+        let id = self.approval.take()?;
         self.set_activity(Activity::Thinking);
         Some(Action::Answer { id, approve })
     }
@@ -143,6 +170,23 @@ impl App {
         self.input.clear();
         self.turn = Some(Turn::new(Instant::now()));
         Some(Action::Submit(text))
+    }
+
+    pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(-i64::from(WHEEL_ROWS)),
+            MouseEventKind::ScrollDown => self.scroll_by(i64::from(WHEEL_ROWS)),
+            _ => None,
+        };
+    }
+
+    /// Move the history by `rows` (up when negative). Reaching the bottom
+    /// follows it again, so new output shows; above it, the view stays put.
+    fn scroll_by(&mut self, rows: i64) -> Option<Action> {
+        let bottom = i64::from(self.view.bottom());
+        let top = i64::from(self.scroll.unwrap_or(self.view.bottom())) + rows;
+        self.scroll = (top < bottom).then(|| top.max(0) as u32);
+        None
     }
 
     /// Ask to cancel the running turn, once.
@@ -186,8 +230,10 @@ impl App {
             }
             Event::ApprovalRequested { id, change } => {
                 self.set_activity(Activity::Approving);
-                self.approval = Some(Approval { id, change });
-                self.take_reply()
+                self.approval = Some(id);
+                let mut committed = self.take_reply();
+                committed.push(Committed::Diff(change));
+                committed
             }
             Event::ToolCallFinished {
                 name,
@@ -196,18 +242,11 @@ impl App {
             } => {
                 self.set_activity(Activity::Thinking);
                 self.approval = None;
-                let mut committed = Vec::new();
-                if let Some(change) = self.accepted.take()
-                    && status == ToolStatus::Completed
-                {
-                    committed.push(Committed::Diff(change));
-                }
-                committed.push(Committed::ToolResult {
+                vec![Committed::ToolResult {
                     name,
                     status,
                     output,
-                });
-                committed
+                }]
             }
             Event::Error { message } => {
                 let mut committed = self.take_reply();
@@ -215,9 +254,14 @@ impl App {
                 committed
             }
             Event::TurnEnded { stop } => {
-                self.turn = None;
+                if let Some(turn) = self.turn.take() {
+                    self.finished = Some(Finished {
+                        stop,
+                        at: Local::now(),
+                        took: turn.started.elapsed(),
+                    });
+                }
                 self.approval = None;
-                self.accepted = None;
                 let mut committed = self.take_reply();
                 match stop {
                     StopReason::EndTurn => {}
@@ -495,6 +539,17 @@ mod tests {
     }
 
     #[test]
+    fn turn_end_records_how_it_ended() {
+        let mut app = busy_app();
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
+
+        assert_eq!(app.finished.map(|f| f.stop), Some(StopReason::Cancelled));
+    }
+
+    #[test]
     fn turn_end_without_text_commits_nothing() {
         let mut app = busy_app();
 
@@ -537,13 +592,19 @@ mod tests {
             change: change(),
         });
 
-        assert_eq!(committed, [Committed::Agent("I'll write it.".into())]);
+        assert_eq!(
+            committed,
+            [
+                Committed::Agent("I'll write it.".into()),
+                Committed::Diff(change())
+            ]
+        );
         assert_eq!(*activity(&app), Activity::Approving);
-        assert_eq!(app.approval.as_ref().map(|a| &a.change), Some(&change()));
+        assert_eq!(app.approval, Some(7));
     }
 
     #[test]
-    fn y_accepts_and_the_diff_is_committed_when_written() {
+    fn y_accepts_and_the_result_follows_the_diff() {
         let mut app = asked_app();
 
         assert_eq!(
@@ -556,19 +617,16 @@ mod tests {
         assert!(app.approval.is_none());
         assert_eq!(
             app.on_event(finished(ToolStatus::Completed)),
-            [
-                Committed::Diff(change()),
-                Committed::ToolResult {
-                    name: "write_file".into(),
-                    status: ToolStatus::Completed,
-                    output: "out".into()
-                }
-            ]
+            [Committed::ToolResult {
+                name: "write_file".into(),
+                status: ToolStatus::Completed,
+                output: "out".into()
+            }]
         );
     }
 
     #[test]
-    fn n_rejects_and_commits_no_diff() {
+    fn n_rejects_and_the_rejection_follows_the_diff() {
         let mut app = asked_app();
 
         assert_eq!(
@@ -606,5 +664,61 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Cancel));
         assert!(app.approval.is_none());
         assert_eq!(*activity(&app), Activity::Cancelling);
+    }
+
+    fn scrolled_app() -> App {
+        App {
+            view: View {
+                height: 10,
+                rows: 50,
+            },
+            ..App::default()
+        }
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_up_from_the_bottom_and_back_to_following_it() {
+        let mut app = scrolled_app();
+
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, Some(40 - WHEEL_ROWS));
+
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, None);
+    }
+
+    #[test]
+    fn page_keys_move_a_pane_and_stop_at_the_top() {
+        let mut app = scrolled_app();
+
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, Some(30));
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::PageUp));
+        }
+        assert_eq!(app.scroll, Some(0));
+
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.scroll, None);
+    }
+
+    #[test]
+    fn scrolling_works_while_asked() {
+        let mut app = asked_app();
+        app.view = scrolled_app().view;
+
+        app.on_key(key(KeyCode::PageUp));
+
+        assert_eq!(app.scroll, Some(30));
+        assert_eq!(app.approval, Some(7));
     }
 }
