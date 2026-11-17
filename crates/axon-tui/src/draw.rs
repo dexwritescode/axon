@@ -15,6 +15,7 @@ use ratatui::{
 };
 
 use crate::app::{Activity, App, Committed, Finished, Turn, View};
+use crate::prompt::Prompt;
 use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
@@ -123,17 +124,19 @@ fn preview(text: &str) -> String {
 }
 
 /// Draw the whole screen: the history, then the activity row, a separator
-/// and the input. Returns the history pane's size, for scrolling.
+/// and the input. Returns the sizes keys need.
 pub(crate) fn screen(frame: &mut Frame, app: &App, history: &[Committed]) -> View {
     let area = frame.area();
     let width = usize::from(area.width.max(1));
+    // One column past the text is left for the cursor.
+    let input_width = width.saturating_sub(PROMPT.len() + 1).max(1);
+    let mut input_top = app.view.input_top;
     let (input, cursor) = match app.approval {
         Some(_) => (vec![approval_prompt()], None),
         None => {
-            let (mut lines, (x, y)) = input(&app.input, width);
-            let skip = lines.len().saturating_sub(INPUT_ROWS);
-            lines.drain(..skip);
-            (lines, Some((x, y - skip as u16)))
+            let (lines, cursor, top) = input(&app.input, input_width, input_top);
+            input_top = top;
+            (lines, Some(cursor))
         }
     };
     let [history_area, _, activity_area, separator_area, input_area] = Layout::vertical([
@@ -146,7 +149,11 @@ pub(crate) fn screen(frame: &mut Frame, app: &App, history: &[Committed]) -> Vie
     ])
     .areas(area);
 
-    let view = history_pane(frame, history_area, app, history);
+    let view = View {
+        input_width,
+        input_top,
+        ..history_pane(frame, history_area, app, history)
+    };
     let status = match (&app.turn, &app.finished) {
         (Some(turn), _) => activity(turn),
         (None, Some(finished)) => finished_line(finished),
@@ -158,8 +165,11 @@ pub(crate) fn screen(frame: &mut Frame, app: &App, history: &[Committed]) -> Vie
         separator_area,
     );
     frame.render_widget(Paragraph::new(input), input_area);
-    if let Some((x, y)) = cursor {
-        frame.set_cursor_position(Position::new(input_area.x + x, input_area.y + y));
+    if let Some(cursor) = cursor {
+        frame.set_cursor_position(Position::new(
+            input_area.x + cursor.x,
+            input_area.y + cursor.y,
+        ));
     }
     view
 }
@@ -182,6 +192,7 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
     let view = View {
         height: area.height,
         rows,
+        ..View::default()
     };
     let pane = u32::from(area.height);
     let gap = pane.saturating_sub(rows);
@@ -216,36 +227,31 @@ fn approval_prompt() -> Line<'static> {
         .collect()
 }
 
-/// The input as screen rows, wrapped at `width` chars, and where the cursor
-/// goes: after the last char, or at the start of the next row when it's full.
-fn input(input: &str, width: usize) -> (Vec<Line<'static>>, (u16, u16)) {
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut last = 0;
-    for (i, line) in input.split('\n').enumerate() {
-        let prefix = if i == 0 { PROMPT } else { PROMPT_INDENT };
-        let chars: Vec<char> = format!("{prefix}{}", line.replace('\t', "    "))
-            .chars()
-            .collect();
-        for (j, chunk) in chars.chunks(width).enumerate() {
-            let row: String = chunk.iter().collect();
-            last = chunk.len();
-            rows.push(
-                match row.strip_prefix(PROMPT).filter(|_| i == 0 && j == 0) {
-                    Some(rest) => Line::from(vec![
-                        Span::from(PROMPT).fg(theme::INPUT).bold(),
-                        Span::from(rest.to_string()),
-                    ]),
-                    None => Line::from(row),
-                },
-            );
-        }
-    }
-    if last == width {
-        rows.push(Line::default());
-        last = 0;
-    }
-    let cursor = (last as u16, rows.len() as u16 - 1);
-    (rows, cursor)
+/// The input's rows, `> ` before the first and `  ` before the rest, at
+/// most `INPUT_ROWS` of them from `top`, moved only as far as needed to
+/// show the cursor; where the cursor goes; and the first row shown. The
+/// text wraps at `width` columns.
+fn input(prompt: &Prompt, width: usize, top: usize) -> (Vec<Line<'static>>, Position, usize) {
+    let rows = prompt.rows(width);
+    let (col, row) = prompt.cursor_at(width);
+    let skip = top
+        .min(rows.len().saturating_sub(INPUT_ROWS))
+        .clamp((row + 1).saturating_sub(INPUT_ROWS), row);
+    let lines = rows
+        .into_iter()
+        .enumerate()
+        .skip(skip)
+        .take(INPUT_ROWS)
+        .map(|(i, range)| {
+            let head = match i {
+                0 => Span::from(PROMPT).fg(theme::INPUT).bold(),
+                _ => Span::from(PROMPT_INDENT),
+            };
+            Line::from(vec![head, Span::from(prompt.text()[range].to_string())])
+        })
+        .collect();
+    let cursor = Position::new((PROMPT.len() + col) as u16, (row - skip) as u16);
+    (lines, cursor, skip)
 }
 
 /// The activity row while a turn runs, starting with the spinner.
@@ -367,7 +373,9 @@ mod tests {
             screen.view,
             View {
                 height: 10,
-                rows: 6
+                rows: 6,
+                input_width: 37,
+                input_top: 0,
             }
         );
     }
@@ -391,10 +399,40 @@ mod tests {
     fn input_grows_to_five_rows_then_shows_its_tail() {
         let screen = render(&app("", &"y".repeat(60)), &[], 10, 20);
 
-        // "> " + 60 chars is 7 rows; the last 5 show, under the separator.
+        // 60 chars at 7 a row is 9 rows; the last 5 show, under the separator.
         assert_eq!(screen.rows[14], "─".repeat(10));
-        assert_eq!(screen.rows[15], "y".repeat(10));
-        assert_eq!(screen.rows[19], "yy");
+        assert_eq!(screen.rows[15], format!("  {}", "y".repeat(7)));
+        assert_eq!(screen.rows[19], "  yyyy");
+        assert_eq!(screen.cursor, Position::new(6, 19));
+    }
+
+    #[test]
+    fn input_rows_move_only_to_keep_the_cursor_in_view() {
+        let mut app = app("", "one\ntwo\nthree\nfour\nfive\nsix\nseven");
+        // The first input row shown and the cursor's screen row.
+        let redraw = |app: &mut App, ups: usize, downs: usize| {
+            (0..ups).for_each(|_| app.input.up(20));
+            (0..downs).for_each(|_| app.input.down(20));
+            let screen = render(app, &[], 30, 20);
+            app.view = screen.view;
+            (screen.rows[15].clone(), screen.cursor.y)
+        };
+
+        assert_eq!(redraw(&mut app, 0, 0), ("  three".into(), 19));
+        assert_eq!(redraw(&mut app, 3, 0), ("  three".into(), 16));
+        assert_eq!(redraw(&mut app, 2, 0), ("  two".into(), 15));
+        assert_eq!(redraw(&mut app, 0, 1), ("  two".into(), 16));
+        assert_eq!(redraw(&mut app, 2, 0), ("> one".into(), 15));
+    }
+
+    #[test]
+    fn input_wraps_words_and_places_the_cursor_mid_text() {
+        let mut app = app("", "hello wide 世界");
+        app.input.word_left();
+        let screen = render(&app, &[], 13, 20);
+
+        // Each wide char takes two cells; the second reads as a space here.
+        assert_eq!(screen.rows[18..20], ["> hello wide", "  世 界"]);
         assert_eq!(screen.cursor, Position::new(2, 19));
     }
 
@@ -411,7 +449,9 @@ mod tests {
             screen.view,
             View {
                 height: 6,
-                rows: 36
+                rows: 36,
+                input_width: 17,
+                input_top: 0,
             }
         );
 

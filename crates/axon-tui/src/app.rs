@@ -7,12 +7,14 @@ use axon_protocol::{Change, Event, StopReason, ToolStatus};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+use crate::prompt::Prompt;
+
 /// History rows one wheel notch scrolls.
 const WHEEL_ROWS: u32 = 3;
 
 #[derive(Default)]
 pub(crate) struct App {
-    pub(crate) input: String,
+    pub(crate) input: Prompt,
     /// The reply streaming in for the current turn.
     pub(crate) streaming_text: String,
     /// The running turn; Enter does nothing until it ends.
@@ -24,15 +26,21 @@ pub(crate) struct App {
     pub(crate) approval: Option<u64>,
     /// The first history row shown, or `None` to follow the bottom.
     pub(crate) scroll: Option<u32>,
-    /// The history pane as last drawn.
+    /// The screen as last drawn.
     pub(crate) view: View,
 }
 
-/// The size of the history pane and of what it holds, in rows.
+/// Sizes from the last draw that keys need.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(crate) struct View {
+    /// The history pane's height in rows.
     pub(crate) height: u16,
+    /// Rows the history takes.
     pub(crate) rows: u32,
+    /// Columns the input's text wraps at.
+    pub(crate) input_width: usize,
+    /// The first input row shown.
+    pub(crate) input_top: usize,
 }
 
 impl View {
@@ -113,7 +121,9 @@ impl App {
         match key.code {
             KeyCode::PageUp => return self.scroll_by(-i64::from(self.view.height)),
             KeyCode::PageDown => return self.scroll_by(i64::from(self.view.height)),
-            KeyCode::End => return self.scroll_by(i64::from(self.view.rows)),
+            KeyCode::End if key.modifiers == KeyModifiers::CONTROL => {
+                return self.scroll_by(i64::from(self.view.rows));
+            }
             _ => {}
         }
         if self.approval.is_some() {
@@ -128,19 +138,36 @@ impl App {
             // Terminals without the kitty keyboard protocol send Shift+Enter as
             // a line feed, which crossterm reports as Ctrl+J.
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-                self.input.push('\n');
+                self.input.insert('\n');
                 None
             }
             (KeyCode::Enter, _) => self.submit(),
-            (KeyCode::Backspace, _) => {
-                self.input.pop();
+            _ => {
+                self.edit(key);
                 None
             }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                self.input.push(c);
-                None
-            }
-            _ => None,
+        }
+    }
+
+    /// Typing and moving the cursor in the input.
+    fn edit(&mut self, key: KeyEvent) {
+        let input = &mut self.input;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => input.insert(c),
+            (KeyCode::Backspace, _) => input.backspace(),
+            (KeyCode::Delete, _) => input.delete(),
+            // macOS terminals send Option+Left/Right as Alt+B/F.
+            (KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL)
+            | (KeyCode::Char('b'), KeyModifiers::ALT) => input.word_left(),
+            (KeyCode::Right, KeyModifiers::ALT | KeyModifiers::CONTROL)
+            | (KeyCode::Char('f'), KeyModifiers::ALT) => input.word_right(),
+            (KeyCode::Left, _) => input.left(),
+            (KeyCode::Right, _) => input.right(),
+            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => input.home(),
+            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => input.end(),
+            (KeyCode::Up, _) => input.up(self.view.input_width),
+            (KeyCode::Down, _) => input.down(self.view.input_width),
+            _ => {}
         }
     }
 
@@ -162,7 +189,7 @@ impl App {
     }
 
     fn submit(&mut self) -> Option<Action> {
-        let text = self.input.trim();
+        let text = self.input.text().trim();
         if self.turn.is_some() || text.is_empty() {
             return None;
         }
@@ -332,7 +359,7 @@ mod tests {
             app.on_key(key(KeyCode::Enter)),
             Some(Action::Submit("hi".into()))
         );
-        assert_eq!(app.input, "");
+        assert_eq!(app.input.text(), "");
         assert!(app.turn.is_some());
     }
 
@@ -351,7 +378,7 @@ mod tests {
         type_text(&mut app, "next");
 
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert_eq!(app.input, "next");
+        assert_eq!(app.input.text(), "next");
     }
 
     #[test]
@@ -362,7 +389,7 @@ mod tests {
         type_text(&mut app, "b");
         app.on_key(ctrl('j'));
 
-        assert_eq!(app.input, "a\nb\n");
+        assert_eq!(app.input.text(), "a\nb\n");
     }
 
     #[test]
@@ -371,17 +398,17 @@ mod tests {
         type_text(&mut app, "hé");
         app.on_key(key(KeyCode::Backspace));
 
-        assert_eq!(app.input, "h");
+        assert_eq!(app.input.text(), "h");
     }
 
     #[test]
     fn shift_types_and_other_modifiers_do_not() {
         let mut app = App::default();
         app.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
-        app.on_key(ctrl('a'));
+        app.on_key(ctrl('x'));
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
 
-        assert_eq!(app.input, "A");
+        assert_eq!(app.input.text(), "A");
     }
 
     #[test]
@@ -653,7 +680,7 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
         assert_eq!(app.on_key(ctrl('y')), None);
-        assert_eq!(app.input, "");
+        assert_eq!(app.input.text(), "");
         assert!(app.approval.is_some());
     }
 
@@ -671,6 +698,8 @@ mod tests {
             view: View {
                 height: 10,
                 rows: 50,
+                input_width: 20,
+                input_top: 0,
             },
             ..App::default()
         }
@@ -707,8 +736,41 @@ mod tests {
         }
         assert_eq!(app.scroll, Some(0));
 
-        app.on_key(key(KeyCode::End));
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
         assert_eq!(app.scroll, None);
+    }
+
+    #[test]
+    fn end_moves_in_the_input_and_leaves_the_history() {
+        let mut app = scrolled_app();
+        type_text(&mut app, "ab");
+        app.on_key(key(KeyCode::PageUp));
+        app.on_key(key(KeyCode::Home));
+
+        app.on_key(key(KeyCode::End));
+        type_text(&mut app, "c");
+
+        assert_eq!(app.input.text(), "abc");
+        assert_eq!(app.scroll, Some(30));
+    }
+
+    #[test]
+    fn keys_edit_at_the_cursor() {
+        let mut app = scrolled_app();
+        type_text(&mut app, "one two");
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Delete));
+        app.on_key(ctrl('e'));
+        app.on_key(key(KeyCode::Left));
+        type_text(&mut app, "!");
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(ctrl('a'));
+        type_text(&mut app, ">");
+
+        assert_eq!(app.input.text(), ">netw!\no");
     }
 
     #[test]

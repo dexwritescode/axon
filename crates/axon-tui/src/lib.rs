@@ -4,6 +4,7 @@
 mod app;
 mod diff;
 mod draw;
+mod prompt;
 mod theme;
 
 use std::io;
