@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_openai::{
@@ -19,6 +20,8 @@ pub struct ModelConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Wait between a turn's model requests, to let the machine cool.
+    pub request_pause: Duration,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -27,6 +30,7 @@ impl fmt::Debug for ModelConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
+            .field("request_pause", &self.request_pause)
             .finish()
     }
 }

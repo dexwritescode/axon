@@ -44,6 +44,7 @@ impl SessionFactory for CoreFactory {
             client: ModelClient::new(&self.config),
             cwd,
             max_requests: MAX_TURN_REQUESTS,
+            request_pause: self.config.request_pause,
         }))
     }
 }

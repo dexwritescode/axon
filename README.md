@@ -33,3 +33,5 @@ TUI keys:
 | Ctrl+C when idle, Ctrl+Q | quit |
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`.
+
+To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0).

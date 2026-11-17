@@ -287,6 +287,11 @@ fn activity(turn: &Turn) -> Line<'static> {
         Activity::Thinking => format!("Thinking… {took} · Esc to cancel"),
         Activity::Running(tool) => format!("Running {tool}… {took} · Esc to cancel"),
         Activity::Approving => format!("Waiting for approval… {took}"),
+        Activity::Cooling { until } if turn.elapsed < *until => {
+            let left = elapsed(*until - turn.elapsed);
+            format!("Cooling down… {left} left · Esc to cancel")
+        }
+        Activity::Cooling { .. } => format!("Thinking… {took} · Esc to cancel"),
         Activity::Cancelling => "Cancelling…".into(),
     };
     status(theme::AGENT, spinner, text)
@@ -543,6 +548,25 @@ mod tests {
 
         turn.activity = Activity::Cancelling;
         assert_eq!(activity(&turn).to_string(), "⠙ Cancelling…");
+    }
+
+    #[test]
+    fn activity_row_counts_down_a_pause_then_thinks() {
+        let mut turn = busy_turn();
+        turn.activity = Activity::Cooling {
+            until: Duration::from_secs(30),
+        };
+        turn.elapsed = Duration::from_secs(5);
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Cooling down… 25s left · Esc to cancel"
+        );
+
+        turn.elapsed = Duration::from_secs(30);
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Thinking… 30s · Esc to cancel"
+        );
     }
 
     #[test]

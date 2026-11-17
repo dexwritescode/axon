@@ -76,6 +76,11 @@ pub(crate) enum Activity {
     Thinking,
     Running(String),
     Approving,
+    /// Waiting between model requests until the turn's `elapsed` reaches
+    /// `until`; thinking after that.
+    Cooling {
+        until: Duration,
+    },
     /// Cancel was sent; the turn ends when the session confirms it.
     Cancelling,
 }
@@ -274,6 +279,13 @@ impl App {
                 self.approval = None;
                 let name = self.calls.remove(&id).unwrap_or_default();
                 vec![Committed::ToolResult { name, result }]
+            }
+            Event::Paused { secs } => {
+                if let Some(turn) = &self.turn {
+                    let until = turn.started.elapsed() + Duration::from_secs(secs);
+                    self.set_activity(Activity::Cooling { until });
+                }
+                Vec::new()
             }
             Event::Error { message } => {
                 let mut committed = self.take_reply();
@@ -574,6 +586,17 @@ mod tests {
         });
 
         assert_eq!(app.finished.map(|f| f.stop), Some(StopReason::Cancelled));
+    }
+
+    #[test]
+    fn a_pause_cools_down_until_its_end() {
+        let mut app = busy_app();
+
+        assert!(app.on_event(Event::Paused { secs: 30 }).is_empty());
+        let Activity::Cooling { until } = *activity(&app) else {
+            panic!("{:?}", activity(&app));
+        };
+        assert!(until >= Duration::from_secs(30) && until < Duration::from_secs(31));
     }
 
     #[test]
