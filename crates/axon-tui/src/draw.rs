@@ -289,7 +289,7 @@ fn activity(turn: &Turn) -> Line<'static> {
         Activity::Approving => format!("Waiting for approval… {took}"),
         Activity::Cooling { until } if turn.elapsed < *until => {
             let left = elapsed(*until - turn.elapsed);
-            format!("Cooling down… {left} left · Esc to cancel")
+            format!("Cooling down… {left} · Esc to cancel")
         }
         Activity::Cooling { .. } => format!("Thinking… {took} · Esc to cancel"),
         Activity::Cancelling => "Cancelling…".into(),
@@ -559,7 +559,7 @@ mod tests {
         turn.elapsed = Duration::from_secs(5);
         assert_eq!(
             activity(&turn).to_string(),
-            "⠋ Cooling down… 25s left · Esc to cancel"
+            "⠋ Cooling down… 25s · Esc to cancel"
         );
 
         turn.elapsed = Duration::from_secs(30);
