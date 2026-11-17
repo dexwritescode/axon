@@ -2,6 +2,7 @@
 //! and writes the user approves) and stream it to a frontend. Knows
 //! nothing about any frontend.
 
+mod context;
 mod jail;
 mod model;
 mod prompt;
