@@ -22,7 +22,7 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
     vec![
         schema(
             "read_file",
-            "Read a text file. Returns up to 2000 lines; use offset to read further.",
+            "Read a text file. Returns up to 2000 lines; use offset to read further. Lines over 2000 characters are cut.",
             json!({
                 "type": "object",
                 "properties": {

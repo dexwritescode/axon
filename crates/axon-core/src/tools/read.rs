@@ -1,5 +1,6 @@
 //! `read_file`: a range of lines from a text file.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use serde_json::Value;
@@ -8,7 +9,8 @@ use super::{optional_usize, read_text, required_str};
 use crate::jail;
 
 const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 64 * 1024;
+const MAX_BYTES: usize = 32 * 1024;
+const MAX_LINE_CHARS: usize = 2000;
 
 pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
     let path = required_str(args, "path")?;
@@ -29,25 +31,14 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
         ));
     }
 
-    if let Some(line) = lines.get(first).filter(|line| line.len() + 1 > MAX_BYTES) {
-        let mut end = MAX_BYTES;
-        while !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        return Ok(format!(
-            "{}\n[line {offset} cut at {end} bytes; use offset {} to read more]\n",
-            &line[..end],
-            offset + 1
-        ));
-    }
-
     let mut out = String::new();
     let mut shown = 0;
     for line in lines.iter().skip(first).take(limit) {
+        let line = cut(line);
         if out.len() + line.len() + 1 > MAX_BYTES {
             break;
         }
-        out.push_str(line);
+        out.push_str(&line);
         out.push('\n');
         shown += 1;
     }
@@ -60,6 +51,14 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// `line`, or its first `MAX_LINE_CHARS` chars and a note saying it was cut.
+fn cut(line: &str) -> Cow<'_, str> {
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        Some((end, _)) => format!("{}… [line cut: {} bytes]", &line[..end], line.len()).into(),
+        None => line.into(),
+    }
 }
 
 #[cfg(test)]
@@ -118,7 +117,7 @@ mod tests {
         let out = read(&dir, json!({"path": "a.txt"})).unwrap();
         assert!(out.len() <= MAX_BYTES + 100);
         assert!(
-            out.contains("use offset 66 to read more"),
+            out.contains("use offset 33 to read more"),
             "{}",
             &out[out.len() - 80..]
         );
@@ -160,18 +159,16 @@ mod tests {
     }
 
     #[test]
-    fn a_line_over_the_byte_cap_is_cut_and_skipped() {
-        let contents = format!("short\n{}é\nnext\n", "x".repeat(MAX_BYTES - 1));
-        let dir = dir_with("a.txt", contents.as_bytes());
+    fn long_lines_are_cut_in_place() {
+        let long = format!("{}é", "x".repeat(MAX_LINE_CHARS - 1));
+        let dir = dir_with("a.txt", format!("{long}tail\nnext\n").as_bytes());
 
-        let out = read(&dir, json!({"path": "a.txt", "offset": 2})).unwrap();
         assert_eq!(
-            out,
-            format!(
-                "{}\n[line 2 cut at {} bytes; use offset 3 to read more]\n",
-                "x".repeat(MAX_BYTES - 1),
-                MAX_BYTES - 1
-            )
+            read(&dir, json!({"path": "a.txt"})),
+            Ok(format!(
+                "{long}… [line cut: {} bytes]\nnext\n",
+                long.len() + 4
+            ))
         );
     }
 
