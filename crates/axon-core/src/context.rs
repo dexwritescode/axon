@@ -17,7 +17,10 @@ pub(crate) async fn discover(
         .strip_suffix("/v1")
         .or_else(|| base_url.strip_suffix("/v1/"))
         .unwrap_or(base_url);
-    lm_studio(http, root, api_key, model).await
+    if let Some(n) = lm_studio(http, root, api_key, model).await {
+        return Some(n);
+    }
+    vllm(http, base_url, api_key, model).await
 }
 
 async fn lm_studio(http: &Client, root: &str, api_key: &str, model: &str) -> Option<u64> {
@@ -27,6 +30,19 @@ async fn lm_studio(http: &Client, root: &str, api_key: &str, model: &str) -> Opt
 
     let json: serde_json::Value = response.json().await.ok()?;
     json["loaded_context_length"].as_u64()
+}
+
+async fn vllm(http: &Client, base_url: &str, api_key: &str, model: &str) -> Option<u64> {
+    let url = format!("{base_url}/models");
+
+    let response = http.get(&url).bearer_auth(api_key).send().await.ok()?;
+
+    let json: serde_json::Value = response.json().await.ok()?;
+    json["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?["max_model_len"]
+        .as_u64()
 }
 
 #[cfg(test)]
@@ -55,6 +71,41 @@ mod tests {
     #[tokio::test]
     async fn lm_studio_404_returns_none() {
         let server = MockServer::start().await;
+
+        let http = Client::new();
+        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn vllm_returns_max_model_len_for_matching_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"data":[{"id":"other-model","max_model_len":4096},{"id":"test-model","max_model_len":32768}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let http = Client::new();
+        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        assert_eq!(result, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn vllm_no_matching_model_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":[{"id":"other-model","max_model_len":4096}]}"#),
+            )
+            .mount(&server)
+            .await;
 
         let http = Client::new();
         let result = discover(&http, &api_url(&server), "test", "test-model").await;
