@@ -1,4 +1,4 @@
-//! Terminal frontend: draws a session inline in the terminal's scrollback.
+//! Terminal frontend: draws a session full screen, on the alternate screen.
 #![allow(clippy::disallowed_methods, reason = "the TUI owns stdout")]
 
 mod app;
@@ -6,22 +6,22 @@ mod diff;
 mod draw;
 mod theme;
 
-use std::io::{self, Stdout, Write};
+use std::io;
 use std::time::{Duration, Instant};
 
 use app::{Action, App, Committed};
 use axon_protocol::{Command, Event, SessionError, SessionFactory, SessionHandle};
 use crossterm::{
-    cursor,
     event::{
-        Event as TermEvent, EventStream, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
+        DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEvent,
+        KeyEventKind, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    style::Print,
-    terminal::{self, ClearType, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,32 +35,43 @@ pub enum TuiError {
 /// Run one session in the terminal until the user quits.
 pub async fn run(factory: &dyn SessionFactory) -> Result<(), TuiError> {
     let session = factory.new_session(std::env::current_dir()?)?;
-    let _terminal = RawTerminal::enter()?;
-    run_loop(&mut io::stdout(), session).await
+    let _screen = Screen::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    run_loop(&mut terminal, session).await
 }
 
-/// Raw mode for as long as it lives; dropping it restores the terminal,
-/// also when unwinding from a panic.
-struct RawTerminal;
+/// The alternate screen in raw mode, with the mouse captured, for as long as
+/// it lives; dropping it restores the terminal, also when unwinding from a panic.
+struct Screen;
 
-impl RawTerminal {
+impl Screen {
     fn enter() -> io::Result<Self> {
+        // Built first, so a failure below still restores what was set.
+        let screen = Self;
         enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         // Lets terminals that support it report Shift+Enter apart from Enter.
         let _ = execute!(
             io::stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
-        Ok(Self)
+        Ok(screen)
     }
 }
 
-impl Drop for RawTerminal {
+impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags, Print("\r\n"));
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
+
+type Tty = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// How often the activity row animates.
 const TICK: Duration = Duration::from_millis(100);
@@ -68,6 +79,7 @@ const TICK: Duration = Duration::from_millis(100);
 /// Something the loop woke up for.
 enum Input {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Session(Option<Event>),
     /// Time to animate the activity row.
     Tick,
@@ -75,7 +87,7 @@ enum Input {
     Redraw,
 }
 
-async fn run_loop(out: &mut Stdout, session: SessionHandle) -> Result<(), TuiError> {
+async fn run_loop(terminal: &mut Tty, session: SessionHandle) -> Result<(), TuiError> {
     let SessionHandle {
         commands,
         mut events,
@@ -83,22 +95,19 @@ async fn run_loop(out: &mut Stdout, session: SessionHandle) -> Result<(), TuiErr
     let mut app = App::default();
     let mut keys = EventStream::new();
     let mut ticks = tokio::time::interval(TICK);
+    let mut history = Vec::new();
 
-    execute!(out, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-    draw::print_logo(out)?;
-    // Start the live area at the bottom of the screen, below the logo.
-    let (_, height) = terminal::size()?;
-    let logo_rows = draw::LOGO.len() as u16;
-    execute!(
-        out,
-        cursor::MoveTo(0, height.saturating_sub(2).max(logo_rows + 1))
-    )?;
-    let mut lines_to_top = redraw(out, &app, 0, &[])?;
+    redraw(terminal, &mut app, &history)?;
 
     loop {
         let input = tokio::select! {
             key = keys.next() => match key {
                 Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => Input::Key(key),
+                Some(Ok(TermEvent::Mouse(mouse))) => match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => Input::Mouse(mouse),
+                    // Moves and clicks change nothing yet; skip the redraw.
+                    _ => continue,
+                },
                 Some(Ok(_)) => Input::Redraw,
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
@@ -109,7 +118,8 @@ async fn run_loop(out: &mut Stdout, session: SessionHandle) -> Result<(), TuiErr
         let Some(committed) = step(&mut app, &commands, input).await else {
             return Ok(());
         };
-        lines_to_top = redraw(out, &app, lines_to_top, &committed)?;
+        history.extend(committed);
+        redraw(terminal, &mut app, &history)?;
     }
 }
 
@@ -140,6 +150,10 @@ async fn step(
             }
             None => Some(Vec::new()),
         },
+        Input::Mouse(mouse) => {
+            app.on_mouse(mouse);
+            Some(Vec::new())
+        }
         Input::Session(event) => Some(app.on_event(event?)),
         Input::Tick => {
             app.on_tick(Instant::now());
@@ -149,24 +163,12 @@ async fn step(
     }
 }
 
-/// Replace the live area: commit finished lines above it, then draw it again.
-/// The frame is written in one go, since stdout would flush at every newline.
-fn redraw(
-    out: &mut impl Write,
-    app: &App,
-    lines_to_top: u16,
-    committed: &[Committed],
-) -> io::Result<u16> {
-    let (width, height) = terminal::size()?;
-    let mut frame = Vec::new();
-    draw::clear_live(&mut frame, lines_to_top)?;
-    for line in committed {
-        draw::commit(&mut frame, line, width)?;
-    }
-    let lines_to_top = draw::render_live(&mut frame, app, width, height)?;
-    out.write_all(&frame)?;
-    out.flush()?;
-    Ok(lines_to_top)
+/// Draw the screen and remember the history pane's size for scrolling.
+fn redraw(terminal: &mut Tty, app: &mut App, history: &[Committed]) -> io::Result<()> {
+    let mut view = app.view;
+    terminal.draw(|frame| view = draw::screen(frame, app, history))?;
+    app.view = view;
+    Ok(())
 }
 
 #[cfg(test)]
