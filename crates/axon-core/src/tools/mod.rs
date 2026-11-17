@@ -22,7 +22,7 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
     vec![
         schema(
             "read_file",
-            "Read a text file. Returns up to 2000 lines; use offset to read further.",
+            "Read a text file. Returns up to 2000 lines; use offset to read further. Lines over 2000 characters are cut.",
             json!({
                 "type": "object",
                 "properties": {
@@ -181,6 +181,11 @@ fn resolve_dir(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The first `max` chars of `text`, if it is longer.
+fn cut_chars(text: &str, max: usize) -> Option<&str> {
+    text.char_indices().nth(max).map(|(end, _)| &text[..end])
+}
+
 /// The text of the file at `target`; `path` is how errors name it.
 fn read_text(target: &Path, path: &str) -> Result<String, String> {
     let bytes = fs::read(target).map_err(|e| format!("{path}: {e}"))?;
@@ -199,6 +204,16 @@ mod tests {
             error.starts_with("arguments were not valid JSON"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn empty_arguments_are_an_empty_object() {
+        for args in ["", "  "] {
+            assert_eq!(
+                run(Path::new("."), "read_file", args),
+                Err("path is required".into())
+            );
+        }
     }
 
     #[test]

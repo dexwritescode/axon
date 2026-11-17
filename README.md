@@ -17,6 +17,19 @@ cargo run                         # the TUI
 lms unload --all && lms server stop
 ```
 
-In the TUI, Enter sends, Shift+Enter or Ctrl+J adds a newline, and Ctrl+C or Ctrl+Q quits.
+TUI keys:
+
+| Key | Action |
+| --- | --- |
+| Enter | send |
+| Shift+Enter, Ctrl+J | new line |
+| ←/→, ↑/↓ | move the cursor |
+| Alt+←/→, Ctrl+←/→, Alt+B/F | move by word |
+| Home/End, Ctrl+A/E | line start/end |
+| PageUp/PageDown, mouse wheel | scroll the history |
+| Ctrl+End | jump the history to the bottom |
+| Y / N | approve or reject a change |
+| Esc, Ctrl+C | cancel the turn |
+| Ctrl+C when idle, Ctrl+Q | quit |
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`.

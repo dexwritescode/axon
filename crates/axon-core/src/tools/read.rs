@@ -1,28 +1,30 @@
 //! `read_file`: a range of lines from a text file.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use serde_json::Value;
 
-use super::{optional_usize, read_text, required_str};
+use super::{cut_chars, optional_usize, read_text, required_str};
 use crate::jail;
 
 const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 64 * 1024;
+const MAX_BYTES: usize = 32 * 1024;
+const MAX_LINE_CHARS: usize = 2000;
 
 pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
     let path = required_str(args, "path")?;
     let offset = optional_usize(args, "offset")?.unwrap_or(1).max(1);
     let limit = optional_usize(args, "limit")?
         .unwrap_or(MAX_LINES)
-        .min(MAX_LINES);
+        .clamp(1, MAX_LINES);
 
     let file = jail::resolve(cwd, path)?;
     let text = read_text(&file, path)?;
 
     let lines: Vec<&str> = text.lines().collect();
     let first = offset - 1;
-    if first >= lines.len() && !lines.is_empty() {
+    if offset > 1 && first >= lines.len() {
         return Err(format!(
             "{path}: offset {offset} is past the last line ({})",
             lines.len()
@@ -32,10 +34,11 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
     let mut out = String::new();
     let mut shown = 0;
     for line in lines.iter().skip(first).take(limit) {
+        let line = cut(line);
         if out.len() + line.len() + 1 > MAX_BYTES {
             break;
         }
-        out.push_str(line);
+        out.push_str(&line);
         out.push('\n');
         shown += 1;
     }
@@ -48,6 +51,18 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// `line`, or its first `MAX_LINE_CHARS` chars and a note saying it was cut.
+fn cut(line: &str) -> Cow<'_, str> {
+    match cut_chars(line, MAX_LINE_CHARS) {
+        Some(head) => format!(
+            "{head}… [line cut at {MAX_LINE_CHARS} chars; {} bytes in all]",
+            line.len()
+        )
+        .into(),
+        None => line.into(),
+    }
 }
 
 #[cfg(test)]
@@ -106,7 +121,7 @@ mod tests {
         let out = read(&dir, json!({"path": "a.txt"})).unwrap();
         assert!(out.len() <= MAX_BYTES + 100);
         assert!(
-            out.contains("use offset 66 to read more"),
+            out.contains("use offset 33 to read more"),
             "{}",
             &out[out.len() - 80..]
         );
@@ -127,6 +142,41 @@ mod tests {
             read(&dir, json!({"path": "bin", "offset": "2"}))
                 .unwrap_err()
                 .contains("offset")
+        );
+    }
+
+    #[test]
+    fn an_empty_file_reads_as_empty() {
+        let dir = dir_with("a.txt", b"");
+
+        assert_eq!(read(&dir, json!({"path": "a.txt"})), Ok(String::new()));
+        assert_eq!(
+            read(&dir, json!({"path": "a.txt", "offset": 2})),
+            Err("a.txt: offset 2 is past the last line (0)".into())
+        );
+    }
+
+    #[test]
+    fn limit_zero_reads_one_line() {
+        let dir = dir_with("a.txt", b"1\n2\n");
+
+        assert_eq!(
+            read(&dir, json!({"path": "a.txt", "limit": 0})),
+            Ok("1\n[showing lines 1-1 of 2; use offset 2 to read more]\n".into())
+        );
+    }
+
+    #[test]
+    fn long_lines_are_cut_in_place() {
+        let long = format!("{}é", "x".repeat(MAX_LINE_CHARS - 1));
+        let dir = dir_with("a.txt", format!("{long}tail\nnext\n").as_bytes());
+
+        assert_eq!(
+            read(&dir, json!({"path": "a.txt"})),
+            Ok(format!(
+                "{long}… [line cut at 2000 chars; {} bytes in all]\nnext\n",
+                long.len() + 4
+            ))
         );
     }
 

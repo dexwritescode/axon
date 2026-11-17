@@ -5,4 +5,5 @@ disallowed-macros = [
 ]
 disallowed-methods = [
     { path = "std::io::stdout", reason = "stdout is the ACP transport; only axon-tui writes to it" },
+    { path = "tokio::io::stdout", allow-invalid = true, reason = "stdout is the ACP transport; only axon-tui writes to it" },
 ]
