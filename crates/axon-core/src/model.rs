@@ -91,7 +91,7 @@ impl ModelClient {
 
     /// Stream the model's reply: text deltas and tool-call fragments, in order.
     /// Dropping the stream cancels the request.
-    pub(crate) async fn stream_turn(
+    pub(crate) async fn stream_chat(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: Vec<ChatCompletionTools>,
@@ -152,7 +152,7 @@ mod tests {
     /// Run a request to the end: its text deltas and assembled tool calls,
     /// or the first error.
     async fn collect(client: &ModelClient) -> Result<(Vec<String>, Vec<ToolCall>)> {
-        let stream = client.stream_turn(vec![user("hi")], Vec::new()).await?;
+        let stream = client.stream_chat(vec![user("hi")], Vec::new()).await?;
         let mut texts = Vec::new();
         let mut calls = ToolCalls::default();
         for delta in stream.collect::<Vec<_>>().await {

@@ -202,6 +202,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_arguments_are_an_empty_object() {
+        for args in ["", "  "] {
+            assert_eq!(
+                run(Path::new("."), "read_file", args),
+                Err("path is required".into())
+            );
+        }
+    }
+
+    #[test]
     fn unknown_tool_is_an_error() {
         assert_eq!(
             run(Path::new("."), "rm", "{}"),

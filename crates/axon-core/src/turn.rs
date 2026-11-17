@@ -121,7 +121,7 @@ impl Agent {
                 reply.cancelled = true;
                 return Ok(reply);
             }
-            stream = self.client.stream_turn(messages, tools::schemas()) => stream?,
+            stream = self.client.stream_chat(messages, tools::schemas()) => stream?,
         };
         let mut stream = pin!(stream);
         let mut calls = ToolCalls::default();
@@ -304,7 +304,8 @@ mod tests {
     use super::*;
     use crate::session;
     use crate::test_support::{
-        agent, prompt, prompt_answering, reply, respond, sent_messages, tool_calls,
+        agent, client_error, delta, end, prompt, prompt_answering, reply, respond, sent_messages,
+        tool_calls,
     };
     use axon_protocol::SessionHandle;
     use axon_protocol::{Change, Command};
@@ -327,10 +328,6 @@ mod tests {
         (server, dir, handle)
     }
 
-    fn end(stop: StopReason) -> Event {
-        Event::TurnEnded { stop }
-    }
-
     #[tokio::test]
     async fn tool_result_goes_back_to_the_model_which_then_answers() {
         let (server, _dir, mut handle) = session_with_notes(25).await;
@@ -350,9 +347,7 @@ mod tests {
                     status: ToolStatus::Completed,
                     output: "remember the milk\n".into()
                 },
-                Event::TextDelta {
-                    text: "Milk.".into()
-                },
+                delta("Milk."),
                 end(StopReason::EndTurn),
             ]
         );
@@ -428,11 +423,12 @@ mod tests {
     async fn failed_turn_leaves_no_partial_messages_in_history() {
         let (server, _dir, mut handle) = session_with_notes(25).await;
         respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
-        respond(&server, crate::test_support::client_error()).await;
+        respond(&server, client_error()).await;
         respond(&server, reply(&["ok"])).await;
 
         let events = prompt(&mut handle, "first").await;
         assert!(matches!(events[2], Event::Error { .. }), "{events:?}");
+        assert_eq!(events[3..], [end(StopReason::EndTurn)]);
         prompt(&mut handle, "second").await;
 
         assert_eq!(

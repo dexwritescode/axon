@@ -15,7 +15,7 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
     let offset = optional_usize(args, "offset")?.unwrap_or(1).max(1);
     let limit = optional_usize(args, "limit")?
         .unwrap_or(MAX_LINES)
-        .min(MAX_LINES);
+        .clamp(1, MAX_LINES);
 
     let file = jail::resolve(cwd, path)?;
     let text = read_text(&file, path)?;
@@ -26,6 +26,18 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
         return Err(format!(
             "{path}: offset {offset} is past the last line ({})",
             lines.len()
+        ));
+    }
+
+    if let Some(line) = lines.get(first).filter(|line| line.len() + 1 > MAX_BYTES) {
+        let mut end = MAX_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Ok(format!(
+            "{}\n[line {offset} cut at {end} bytes; use offset {} to read more]\n",
+            &line[..end],
+            offset + 1
         ));
     }
 
@@ -127,6 +139,39 @@ mod tests {
             read(&dir, json!({"path": "bin", "offset": "2"}))
                 .unwrap_err()
                 .contains("offset")
+        );
+    }
+
+    #[test]
+    fn an_empty_file_reads_as_empty() {
+        let dir = dir_with("a.txt", b"");
+
+        assert_eq!(read(&dir, json!({"path": "a.txt"})), Ok(String::new()));
+    }
+
+    #[test]
+    fn limit_zero_reads_one_line() {
+        let dir = dir_with("a.txt", b"1\n2\n");
+
+        assert_eq!(
+            read(&dir, json!({"path": "a.txt", "limit": 0})),
+            Ok("1\n[showing lines 1-1 of 2; use offset 2 to read more]\n".into())
+        );
+    }
+
+    #[test]
+    fn a_line_over_the_byte_cap_is_cut_and_skipped() {
+        let contents = format!("short\n{}é\nnext\n", "x".repeat(MAX_BYTES - 1));
+        let dir = dir_with("a.txt", contents.as_bytes());
+
+        let out = read(&dir, json!({"path": "a.txt", "offset": 2})).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}\n[line 2 cut at {} bytes; use offset 3 to read more]\n",
+                "x".repeat(MAX_BYTES - 1),
+                MAX_BYTES - 1
+            )
         );
     }
 

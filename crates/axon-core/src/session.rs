@@ -97,7 +97,7 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{agent, client_error, prompt, reply, respond, sent_messages};
+    use crate::test_support::{agent, delta, end, prompt, reply, respond, sent_messages};
     use serde_json::json;
     use std::path::Path;
     use std::time::Duration;
@@ -108,14 +108,6 @@ mod tests {
         spawn(agent(server, Path::new(".")))
     }
 
-    const END: Event = Event::TurnEnded {
-        stop: StopReason::EndTurn,
-    };
-
-    fn delta(text: &str) -> Event {
-        Event::TextDelta { text: text.into() }
-    }
-
     #[tokio::test]
     async fn prompt_streams_deltas_then_ends_the_turn() {
         let server = MockServer::start().await;
@@ -124,27 +116,7 @@ mod tests {
 
         assert_eq!(
             prompt(&mut handle, "hi").await,
-            [delta("Hello"), delta(", world"), END]
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_turn_reports_an_error_and_is_left_out_of_history() {
-        let server = MockServer::start().await;
-        respond(&server, client_error()).await;
-        respond(&server, reply(&["ok"])).await;
-        let mut handle = session(&server);
-
-        let events = prompt(&mut handle, "first").await;
-        assert!(
-            matches!(events[..], [Event::Error { .. }, END]),
-            "{events:?}"
-        );
-
-        assert_eq!(prompt(&mut handle, "second").await, [delta("ok"), END]);
-        assert_eq!(
-            sent_messages(&server).await[1],
-            json!([{"role": "user", "content": "second"}])
+            [delta("Hello"), delta(", world"), end(StopReason::EndTurn)]
         );
     }
 
@@ -221,13 +193,37 @@ mod tests {
                 Some(Event::Error {
                     message: "a turn is already running".into()
                 }),
-                Some(Event::TurnEnded {
-                    stop: StopReason::Cancelled
-                })
+                Some(end(StopReason::Cancelled))
             ]
         );
 
-        assert_eq!(prompt(&mut handle, "after").await, [delta("next"), END]);
+        assert_eq!(
+            prompt(&mut handle, "after").await,
+            [delta("next"), end(StopReason::EndTurn)]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_command_sender_mid_turn_cancels_it_and_stops_the_session() {
+        let server = MockServer::start().await;
+        respond(&server, reply(&["late"]).set_delay(Duration::from_secs(30))).await;
+        let SessionHandle {
+            commands,
+            mut events,
+        } = session(&server);
+
+        commands
+            .send(Command::Prompt { text: "hi".into() })
+            .await
+            .unwrap();
+        drop(commands);
+
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            [events.recv().await, events.recv().await]
+        })
+        .await
+        .expect("turn should stop without waiting for the model");
+        assert_eq!(events, [Some(end(StopReason::Cancelled)), None]);
     }
 
     #[tokio::test]
@@ -238,6 +234,9 @@ mod tests {
 
         handle.commands.send(Command::Cancel).await.unwrap();
 
-        assert_eq!(prompt(&mut handle, "hi").await, [delta("ok"), END]);
+        assert_eq!(
+            prompt(&mut handle, "hi").await,
+            [delta("ok"), end(StopReason::EndTurn)]
+        );
     }
 }

@@ -6,7 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use std::path::Path;
 
-use axon_protocol::{Command, Event, SessionHandle};
+use axon_protocol::{Command, Event, SessionHandle, StopReason};
 
 use crate::model::{ModelClient, ModelConfig};
 use crate::turn::Agent;
@@ -96,6 +96,14 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
         cwd: cwd.canonicalize().unwrap(),
         max_requests: 25,
     }
+}
+
+pub(crate) fn end(stop: StopReason) -> Event {
+    Event::TurnEnded { stop }
+}
+
+pub(crate) fn delta(text: &str) -> Event {
+    Event::TextDelta { text: text.into() }
 }
 
 /// Send a prompt and collect events up to and including `TurnEnded`.

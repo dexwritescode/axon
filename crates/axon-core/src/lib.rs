@@ -51,8 +51,8 @@ impl SessionFactory for CoreFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{api_url, config, prompt, reply, respond};
-    use axon_protocol::{Event, StopReason};
+    use crate::test_support::{api_url, config, delta, end, prompt, reply, respond};
+    use axon_protocol::StopReason;
     use wiremock::MockServer;
 
     fn factory(base_url: String) -> CoreFactory {
@@ -81,14 +81,7 @@ mod tests {
 
         assert_eq!(
             prompt(&mut handle, "hi").await,
-            [
-                Event::TextDelta {
-                    text: "Hello".into()
-                },
-                Event::TurnEnded {
-                    stop: StopReason::EndTurn
-                }
-            ]
+            [delta("Hello"), end(StopReason::EndTurn)]
         );
     }
 }

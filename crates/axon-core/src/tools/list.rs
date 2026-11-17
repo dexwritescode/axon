@@ -82,6 +82,21 @@ mod tests {
     }
 
     #[test]
+    fn depth_is_clamped_to_one_through_five() {
+        let dir = tree();
+
+        assert_eq!(
+            list(&dir, json!({"path": "src", "depth": 0})),
+            Ok("src/deep/\nsrc/main.rs\n".into())
+        );
+        fs::create_dir_all(dir.path().join("1/2/3/4/5/6/7")).unwrap();
+        assert_eq!(
+            list(&dir, json!({"path": "1", "depth": 99})),
+            Ok("1/2/\n1/2/3/\n1/2/3/4/\n1/2/3/4/5/\n1/2/3/4/5/6/\n".into())
+        );
+    }
+
+    #[test]
     fn large_listings_are_capped() {
         let dir = TempDir::new().unwrap();
         for n in 0..MAX_ENTRIES + 10 {
