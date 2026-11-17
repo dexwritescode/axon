@@ -7,7 +7,7 @@ use regex::RegexBuilder;
 use serde_json::Value;
 
 use super::walk::{Glob, listing, relative, walk};
-use super::{optional_bool, optional_str, required_str};
+use super::{cut_chars, optional_bool, optional_str, required_str};
 use crate::jail;
 
 const MAX_RESULTS: usize = 200;
@@ -78,8 +78,8 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
 }
 
 fn clip(line: &str) -> String {
-    match line.char_indices().nth(MAX_LINE_CHARS) {
-        Some((end, _)) => format!("{}…", &line[..end]),
+    match cut_chars(line, MAX_LINE_CHARS) {
+        Some(head) => format!("{head}…"),
         None => line.into(),
     }
 }

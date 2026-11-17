@@ -181,6 +181,11 @@ fn resolve_dir(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The first `max` chars of `text`, if it is longer.
+fn cut_chars(text: &str, max: usize) -> Option<&str> {
+    text.char_indices().nth(max).map(|(end, _)| &text[..end])
+}
+
 /// The text of the file at `target`; `path` is how errors name it.
 fn read_text(target: &Path, path: &str) -> Result<String, String> {
     let bytes = fs::read(target).map_err(|e| format!("{path}: {e}"))?;

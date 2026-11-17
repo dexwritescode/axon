@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::{optional_usize, read_text, required_str};
+use super::{cut_chars, optional_usize, read_text, required_str};
 use crate::jail;
 
 const MAX_LINES: usize = 2000;
@@ -24,7 +24,7 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
 
     let lines: Vec<&str> = text.lines().collect();
     let first = offset - 1;
-    if first >= lines.len() && !lines.is_empty() {
+    if offset > 1 && first >= lines.len() {
         return Err(format!(
             "{path}: offset {offset} is past the last line ({})",
             lines.len()
@@ -55,8 +55,12 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
 
 /// `line`, or its first `MAX_LINE_CHARS` chars and a note saying it was cut.
 fn cut(line: &str) -> Cow<'_, str> {
-    match line.char_indices().nth(MAX_LINE_CHARS) {
-        Some((end, _)) => format!("{}… [line cut: {} bytes]", &line[..end], line.len()).into(),
+    match cut_chars(line, MAX_LINE_CHARS) {
+        Some(head) => format!(
+            "{head}… [line cut at {MAX_LINE_CHARS} chars; {} bytes in all]",
+            line.len()
+        )
+        .into(),
         None => line.into(),
     }
 }
@@ -146,6 +150,10 @@ mod tests {
         let dir = dir_with("a.txt", b"");
 
         assert_eq!(read(&dir, json!({"path": "a.txt"})), Ok(String::new()));
+        assert_eq!(
+            read(&dir, json!({"path": "a.txt", "offset": 2})),
+            Err("a.txt: offset 2 is past the last line (0)".into())
+        );
     }
 
     #[test]
@@ -166,7 +174,7 @@ mod tests {
         assert_eq!(
             read(&dir, json!({"path": "a.txt"})),
             Ok(format!(
-                "{long}… [line cut: {} bytes]\nnext\n",
+                "{long}… [line cut at 2000 chars; {} bytes in all]\nnext\n",
                 long.len() + 4
             ))
         );
