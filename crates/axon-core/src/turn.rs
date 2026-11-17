@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
 use crate::prompt;
-use crate::tools::{self, Action};
+use crate::tools::{self, Action, Printed};
 
 const CANCELLED: &str = "cancelled by user";
 const REJECTED: &str = "the user rejected this tool call";
@@ -178,7 +178,7 @@ impl Agent {
             },
             Ok(Action::Run(run)) => match asking.ask(run.change(), events).await? {
                 Some(true) => match run.execute(&self.cwd, asking.cancel).await {
-                    Ok((output, exit)) => Outcome::command(output, exit),
+                    Ok((printed, exit)) => Outcome::command(printed, exit),
                     Err(error) => Outcome::failed(error),
                 },
                 answer => Outcome::not_approved(answer),
@@ -229,20 +229,29 @@ impl Outcome {
         }
     }
 
-    fn command(output: String, exit: Exit) -> Self {
+    fn command(Printed { head, cut, tail }: Printed, exit: Exit) -> Self {
         let ending = match exit {
             Exit::Code(code) => format!("exit code {code}"),
             Exit::Killed => "killed by a signal".into(),
             Exit::TimedOut { secs } => format!("timed out after {secs} s and was killed"),
             Exit::Cancelled => CANCELLED.into(),
         };
-        let printed = match output.trim_end_matches('\n') {
+        let printed = match cut {
+            0 => head.clone(),
+            cut => format!("{head}\n[… {cut} bytes cut …]\n{tail}"),
+        };
+        let printed = match printed.trim_end_matches('\n') {
             "" => "(no output)",
             printed => printed,
         };
         Self {
             for_model: format!("{printed}\n[{ending}]"),
-            result: ToolResult::Command { output, exit },
+            result: ToolResult::Command {
+                head,
+                cut,
+                tail,
+                exit,
+            },
         }
     }
 }
@@ -651,7 +660,9 @@ mod tests {
                 finished(
                     1,
                     ToolResult::Command {
-                        output: "remember the milk\n".into(),
+                        head: "remember the milk\n".into(),
+                        cut: 0,
+                        tail: String::new(),
                         exit: Exit::Code(2)
                     }
                 ),
@@ -700,7 +711,9 @@ mod tests {
                 finished(
                     1,
                     ToolResult::Command {
-                        output: String::new(),
+                        head: String::new(),
+                        cut: 0,
+                        tail: String::new(),
                         exit: Exit::Cancelled
                     }
                 ),
@@ -711,7 +724,12 @@ mod tests {
 
     #[test]
     fn the_model_hears_how_a_command_ended() {
-        let heard = |output: &str, exit| Outcome::command(output.into(), exit).for_model;
+        let whole = |head: &str| Printed {
+            head: head.into(),
+            cut: 0,
+            tail: String::new(),
+        };
+        let heard = |head: &str, exit| Outcome::command(whole(head), exit).for_model;
 
         assert_eq!(heard("ok\n", Exit::Code(0)), "ok\n[exit code 0]");
         assert_eq!(heard("", Exit::Killed), "(no output)\n[killed by a signal]");
@@ -722,6 +740,15 @@ mod tests {
         assert_eq!(
             heard("", Exit::Cancelled),
             format!("(no output)\n[{CANCELLED}]")
+        );
+        let long = Printed {
+            head: "start\n".into(),
+            cut: 100,
+            tail: "end\n".into(),
+        };
+        assert_eq!(
+            Outcome::command(long, Exit::Code(0)).for_model,
+            "start\n\n[… 100 bytes cut …]\nend\n[exit code 0]"
         );
     }
 

@@ -89,7 +89,7 @@ fn committed(line: &Committed, width: u16) -> Paragraph<'static> {
                     tool_line("  ←   ", theme::ERROR, name, &preview(error))
                 }
                 ToolResult::Rejected => tool_line("  ✗   ", theme::REJECTED, name, "rejected"),
-                ToolResult::Command { output, exit } => command_result(name, output, *exit),
+                ToolResult::Command { head, exit, .. } => command_result(name, head, *exit),
             };
         }
     };
@@ -110,16 +110,17 @@ fn labelled(name: &'static str, color: Color, text: &str) -> Text<'static> {
         .collect()
 }
 
-/// A command's result: how it ended, unless it exited 0, then its output.
-fn command_result(name: &str, output: &str, exit: Exit) -> Paragraph<'static> {
+/// A command's result: how it ended, unless it exited 0, then the start of
+/// what it printed.
+fn command_result(name: &str, head: &str, exit: Exit) -> Paragraph<'static> {
     let ending = match exit {
-        Exit::Code(0) => return tool_line("  ←   ", theme::TOOL, name, &preview(output)),
+        Exit::Code(0) => return tool_line("  ←   ", theme::TOOL, name, &preview(head)),
         Exit::Code(code) => format!("exit {code}"),
         Exit::Killed => "killed".into(),
         Exit::TimedOut { secs } => format!("timed out after {secs} s"),
         Exit::Cancelled => "cancelled".into(),
     };
-    let detail = match preview(output).as_str() {
+    let detail = match preview(head).as_str() {
         "" => ending,
         printed => format!("{ending} · {printed}"),
     };
@@ -640,11 +641,13 @@ mod tests {
 
     #[test]
     fn command_results_say_how_they_ended() {
-        let result = |output: &str, exit| {
+        let result = |head: &str, exit| {
             let line = Committed::ToolResult {
                 name: "run_command".into(),
                 result: ToolResult::Command {
-                    output: output.into(),
+                    head: head.into(),
+                    cut: 0,
+                    tail: String::new(),
                     exit,
                 },
             };

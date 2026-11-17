@@ -29,6 +29,15 @@ pub(super) const SHELL: &str = "sh -c";
 #[cfg(windows)]
 pub(super) const SHELL: &str = "cmd /C";
 
+/// What a command printed, keeping its first and last bytes when long.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Printed {
+    pub(crate) head: String,
+    /// Bytes left out between `head` and `tail`; 0 means `head` is everything.
+    pub(crate) cut: usize,
+    pub(crate) tail: String,
+}
+
 /// A command the model wants to run.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Run {
@@ -59,13 +68,13 @@ impl Run {
     }
 
     /// Run the command in `cwd` until it exits, times out or `cancel` fires;
-    /// then kill whatever is left of it. Returns what it printed (capped) and
-    /// how it ended, or why it couldn't start.
+    /// then kill whatever is left of it. Returns what it printed and how it
+    /// ended, or why it couldn't start.
     pub(crate) async fn execute(
         &self,
         cwd: &Path,
         cancel: &CancellationToken,
-    ) -> Result<(String, Exit), String> {
+    ) -> Result<(Printed, Exit), String> {
         let (reader, writer) = io::pipe().map_err(|e| e.to_string())?;
         let mut command = shell(&self.command);
         command.command_mut().current_dir(cwd).stdin(Stdio::null());
@@ -109,8 +118,8 @@ impl Run {
         let _ = child.0.wait().await;
         let _ = tokio::time::timeout(DRAIN, reading).await;
 
-        let output = capture.lock().unwrap().text();
-        Ok((output, exit))
+        let printed = capture.lock().unwrap().printed();
+        Ok((printed, exit))
     }
 }
 
@@ -171,14 +180,18 @@ impl Capture {
         self.tail.drain(..over);
     }
 
-    /// The text, with a note where bytes were cut; a char split by the cut
-    /// is left out rather than shown as U+FFFD.
-    fn text(&self) -> String {
+    /// The text kept; a char split by the cut is left out rather than shown
+    /// as U+FFFD.
+    fn printed(&self) -> Printed {
         let mut tail: Vec<u8> = self.tail.iter().copied().collect();
         if self.total == self.head.len() + tail.len() {
             let mut all = self.head.clone();
             all.append(&mut tail);
-            return String::from_utf8_lossy(&all).into_owned();
+            return Printed {
+                head: String::from_utf8_lossy(&all).into_owned(),
+                cut: 0,
+                tail: String::new(),
+            };
         }
         let head = &self.head[..char_end(&self.head)];
         let start = tail
@@ -187,12 +200,11 @@ impl Capture {
             .take_while(|&&b| b & 0xC0 == 0x80)
             .count();
         let tail = &tail[start..];
-        let cut = self.total - head.len() - tail.len();
-        format!(
-            "{}\n[… {cut} bytes cut …]\n{}",
-            String::from_utf8_lossy(head),
-            String::from_utf8_lossy(tail)
-        )
+        Printed {
+            head: String::from_utf8_lossy(head).into_owned(),
+            cut: self.total - head.len() - tail.len(),
+            tail: String::from_utf8_lossy(tail).into_owned(),
+        }
     }
 }
 
@@ -210,15 +222,23 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    /// All of `printed`, which must not have been cut.
+    fn whole(printed: Printed) -> String {
+        assert_eq!((printed.cut, printed.tail.as_str()), (0, ""));
+        printed.head
+    }
+
     async fn run(command: &str, timeout_secs: u64) -> (String, Exit) {
         let dir = TempDir::new().unwrap();
         let run = Run {
             command: command.into(),
             timeout_secs,
         };
-        run.execute(dir.path(), &CancellationToken::new())
+        let (printed, exit) = run
+            .execute(dir.path(), &CancellationToken::new())
             .await
-            .unwrap()
+            .unwrap();
+        (whole(printed), exit)
     }
 
     #[test]
@@ -256,11 +276,11 @@ mod tests {
             timeout_secs: 10,
         };
 
-        let (output, _) = run
+        let (printed, _) = run
             .execute(dir.path(), &CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(output, "here.txt\n");
+        assert_eq!(whole(printed), "here.txt\n");
     }
 
     /// Run `command` in a temp dir; returns its result and whether
@@ -276,12 +296,12 @@ mod tests {
             command: command.into(),
             timeout_secs,
         };
-        let (output, exit) = run
+        let (printed, exit) = run
             .execute(dir.path(), &CancellationToken::new())
             .await
             .unwrap();
         tokio::time::sleep(after).await;
-        (output, exit, dir.path().join("late.txt").exists())
+        (whole(printed), exit, dir.path().join("late.txt").exists())
     }
 
     #[cfg(unix)]
@@ -341,7 +361,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             cancel.cancel();
         });
-        assert_eq!(result, Ok((String::new(), Exit::Cancelled)));
+        let (printed, exit) = result.unwrap();
+        assert_eq!((whole(printed), exit), (String::new(), Exit::Cancelled));
     }
 
     #[test]
@@ -351,14 +372,13 @@ mod tests {
         capture.push(&[b'x'; 100]);
         capture.push(&vec![b't'; TAIL_BYTES]);
 
-        let text = capture.text();
         assert_eq!(
-            text,
-            format!(
-                "{}\n[… 100 bytes cut …]\n{}",
-                "h".repeat(HEAD_BYTES),
-                "t".repeat(TAIL_BYTES)
-            )
+            capture.printed(),
+            Printed {
+                head: "h".repeat(HEAD_BYTES),
+                cut: 100,
+                tail: "t".repeat(TAIL_BYTES)
+            }
         );
     }
 
@@ -368,7 +388,10 @@ mod tests {
         capture.push(&vec![b'a'; HEAD_BYTES - 1]);
         capture.push("é!".as_bytes());
 
-        assert_eq!(capture.text(), format!("{}é!", "a".repeat(HEAD_BYTES - 1)));
+        assert_eq!(
+            whole(capture.printed()),
+            format!("{}é!", "a".repeat(HEAD_BYTES - 1))
+        );
     }
 
     #[test]
@@ -381,12 +404,12 @@ mod tests {
         capture.push(&vec![b'z'; TAIL_BYTES - 1]);
 
         assert_eq!(
-            capture.text(),
-            format!(
-                "{}\n[… 14 bytes cut …]\n{}",
-                "a".repeat(HEAD_BYTES - 1),
-                "z".repeat(TAIL_BYTES - 1)
-            )
+            capture.printed(),
+            Printed {
+                head: "a".repeat(HEAD_BYTES - 1),
+                cut: 14,
+                tail: "z".repeat(TAIL_BYTES - 1)
+            }
         );
     }
 
@@ -395,6 +418,6 @@ mod tests {
         let mut capture = Capture::default();
         capture.push(b"ok \xff\n");
 
-        assert_eq!(capture.text(), "ok \u{fffd}\n");
+        assert_eq!(whole(capture.printed()), "ok \u{fffd}\n");
     }
 }

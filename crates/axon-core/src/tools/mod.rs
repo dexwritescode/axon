@@ -8,7 +8,7 @@ mod shell;
 mod walk;
 mod write;
 
-pub(crate) use shell::Run;
+pub(crate) use shell::{Printed, Run};
 pub(crate) use write::Write;
 
 use std::fs;

@@ -60,8 +60,16 @@ pub enum ToolResult {
     Failed(String),
     /// The user rejected the change, or cancelled the turn while asked.
     Rejected,
-    /// A command ran: what it printed (stdout and stderr, capped) and how it ended.
-    Command { output: String, exit: Exit },
+    /// A command ran: what it printed (stdout and stderr together) and how
+    /// it ended. Long output keeps its start and end: `cut` bytes between
+    /// `head` and `tail` were left out. When `cut` is 0, `head` holds
+    /// everything and `tail` is empty.
+    Command {
+        head: String,
+        cut: usize,
+        tail: String,
+        exit: Exit,
+    },
 }
 
 /// How a command ended.
