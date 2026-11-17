@@ -1,11 +1,11 @@
 //! Drawing with ratatui on the full screen: the history pane (logo, finished
 //! lines, the streaming reply), the activity row, a separator and the input.
-//! While a change waits for approval, its diff is in the history and a y/n
-//! prompt replaces the input.
+//! While a change waits for approval, its diff or command is in the history
+//! and a y/n prompt replaces the input.
 
 use std::time::Duration;
 
-use axon_protocol::{StopReason, ToolStatus};
+use axon_protocol::{Change, Exit, StopReason, ToolResult};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
@@ -61,22 +61,35 @@ fn committed(line: &Committed, width: u16) -> Paragraph<'static> {
         Committed::Cancelled => {
             return Paragraph::new(Line::from("  ✗   cancelled").fg(theme::ERROR));
         }
-        Committed::Diff(change) => {
+        Committed::Change(Change::WriteFile {
+            path,
+            old_text,
+            new_text,
+        }) => {
             let width = usize::from(width.max(1));
-            return Paragraph::new(diff::lines(change, width, COMMITTED_DIFF_ROWS));
+            let lines = diff::lines(
+                path,
+                old_text.as_deref(),
+                new_text,
+                width,
+                COMMITTED_DIFF_ROWS,
+            );
+            return Paragraph::new(lines);
         }
+        Committed::Change(Change::RunCommand { command }) => ("  $   ", theme::INPUT, command),
         Committed::ToolCall { name, args } => {
             return tool_line("  →   ", theme::TOOL, name, &preview(args));
         }
-        Committed::ToolResult {
-            name,
-            status,
-            output,
-        } => {
-            return match status {
-                ToolStatus::Completed => tool_line("  ←   ", theme::TOOL, name, &preview(output)),
-                ToolStatus::Failed => tool_line("  ←   ", theme::ERROR, name, &preview(output)),
-                ToolStatus::Rejected => tool_line("  ✗   ", theme::REJECTED, name, "rejected"),
+        Committed::ToolResult { name, result } => {
+            return match result {
+                ToolResult::Output(output) => {
+                    tool_line("  ←   ", theme::TOOL, name, &preview(output))
+                }
+                ToolResult::Failed(error) => {
+                    tool_line("  ←   ", theme::ERROR, name, &preview(error))
+                }
+                ToolResult::Rejected => tool_line("  ✗   ", theme::REJECTED, name, "rejected"),
+                ToolResult::Command { head, exit, .. } => command_result(name, head, *exit),
             };
         }
     };
@@ -95,6 +108,23 @@ fn labelled(name: &'static str, color: Color, text: &str) -> Text<'static> {
             Line::from(vec![head, Span::from(part.replace('\t', "    "))])
         })
         .collect()
+}
+
+/// A command's result: how it ended, unless it exited 0, then the start of
+/// what it printed.
+fn command_result(name: &str, head: &str, exit: Exit) -> Paragraph<'static> {
+    let ending = match exit {
+        Exit::Code(0) => return tool_line("  ←   ", theme::TOOL, name, &preview(head)),
+        Exit::Code(code) => format!("exit {code}"),
+        Exit::Killed => "killed".into(),
+        Exit::TimedOut { secs } => format!("timed out after {secs} s"),
+        Exit::Cancelled => "cancelled".into(),
+    };
+    let detail = match preview(head).as_str() {
+        "" => ending,
+        printed => format!("{ending} · {printed}"),
+    };
+    tool_line("  ←   ", theme::ERROR, name, &detail)
 }
 
 fn tool_line(arrow: &str, color: Color, name: &str, detail: &str) -> Paragraph<'static> {
@@ -529,8 +559,7 @@ mod tests {
     fn tool_lines_are_cut_to_the_width() {
         let failed = Committed::ToolResult {
             name: "list_dir".into(),
-            status: ToolStatus::Failed,
-            output: "x".repeat(100),
+            result: ToolResult::Failed("x".repeat(100)),
         };
 
         let rows = text(committed(&failed, 30), 30);
@@ -554,7 +583,7 @@ mod tests {
         app.turn = Some(busy_turn());
         let history = app.on_event(axon_protocol::Event::ApprovalRequested {
             id: 1,
-            change: axon_protocol::Change::WriteFile {
+            change: Change::WriteFile {
                 path: "a.txt".into(),
                 old_text: None,
                 new_text: (1..=30).map(|n| format!("{n}\n")).collect(),
@@ -580,15 +609,14 @@ mod tests {
     fn rejected_and_accepted_changes_commit_their_own_lines() {
         let rejected = Committed::ToolResult {
             name: "edit_file".into(),
-            status: ToolStatus::Rejected,
-            output: String::new(),
+            result: ToolResult::Rejected,
         };
         assert_eq!(
             text(committed(&rejected, 80), 80),
             ["  ✗   edit_file  rejected"]
         );
 
-        let accepted = Committed::Diff(axon_protocol::Change::WriteFile {
+        let accepted = Committed::Change(Change::WriteFile {
             path: "a.txt".into(),
             old_text: None,
             new_text: (1..=50).map(|n| format!("{n}\n")).collect(),
@@ -597,5 +625,45 @@ mod tests {
             text(committed(&accepted, 80), 80).len(),
             COMMITTED_DIFF_ROWS
         );
+    }
+
+    #[test]
+    fn a_command_shows_as_a_shell_line() {
+        let command = Committed::Change(Change::RunCommand {
+            command: "cargo test\n--quiet".into(),
+        });
+
+        assert_eq!(
+            text(committed(&command, 80), 80),
+            ["  $   cargo test", "      --quiet"]
+        );
+    }
+
+    #[test]
+    fn command_results_say_how_they_ended() {
+        let result = |head: &str, exit| {
+            let line = Committed::ToolResult {
+                name: "run_command".into(),
+                result: ToolResult::Command {
+                    head: head.into(),
+                    cut: 0,
+                    tail: String::new(),
+                    exit,
+                },
+            };
+            text(committed(&line, 80), 80).join("\n")
+        };
+
+        assert_eq!(result("ok\n", Exit::Code(0)), "  ←   run_command  ok");
+        assert_eq!(
+            result("boom\nmore\n", Exit::Code(101)),
+            "  ←   run_command  exit 101 · boom …"
+        );
+        assert_eq!(result("", Exit::Killed), "  ←   run_command  killed");
+        assert_eq!(
+            result("", Exit::TimedOut { secs: 120 }),
+            "  ←   run_command  timed out after 120 s"
+        );
+        assert_eq!(result("", Exit::Cancelled), "  ←   run_command  cancelled");
     }
 }

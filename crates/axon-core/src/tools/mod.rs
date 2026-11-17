@@ -4,9 +4,11 @@ mod find;
 mod grep;
 mod list;
 mod read;
+mod shell;
 mod walk;
 mod write;
 
+pub(crate) use shell::{Printed, Run};
 pub(crate) use write::Write;
 
 use std::fs;
@@ -86,6 +88,30 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
             }),
         ),
         schema(
+            "run_command",
+            &format!(
+                "Run a command with {} in the working directory. The user approves every command. \
+                 stdin is closed; stdout and stderr come back together, capped at {} KB (the first {} KB \
+                 and the last {} KB). Background jobs are killed when the command exits.",
+                shell::SHELL,
+                (shell::HEAD_BYTES + shell::TAIL_BYTES) / 1024,
+                shell::HEAD_BYTES / 1024,
+                shell::TAIL_BYTES / 1024
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command line"},
+                    "timeout": {"type": "integer", "description": format!(
+                        "Seconds before the command is killed, 1 to {}; defaults to {}",
+                        shell::MAX_TIMEOUT_SECS,
+                        shell::DEFAULT_TIMEOUT_SECS
+                    )}
+                },
+                "required": ["command"]
+            }),
+        ),
+        schema(
             "find",
             "Find files by name or path with a glob, skipping those ignored by .gitignore.",
             json!({
@@ -118,6 +144,8 @@ pub(crate) enum Action {
     Output(String),
     /// The tool wants to change a file, once the user approves.
     Write(Write),
+    /// The tool wants to run a command, once the user approves.
+    Run(Run),
 }
 
 /// Run a tool call inside `cwd`: what it produced, or an error message for the model.
@@ -134,6 +162,7 @@ pub(crate) fn run(cwd: &Path, name: &str, args: &str) -> Result<Action, String> 
         "find" => find::run(cwd, &args).map(Action::Output),
         "write_file" => write::write_file(cwd, &args).map(Action::Write),
         "edit_file" => write::edit_file(cwd, &args).map(Action::Write),
+        "run_command" => shell::run_command(&args).map(Action::Run),
         _ => Err(format!("unknown tool: {name}")),
     }
 }
