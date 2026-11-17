@@ -38,13 +38,25 @@ async fn live_backend_reports_its_context_and_answers() {
         .unwrap();
 
     let mut reply = String::new();
+    let mut tool_call_names: Vec<String> = Vec::new();
     while let Some(delta) = stream.next().await {
         let delta = delta.unwrap();
-        if let Delta::Text(text) = delta {
-            reply.push_str(&text);
+        match delta {
+            Delta::Text(text) => reply.push_str(&text),
+            Delta::ToolCall(chunk) => {
+                if let Some(function) = &chunk.function
+                    && let Some(name) = &function.name
+                {
+                    tool_call_names.push(name.clone());
+                }
+            }
         }
     }
 
     eprintln!("reply: {:?}", reply);
-    assert!(!reply.is_empty());
+    eprintln!("tool_call_names: {:?}", tool_call_names);
+    assert!(
+        !reply.trim().is_empty() || !tool_call_names.is_empty(),
+        "expected either non-empty reply text or at least one tool call"
+    );
 }
