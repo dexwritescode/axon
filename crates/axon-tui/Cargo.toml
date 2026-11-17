@@ -10,6 +10,7 @@ chrono.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 humantime.workspace = true
+unicode-width.workspace = true
 ratatui.workspace = true
 similar.workspace = true
 syntect.workspace = true
