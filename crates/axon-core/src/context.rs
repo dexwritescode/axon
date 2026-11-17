@@ -23,7 +23,10 @@ pub(crate) async fn discover(
     if let Some(n) = vllm(http, base_url, api_key, model).await {
         return Some(n);
     }
-    llama_cpp(http, root, api_key).await
+    if let Some(n) = llama_cpp(http, root, api_key).await {
+        return Some(n);
+    }
+    ollama(http, root, api_key, model).await
 }
 
 async fn lm_studio(http: &Client, root: &str, api_key: &str, model: &str) -> Option<u64> {
@@ -55,6 +58,21 @@ async fn llama_cpp(http: &Client, root: &str, api_key: &str) -> Option<u64> {
 
     let json: serde_json::Value = response.json().await.ok()?;
     json["default_generation_settings"]["n_ctx"].as_u64()
+}
+
+async fn ollama(http: &Client, root: &str, api_key: &str, model: &str) -> Option<u64> {
+    let url = format!("{root}/api/ps");
+
+    let response = http.get(&url).bearer_auth(api_key).send().await.ok()?;
+
+    let json: serde_json::Value = response.json().await.ok()?;
+    json["models"]
+        .as_array()?
+        .iter()
+        .find(|m| {
+            m["name"].as_str() == Some(model) || m["model"].as_str() == Some(model)
+        })?["context_length"]
+        .as_u64()
 }
 
 #[cfg(test)]
@@ -148,6 +166,42 @@ mod tests {
             .and(path("/props"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string(r#"{"default_generation_settings":{}}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let http = Client::new();
+        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn ollama_returns_context_length_for_matching_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"models":[{"name":"other-model","model":"other-model","context_length":4096},{"name":"test-model","model":"test-model","context_length":32768}]}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let http = Client::new();
+        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        assert_eq!(result, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn ollama_no_matching_model_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"models":[{"name":"other-model","model":"other-model","context_length":4096}]}"#,
+                ),
             )
             .mount(&server)
             .await;
