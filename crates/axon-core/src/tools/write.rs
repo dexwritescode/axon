@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::walk::relative;
-use super::{optional_bool, optional_str};
+use super::{optional_bool, read_text, required_str};
 use crate::jail;
 
 /// A file change waiting for approval.
@@ -82,15 +82,6 @@ pub(super) fn edit_file(cwd: &Path, args: &Value) -> Result<Write, String> {
         old_text: Some(text),
         new_text,
     })
-}
-
-fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
-    optional_str(args, name)?.ok_or_else(|| format!("{name} is required"))
-}
-
-fn read_text(target: &Path, path: &str) -> Result<String, String> {
-    let bytes = fs::read(target).map_err(|e| format!("{path}: {e}"))?;
-    String::from_utf8(bytes).map_err(|_| format!("{path}: not a UTF-8 text file"))
 }
 
 #[cfg(test)]

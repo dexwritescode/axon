@@ -24,13 +24,21 @@ pub(crate) fn spawn(agent: Agent) -> SessionHandle {
 /// Runs until the frontend drops its command sender or its event receiver.
 async fn run(agent: Agent, mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
     let mut history: Vec<ChatCompletionRequestMessage> = Vec::new();
+    let mut last_approval = 0;
 
     while let Some(command) = commands.recv().await {
         match command {
             Command::Prompt { text } => {
                 let before = history.len();
                 history.push(ChatCompletionRequestMessage::User(text.into()));
-                let result = turn(&agent, &mut history, &mut commands, &events).await;
+                let result = turn(
+                    &agent,
+                    &mut history,
+                    &mut last_approval,
+                    &mut commands,
+                    &events,
+                )
+                .await;
                 let stop = match result {
                     Ok(stop) => stop,
                     Err(e) => {
@@ -57,12 +65,13 @@ async fn run(agent: Agent, mut commands: mpsc::Receiver<Command>, events: mpsc::
 async fn turn(
     agent: &Agent,
     history: &mut Vec<ChatCompletionRequestMessage>,
+    last_approval: &mut u64,
     commands: &mut mpsc::Receiver<Command>,
     events: &mpsc::Sender<Event>,
 ) -> Result<StopReason> {
     let cancel = CancellationToken::new();
     let (approve, mut approvals) = mpsc::unbounded_channel();
-    let mut turn = pin!(agent.turn(history, events, &mut approvals, &cancel));
+    let mut turn = pin!(agent.turn(history, events, &mut approvals, last_approval, &cancel));
     let mut frontend_open = true;
     loop {
         tokio::select! {

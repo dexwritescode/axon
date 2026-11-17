@@ -65,11 +65,6 @@ fn committed(line: &Committed, width: u16) -> Paragraph<'static> {
             let width = usize::from(width.max(1));
             return Paragraph::new(diff::lines(change, width, COMMITTED_DIFF_ROWS));
         }
-        Committed::ToolResult {
-            name,
-            status: ToolStatus::Rejected,
-            ..
-        } => return tool_line("  ✗   ", theme::REJECTED, name, "rejected"),
         Committed::ToolCall { name, args } => {
             return tool_line("  →   ", theme::TOOL, name, &preview(args));
         }
@@ -78,11 +73,11 @@ fn committed(line: &Committed, width: u16) -> Paragraph<'static> {
             status,
             output,
         } => {
-            let color = match status {
-                ToolStatus::Completed => theme::TOOL,
-                ToolStatus::Failed | ToolStatus::Rejected => theme::ERROR,
+            return match status {
+                ToolStatus::Completed => tool_line("  ←   ", theme::TOOL, name, &preview(output)),
+                ToolStatus::Failed => tool_line("  ←   ", theme::ERROR, name, &preview(output)),
+                ToolStatus::Rejected => tool_line("  ✗   ", theme::REJECTED, name, "rejected"),
             };
-            return tool_line("  ←   ", color, name, &preview(output));
         }
     };
     Paragraph::new(labelled(name, color, text)).wrap(Wrap { trim: false })
@@ -586,7 +581,7 @@ mod tests {
         let rejected = Committed::ToolResult {
             name: "edit_file".into(),
             status: ToolStatus::Rejected,
-            output: "the user rejected this change".into(),
+            output: String::new(),
         };
         assert_eq!(
             text(committed(&rejected, 80), 80),

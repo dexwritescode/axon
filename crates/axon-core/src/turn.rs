@@ -44,16 +44,18 @@ impl Agent {
     /// `history` valid: a partial reply is kept without its tool calls, and
     /// tool calls not yet run are answered with "cancelled by user".
     /// File changes wait for an answer on `approvals`; a rejection ends the
-    /// turn, so the user can say what they want instead.
+    /// turn, so the user can say what they want instead. Each request takes
+    /// the next id after `last_approval`, which the session keeps across
+    /// turns so an old answer can't match a new request.
     pub(crate) async fn turn(
         &self,
         history: &mut Vec<ChatCompletionRequestMessage>,
         events: &mpsc::Sender<Event>,
         approvals: &mut mpsc::UnboundedReceiver<Approval>,
+        last_approval: &mut u64,
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
         let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
-        let mut next_approval = 0;
         for _ in 0..self.max_requests {
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
@@ -76,9 +78,9 @@ impl Agent {
                 } else if rejected {
                     SKIPPED.to_string()
                 } else {
-                    next_approval += 1;
+                    *last_approval += 1;
                     let asking = Asking {
-                        id: next_approval,
+                        id: *last_approval,
                         approvals: &mut *approvals,
                         cancel,
                     };
@@ -204,10 +206,11 @@ impl Outcome {
         }
     }
 
+    /// Only the model hears why; frontends word it from the status.
     fn rejected(why: &str) -> Self {
         Self {
             status: ToolStatus::Rejected,
-            output: why.into(),
+            output: String::new(),
             for_model: why.into(),
         }
     }
@@ -448,9 +451,16 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut history = vec![ChatCompletionRequestMessage::User("go".into())];
         let (_approve, mut approvals) = mpsc::unbounded_channel();
+        let mut last_approval = 0;
         let mut seen = Vec::new();
         let stop = {
-            let mut turn = pin!(agent.turn(&mut history, &events, &mut approvals, &cancel));
+            let mut turn = pin!(agent.turn(
+                &mut history,
+                &events,
+                &mut approvals,
+                &mut last_approval,
+                &cancel
+            ));
             loop {
                 tokio::select! {
                     stop = &mut turn => break stop.unwrap(),
@@ -603,7 +613,7 @@ mod tests {
         assert_eq!(
             events[2..],
             [
-                finished("edit_file", ToolStatus::Rejected, REJECTED),
+                finished("edit_file", ToolStatus::Rejected, ""),
                 end(StopReason::EndTurn)
             ]
         );
@@ -633,6 +643,27 @@ mod tests {
             matches!(&events[1], Event::ToolCallFinished { status: ToolStatus::Failed, output, .. } if output.contains("outside")),
             "{events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn approval_ids_keep_counting_across_turns() {
+        let (server, _dir, mut handle) = session_with_notes(25).await;
+        for path in ["a.txt", "b.txt"] {
+            let args = format!(r#"{{"path":"{path}","content":"x"}}"#);
+            respond(&server, tool_calls(&[("c1", "write_file", &args)])).await;
+            respond(&server, reply(&["Done."])).await;
+        }
+
+        let first = prompt_answering(&mut handle, "write a", Some(true)).await;
+        let second = prompt_answering(&mut handle, "write b", Some(true)).await;
+
+        let id = |events: &[Event]| {
+            events.iter().find_map(|event| match event {
+                Event::ApprovalRequested { id, .. } => Some(*id),
+                _ => None,
+            })
+        };
+        assert_eq!((id(&first), id(&second)), (Some(1), Some(2)));
     }
 
     #[tokio::test]
@@ -678,10 +709,15 @@ mod tests {
         assert_eq!(
             events[2..],
             [
-                finished("write_file", ToolStatus::Rejected, CANCELLED),
+                finished("write_file", ToolStatus::Rejected, ""),
                 end(StopReason::Cancelled)
             ]
         );
         assert!(!dir.path().join("new.txt").exists());
+
+        respond(&server, reply(&["Ok."])).await;
+        prompt(&mut handle, "never mind").await;
+        let sent = &sent_messages(&server).await[1];
+        assert_eq!(sent[2]["content"], CANCELLED);
     }
 }

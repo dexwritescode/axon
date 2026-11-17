@@ -9,10 +9,13 @@ mod write;
 
 pub(crate) use write::Write;
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use serde_json::{Value, json};
+
+use crate::jail;
 
 /// The schemas sent with every request.
 pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
@@ -163,6 +166,25 @@ fn optional_str<'a>(args: &'a Value, name: &str) -> Result<Option<&'a str>, Stri
             .map(Some)
             .ok_or_else(|| format!("{name} must be a string")),
     }
+}
+
+fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
+    optional_str(args, name)?.ok_or_else(|| format!("{name} is required"))
+}
+
+/// The directory at `path`, inside the working directory.
+fn resolve_dir(cwd: &Path, path: &str) -> Result<PathBuf, String> {
+    let dir = jail::resolve(cwd, path)?;
+    if !dir.is_dir() {
+        return Err(format!("{path}: not a directory"));
+    }
+    Ok(dir)
+}
+
+/// The text of the file at `target`; `path` is how errors name it.
+fn read_text(target: &Path, path: &str) -> Result<String, String> {
+    let bytes = fs::read(target).map_err(|e| format!("{path}: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| format!("{path}: not a UTF-8 text file"))
 }
 
 #[cfg(test)]
