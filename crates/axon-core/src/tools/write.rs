@@ -15,10 +15,10 @@ use crate::jail;
 #[derive(Debug, PartialEq)]
 pub(crate) struct Write {
     /// Relative to the working directory.
-    pub(crate) path: String,
+    path: String,
     target: PathBuf,
-    pub(crate) old_text: Option<String>,
-    pub(crate) new_text: String,
+    old_text: Option<String>,
+    new_text: String,
 }
 
 impl Write {

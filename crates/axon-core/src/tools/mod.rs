@@ -91,15 +91,22 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
             "run_command",
             &format!(
                 "Run a command with {} in the working directory. The user approves every command. \
-                 stdin is closed; stdout and stderr come back together, capped at 32 KB (the first 8 KB \
-                 and the last 24 KB). Background jobs are killed when the command exits.",
-                shell::SHELL
+                 stdin is closed; stdout and stderr come back together, capped at {} KB (the first {} KB \
+                 and the last {} KB). Background jobs are killed when the command exits.",
+                shell::SHELL,
+                (shell::HEAD_BYTES + shell::TAIL_BYTES) / 1024,
+                shell::HEAD_BYTES / 1024,
+                shell::TAIL_BYTES / 1024
             ),
             json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command line"},
-                    "timeout": {"type": "integer", "description": "Seconds before the command is killed, 1 to 600; defaults to 120"}
+                    "timeout": {"type": "integer", "description": format!(
+                        "Seconds before the command is killed, 1 to {}; defaults to {}",
+                        shell::MAX_TIMEOUT_SECS,
+                        shell::DEFAULT_TIMEOUT_SECS
+                    )}
                 },
                 "required": ["command"]
             }),

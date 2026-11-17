@@ -19,8 +19,8 @@ use crate::prompt;
 use crate::tools::{self, Action};
 
 const CANCELLED: &str = "cancelled by user";
-const REJECTED: &str = "the user rejected this change";
-const SKIPPED: &str = "not run: the user rejected an earlier change";
+const REJECTED: &str = "the user rejected this tool call";
+const SKIPPED: &str = "not run: the user rejected an earlier tool call";
 
 /// The user's answer to an `ApprovalRequested` event.
 pub(crate) struct Approval {
@@ -176,18 +176,13 @@ impl Agent {
                 },
                 answer => Outcome::not_approved(answer),
             },
-            Ok(Action::Run(run)) => {
-                let change = Change::RunCommand {
-                    command: run.command.clone(),
-                };
-                match asking.ask(change, events).await? {
-                    Some(true) => match run.execute(&self.cwd, asking.cancel).await {
-                        Ok((output, exit)) => Outcome::command(output, exit),
-                        Err(error) => Outcome::failed(error),
-                    },
-                    answer => Outcome::not_approved(answer),
-                }
-            }
+            Ok(Action::Run(run)) => match asking.ask(run.change(), events).await? {
+                Some(true) => match run.execute(&self.cwd, asking.cancel).await {
+                    Ok((output, exit)) => Outcome::command(output, exit),
+                    Err(error) => Outcome::failed(error),
+                },
+                answer => Outcome::not_approved(answer),
+            },
             Err(error) => Outcome::failed(error),
         };
         events
@@ -711,6 +706,22 @@ mod tests {
                 ),
                 end(StopReason::Cancelled)
             ]
+        );
+    }
+
+    #[test]
+    fn the_model_hears_how_a_command_ended() {
+        let heard = |output: &str, exit| Outcome::command(output.into(), exit).for_model;
+
+        assert_eq!(heard("ok\n", Exit::Code(0)), "ok\n[exit code 0]");
+        assert_eq!(heard("", Exit::Killed), "(no output)\n[killed by a signal]");
+        assert_eq!(
+            heard("x", Exit::TimedOut { secs: 5 }),
+            "x\n[timed out after 5 s and was killed]"
+        );
+        assert_eq!(
+            heard("", Exit::Cancelled),
+            format!("(no output)\n[{CANCELLED}]")
         );
     }
 
