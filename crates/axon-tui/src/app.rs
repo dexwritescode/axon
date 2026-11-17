@@ -1,9 +1,10 @@
 //! UI state and how keys and session events change it. No terminal I/O.
 
+use std::collections::HashMap;
 use std::mem;
 use std::time::{Duration, Instant};
 
-use axon_protocol::{Change, Event, StopReason, ToolStatus};
+use axon_protocol::{Change, Event, StopReason, ToolResult};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
@@ -21,9 +22,11 @@ pub(crate) struct App {
     pub(crate) turn: Option<Turn>,
     /// How the last turn ended, shown in the activity row until the next one.
     pub(crate) finished: Option<Finished>,
-    /// The id of a change waiting for y or n; its diff is already in the
-    /// history and the y/n prompt replaces the input.
+    /// The id of a tool call waiting for y or n; its change is already in
+    /// the history and the y/n prompt replaces the input.
     pub(crate) approval: Option<u64>,
+    /// Names of the tool calls started and not yet finished, by id.
+    pub(crate) calls: HashMap<u64, String>,
     /// The first history row shown, or `None` to follow the bottom.
     pub(crate) scroll: Option<u32>,
     /// The screen as last drawn.
@@ -107,11 +110,10 @@ pub(crate) enum Committed {
     },
     ToolResult {
         name: String,
-        status: ToolStatus,
-        output: String,
+        result: ToolResult,
     },
     /// A change asked for approval, kept whatever the answer.
-    Diff(Change),
+    Change(Change),
     Error(String),
     Cancelled,
 }
@@ -184,7 +186,11 @@ impl App {
             _ => return None,
         };
         let id = self.approval.take()?;
-        self.set_activity(Activity::Thinking);
+        let activity = match self.calls.get(&id) {
+            Some(name) if approve => Activity::Running(name.clone()),
+            _ => Activity::Thinking,
+        };
+        self.set_activity(activity);
         Some(Action::Answer { id, approve })
     }
 
@@ -249,8 +255,9 @@ impl App {
                 self.streaming_text.push_str(&text);
                 Vec::new()
             }
-            Event::ToolCallStarted { name, args } => {
+            Event::ToolCallStarted { id, name, args } => {
                 self.set_activity(Activity::Running(name.clone()));
+                self.calls.insert(id, name.clone());
                 let mut committed = self.take_reply();
                 committed.push(Committed::ToolCall { name, args });
                 committed
@@ -259,21 +266,14 @@ impl App {
                 self.set_activity(Activity::Approving);
                 self.approval = Some(id);
                 let mut committed = self.take_reply();
-                committed.push(Committed::Diff(change));
+                committed.push(Committed::Change(change));
                 committed
             }
-            Event::ToolCallFinished {
-                name,
-                status,
-                output,
-            } => {
+            Event::ToolCallFinished { id, result } => {
                 self.set_activity(Activity::Thinking);
                 self.approval = None;
-                vec![Committed::ToolResult {
-                    name,
-                    status,
-                    output,
-                }]
+                let name = self.calls.remove(&id).unwrap_or_default();
+                vec![Committed::ToolResult { name, result }]
             }
             Event::Error { message } => {
                 let mut committed = self.take_reply();
@@ -289,6 +289,7 @@ impl App {
                     });
                 }
                 self.approval = None;
+                self.calls.clear();
                 let mut committed = self.take_reply();
                 match stop {
                     StopReason::EndTurn => {}
@@ -440,13 +441,13 @@ mod tests {
     fn activity_follows_tool_calls_but_cancelling_sticks() {
         let mut app = busy_app();
         let started = || Event::ToolCallStarted {
+            id: 1,
             name: "list_dir".into(),
             args: "{}".into(),
         };
         let finished = || Event::ToolCallFinished {
-            name: "list_dir".into(),
-            status: ToolStatus::Completed,
-            output: String::new(),
+            id: 1,
+            result: ToolResult::Output(String::new()),
         };
 
         app.on_event(started());
@@ -528,6 +529,7 @@ mod tests {
 
         assert_eq!(
             app.on_event(Event::ToolCallStarted {
+                id: 1,
                 name: "list_dir".into(),
                 args: "{}".into()
             }),
@@ -541,14 +543,12 @@ mod tests {
         );
         assert_eq!(
             app.on_event(Event::ToolCallFinished {
-                name: "list_dir".into(),
-                status: ToolStatus::Completed,
-                output: "src/\n".into()
+                id: 1,
+                result: ToolResult::Output("src/\n".into())
             }),
             [Committed::ToolResult {
                 name: "list_dir".into(),
-                status: ToolStatus::Completed,
-                output: "src/\n".into()
+                result: ToolResult::Output("src/\n".into())
             }]
         );
     }
@@ -594,6 +594,11 @@ mod tests {
 
     fn asked_app() -> App {
         let mut app = busy_app();
+        app.on_event(Event::ToolCallStarted {
+            id: 7,
+            name: "write_file".into(),
+            args: "{}".into(),
+        });
         app.on_event(Event::ApprovalRequested {
             id: 7,
             change: change(),
@@ -601,12 +606,8 @@ mod tests {
         app
     }
 
-    fn finished(status: ToolStatus) -> Event {
-        Event::ToolCallFinished {
-            name: "write_file".into(),
-            status,
-            output: "out".into(),
-        }
+    fn finished(result: ToolResult) -> Event {
+        Event::ToolCallFinished { id: 7, result }
     }
 
     #[test]
@@ -623,7 +624,7 @@ mod tests {
             committed,
             [
                 Committed::Agent("I'll write it.".into()),
-                Committed::Diff(change())
+                Committed::Change(change())
             ]
         );
         assert_eq!(*activity(&app), Activity::Approving);
@@ -631,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn y_accepts_and_the_result_follows_the_diff() {
+    fn y_accepts_runs_and_the_result_follows_the_change() {
         let mut app = asked_app();
 
         assert_eq!(
@@ -642,18 +643,18 @@ mod tests {
             })
         );
         assert!(app.approval.is_none());
+        assert_eq!(*activity(&app), Activity::Running("write_file".into()));
         assert_eq!(
-            app.on_event(finished(ToolStatus::Completed)),
+            app.on_event(finished(ToolResult::Output("out".into()))),
             [Committed::ToolResult {
                 name: "write_file".into(),
-                status: ToolStatus::Completed,
-                output: "out".into()
+                result: ToolResult::Output("out".into())
             }]
         );
     }
 
     #[test]
-    fn n_rejects_and_the_rejection_follows_the_diff() {
+    fn n_rejects_and_the_rejection_follows_the_change() {
         let mut app = asked_app();
 
         assert_eq!(
@@ -663,14 +664,14 @@ mod tests {
                 approve: false
             })
         );
-        let committed = app.on_event(finished(ToolStatus::Rejected));
-        assert!(matches!(
-            &committed[..],
+        assert_eq!(*activity(&app), Activity::Thinking);
+        assert_eq!(
+            app.on_event(finished(ToolResult::Rejected)),
             [Committed::ToolResult {
-                status: ToolStatus::Rejected,
-                ..
+                name: "write_file".into(),
+                result: ToolResult::Rejected
             }]
-        ));
+        );
     }
 
     #[test]

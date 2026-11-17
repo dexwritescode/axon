@@ -10,10 +10,11 @@ anyhow.workspace = true
 async-openai.workspace = true
 futures.workspace = true
 globset.workspace = true
+process-wrap.workspace = true
 ignore.workspace = true
 regex.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "io-util"] }
 tokio-util.workspace = true
 
 [dev-dependencies]

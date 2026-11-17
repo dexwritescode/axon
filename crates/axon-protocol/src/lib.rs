@@ -14,7 +14,7 @@ pub enum Command {
     /// Stop the running turn; it ends with `StopReason::Cancelled`.
     /// Does nothing while idle.
     Cancel,
-    /// Answer the `ApprovalRequested` event with this `id`.
+    /// Answer the `ApprovalRequested` event for the tool call with this `id`.
     Approval { id: u64, approve: bool },
 }
 
@@ -23,17 +23,14 @@ pub enum Command {
 pub enum Event {
     /// A piece of the model's reply, in order.
     TextDelta { text: String },
-    /// The model called a tool; `args` is the JSON text it sent.
-    ToolCallStarted { name: String, args: String },
-    /// The tool call started last wants to make `change`; it waits for a
+    /// The model called a tool; `args` is the JSON text it sent. `id` is
+    /// unique within the session and names this call in later events.
+    ToolCallStarted { id: u64, name: String, args: String },
+    /// The tool call `id` wants to make `change`; it waits for a
     /// `Command::Approval` with the same `id`, or for `Command::Cancel`.
     ApprovalRequested { id: u64, change: Change },
-    /// The tool call started last has finished.
-    ToolCallFinished {
-        name: String,
-        status: ToolStatus,
-        output: String,
-    },
+    /// The tool call `id` has finished.
+    ToolCallFinished { id: u64, result: ToolResult },
     /// Something went wrong; the session stays usable.
     Error { message: String },
     /// The turn started by the last `Prompt` is over.
@@ -50,15 +47,35 @@ pub enum Change {
         old_text: Option<String>,
         new_text: String,
     },
+    /// Run `command` in the platform shell, in the working directory.
+    RunCommand { command: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ToolStatus {
-    Completed,
-    /// The tool reported an error; `output` says what went wrong.
-    Failed,
+/// How a tool call ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolResult {
+    /// What a file tool returned.
+    Output(String),
+    /// The tool couldn't do it; says why.
+    Failed(String),
     /// The user rejected the change, or cancelled the turn while asked.
     Rejected,
+    /// A command ran: what it printed (stdout and stderr, capped) and how it ended.
+    Command { output: String, exit: Exit },
+}
+
+/// How a command ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Exit {
+    Code(i32),
+    /// Ended without an exit code, e.g. killed by a signal on Unix.
+    Killed,
+    /// Killed after running this long.
+    TimedOut {
+        secs: u64,
+    },
+    /// Killed because the turn was cancelled.
+    Cancelled,
 }
 
 /// Why a turn ended.

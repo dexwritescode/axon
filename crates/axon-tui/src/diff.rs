@@ -4,7 +4,6 @@ use std::ops::Range;
 use std::sync::LazyLock;
 
 use crate::theme;
-use axon_protocol::Change;
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
@@ -43,14 +42,16 @@ enum Row {
     More(usize),
 }
 
-/// `change` in at most `max_rows` lines (at least two) of `width` columns.
-pub(crate) fn lines(change: &Change, width: usize, max_rows: usize) -> Vec<Line<'static>> {
-    let Change::WriteFile {
-        path,
-        old_text,
-        new_text,
-    } = change;
-    let mut rows = rows(path, old_text.as_deref(), new_text);
+/// The change from `old_text` (`None` for a new file) to `new_text` in at
+/// most `max_rows` lines (at least two) of `width` columns.
+pub(crate) fn lines(
+    path: &str,
+    old_text: Option<&str>,
+    new_text: &str,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = rows(path, old_text, new_text);
     let max_rows = max_rows.max(2);
     if rows.len() > max_rows {
         let hidden = rows.len() - (max_rows - 1);
@@ -204,14 +205,6 @@ mod tests {
         }
     }
 
-    fn change(old_text: Option<&str>, new_text: &str) -> Change {
-        Change::WriteFile {
-            path: "src/lib.rs".into(),
-            old_text: old_text.map(String::from),
-            new_text: new_text.into(),
-        }
-    }
-
     fn text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -267,7 +260,7 @@ mod tests {
             .map(|n| format!("line {n} {}\n", "x".repeat(100)))
             .collect();
 
-        let lines: Vec<String> = lines(&change(None, &new), 40, 10)
+        let lines: Vec<String> = lines("src/lib.rs", None, &new, 40, 10)
             .iter()
             .map(text)
             .collect();
@@ -285,9 +278,7 @@ mod tests {
 
     #[test]
     fn changed_words_get_their_own_background() {
-        let change = change(Some("let a = 1;\n"), "let a = 2;\n");
-
-        let lines = lines(&change, 80, 10);
+        let lines = lines("src/lib.rs", Some("let a = 1;\n"), "let a = 2;\n", 80, 10);
 
         let added = &lines[2];
         let bg_of = |s: &str| {

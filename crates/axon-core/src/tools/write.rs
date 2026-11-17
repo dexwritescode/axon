@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use axon_protocol::Change;
 use serde_json::Value;
 
 use super::walk::relative;
@@ -21,6 +22,15 @@ pub(crate) struct Write {
 }
 
 impl Write {
+    /// What the user is asked to approve.
+    pub(crate) fn change(&self) -> Change {
+        Change::WriteFile {
+            path: self.path.clone(),
+            old_text: self.old_text.clone(),
+            new_text: self.new_text.clone(),
+        }
+    }
+
     /// Write the file, creating missing parent directories.
     pub(crate) fn apply(&self) -> Result<String, String> {
         if let Some(dir) = self.target.parent() {

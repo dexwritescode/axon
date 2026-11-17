@@ -9,14 +9,14 @@ use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs, FunctionCall,
 };
-use axon_protocol::{Change, Event, StopReason, ToolStatus};
+use axon_protocol::{Change, Event, Exit, StopReason, ToolResult};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
 use crate::prompt;
-use crate::tools::{self, Action, Write};
+use crate::tools::{self, Action};
 
 const CANCELLED: &str = "cancelled by user";
 const REJECTED: &str = "the user rejected this change";
@@ -43,16 +43,16 @@ impl Agent {
     /// When `cancel` fires, the turn stops at the next safe point and leaves
     /// `history` valid: a partial reply is kept without its tool calls, and
     /// tool calls not yet run are answered with "cancelled by user".
-    /// File changes wait for an answer on `approvals`; a rejection ends the
-    /// turn, so the user can say what they want instead. Each request takes
-    /// the next id after `last_approval`, which the session keeps across
-    /// turns so an old answer can't match a new request.
+    /// File changes and commands wait for an answer on `approvals`; a
+    /// rejection ends the turn, so the user can say what they want instead.
+    /// Each tool call takes the next id after `last_call`, which the session
+    /// keeps across turns so an old answer can't match a new call.
     pub(crate) async fn turn(
         &self,
         history: &mut Vec<ChatCompletionRequestMessage>,
         events: &mpsc::Sender<Event>,
         approvals: &mut mpsc::UnboundedReceiver<Approval>,
-        last_approval: &mut u64,
+        last_call: &mut u64,
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
         let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
@@ -78,15 +78,15 @@ impl Agent {
                 } else if rejected {
                     SKIPPED.to_string()
                 } else {
-                    *last_approval += 1;
+                    *last_call += 1;
                     let asking = Asking {
-                        id: *last_approval,
+                        id: *last_call,
                         approvals: &mut *approvals,
                         cancel,
                     };
-                    let (status, output) = self.run_tool(&call, events, asking).await?;
-                    rejected = status == ToolStatus::Rejected;
-                    output
+                    let outcome = self.run_tool(&call, events, asking).await?;
+                    rejected = outcome.result == ToolResult::Rejected;
+                    outcome.for_model
                 };
                 history.push(
                     ChatCompletionRequestToolMessageArgs::default()
@@ -149,16 +149,18 @@ impl Agent {
         Ok(reply)
     }
 
-    /// Run a tool call, reporting it to the frontend and asking before any
-    /// file change; returns how it ended and what the model sees.
+    /// Run tool call `id`, reporting it to the frontend and asking before
+    /// any file change or command; returns how it ended for the model.
     async fn run_tool(
         &self,
         call: &ToolCall,
         events: &mpsc::Sender<Event>,
-        asking: Asking<'_>,
-    ) -> Result<(ToolStatus, String)> {
+        mut asking: Asking<'_>,
+    ) -> Result<Outcome> {
+        let id = asking.id;
         events
             .send(Event::ToolCallStarted {
+                id,
                 name: call.name.clone(),
                 args: call.args.clone(),
             })
@@ -166,84 +168,91 @@ impl Agent {
         let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
         let action = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
         let outcome = match action {
-            Ok(Action::Output(output)) => Outcome::completed(output),
-            Ok(Action::Write(write)) => approve_and_write(write, events, asking).await?,
+            Ok(Action::Output(output)) => Outcome::output(output),
+            Ok(Action::Write(write)) => match asking.ask(write.change(), events).await? {
+                Some(true) => match tokio::task::spawn_blocking(move || write.apply()).await? {
+                    Ok(output) => Outcome::output(output),
+                    Err(error) => Outcome::failed(error),
+                },
+                answer => Outcome::not_approved(answer),
+            },
+            Ok(Action::Run(run)) => {
+                let change = Change::RunCommand {
+                    command: run.command.clone(),
+                };
+                match asking.ask(change, events).await? {
+                    Some(true) => match run.execute(&self.cwd, asking.cancel).await {
+                        Ok((output, exit)) => Outcome::command(output, exit),
+                        Err(error) => Outcome::failed(error),
+                    },
+                    answer => Outcome::not_approved(answer),
+                }
+            }
             Err(error) => Outcome::failed(error),
         };
         events
             .send(Event::ToolCallFinished {
-                name: call.name.clone(),
-                status: outcome.status,
-                output: outcome.output,
+                id,
+                result: outcome.result.clone(),
             })
             .await?;
-        Ok((outcome.status, outcome.for_model))
+        Ok(outcome)
     }
 }
 
-/// How a tool call ended.
+/// How a tool call ended: for the frontend, and for the model.
 struct Outcome {
-    status: ToolStatus,
-    /// For the frontend.
-    output: String,
+    result: ToolResult,
     for_model: String,
 }
 
 impl Outcome {
-    fn completed(output: String) -> Self {
+    fn output(output: String) -> Self {
         Self {
-            status: ToolStatus::Completed,
             for_model: output.clone(),
-            output,
+            result: ToolResult::Output(output),
         }
     }
 
     fn failed(error: String) -> Self {
         Self {
-            status: ToolStatus::Failed,
             for_model: format!("error: {error}"),
-            output: error,
+            result: ToolResult::Failed(error),
         }
     }
 
-    /// Only the model hears why; frontends word it from the status.
-    fn rejected(why: &str) -> Self {
+    /// The user said no (`Some(false)`) or cancelled while asked (`None`).
+    fn not_approved(answer: Option<bool>) -> Self {
         Self {
-            status: ToolStatus::Rejected,
-            output: String::new(),
-            for_model: why.into(),
+            result: ToolResult::Rejected,
+            for_model: if answer.is_some() {
+                REJECTED
+            } else {
+                CANCELLED
+            }
+            .into(),
+        }
+    }
+
+    fn command(output: String, exit: Exit) -> Self {
+        let ending = match exit {
+            Exit::Code(code) => format!("exit code {code}"),
+            Exit::Killed => "killed by a signal".into(),
+            Exit::TimedOut { secs } => format!("timed out after {secs} s and was killed"),
+            Exit::Cancelled => CANCELLED.into(),
+        };
+        let printed = match output.trim_end_matches('\n') {
+            "" => "(no output)",
+            printed => printed,
+        };
+        Self {
+            for_model: format!("{printed}\n[{ending}]"),
+            result: ToolResult::Command { output, exit },
         }
     }
 }
 
-/// Show the change, wait for the user, and write the file if they approve.
-async fn approve_and_write(
-    write: Write,
-    events: &mpsc::Sender<Event>,
-    asking: Asking<'_>,
-) -> Result<Outcome> {
-    let change = Change::WriteFile {
-        path: write.path.clone(),
-        old_text: write.old_text.clone(),
-        new_text: write.new_text.clone(),
-    };
-    events
-        .send(Event::ApprovalRequested {
-            id: asking.id,
-            change,
-        })
-        .await?;
-    Ok(match asking.answer().await {
-        Some(true) => match tokio::task::spawn_blocking(move || write.apply()).await? {
-            Ok(output) => Outcome::completed(output),
-            Err(error) => Outcome::failed(error),
-        },
-        Some(false) => Outcome::rejected(REJECTED),
-        None => Outcome::rejected(CANCELLED),
-    })
-}
-
-/// One approval request: its id and where the answer comes from.
+/// One tool call that may ask the user: its id and where answers come from.
 struct Asking<'a> {
     id: u64,
     approvals: &'a mut mpsc::UnboundedReceiver<Approval>,
@@ -251,17 +260,23 @@ struct Asking<'a> {
 }
 
 impl Asking<'_> {
-    /// The user's answer, or `None` if the turn is cancelled first.
-    /// Answers to other requests are ignored.
-    async fn answer(self) -> Option<bool> {
+    /// Show `change` and wait for the user: their answer, or `None` if the
+    /// turn is cancelled first. Answers to other calls are ignored.
+    async fn ask(&mut self, change: Change, events: &mpsc::Sender<Event>) -> Result<Option<bool>> {
+        events
+            .send(Event::ApprovalRequested {
+                id: self.id,
+                change,
+            })
+            .await?;
         loop {
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return None,
+                _ = self.cancel.cancelled() => return Ok(None),
                 approval = self.approvals.recv() => match approval {
-                    Some(approval) if approval.id == self.id => return Some(approval.approve),
+                    Some(approval) if approval.id == self.id => return Ok(Some(approval.approve)),
                     Some(_) => {}
-                    None => return None,
+                    None => return Ok(None),
                 },
             }
         }
@@ -339,14 +354,11 @@ mod tests {
             prompt(&mut handle, "what's in my notes?").await,
             [
                 Event::ToolCallStarted {
+                    id: 1,
                     name: "read_file".into(),
                     args: args.into()
                 },
-                Event::ToolCallFinished {
-                    name: "read_file".into(),
-                    status: ToolStatus::Completed,
-                    output: "remember the milk\n".into()
-                },
+                finished(1, ToolResult::Output("remember the milk\n".into())),
                 delta("Milk."),
                 end(StopReason::EndTurn),
             ]
@@ -392,10 +404,13 @@ mod tests {
 
         let events = prompt(&mut handle, "read").await;
 
-        let Event::ToolCallFinished { status, output, .. } = &events[1] else {
+        let Event::ToolCallFinished {
+            result: ToolResult::Failed(output),
+            ..
+        } = &events[1]
+        else {
             panic!("{events:?}");
         };
-        assert_eq!(*status, ToolStatus::Failed);
         assert!(
             output.starts_with("arguments were not valid JSON"),
             "{output}"
@@ -447,14 +462,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut history = vec![ChatCompletionRequestMessage::User("go".into())];
         let (_approve, mut approvals) = mpsc::unbounded_channel();
-        let mut last_approval = 0;
+        let mut last_call = 0;
         let mut seen = Vec::new();
         let stop = {
             let mut turn = pin!(agent.turn(
                 &mut history,
                 &events,
                 &mut approvals,
-                &mut last_approval,
+                &mut last_call,
                 &cancel
             ));
             loop {
@@ -526,12 +541,8 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
-    fn finished(name: &str, status: ToolStatus, output: &str) -> Event {
-        Event::ToolCallFinished {
-            name: name.into(),
-            status,
-            output: output.into(),
-        }
+    fn finished(id: u64, result: ToolResult) -> Event {
+        Event::ToolCallFinished { id, result }
     }
 
     #[tokio::test]
@@ -554,7 +565,7 @@ mod tests {
                         new_text: "hi\n".into()
                     }
                 },
-                finished("write_file", ToolStatus::Completed, "wrote sub/new.txt"),
+                finished(1, ToolResult::Output("wrote sub/new.txt".into())),
             ]
         );
         assert_eq!(
@@ -608,10 +619,7 @@ mod tests {
 
         assert_eq!(
             events[2..],
-            [
-                finished("edit_file", ToolStatus::Rejected, ""),
-                end(StopReason::EndTurn)
-            ]
+            [finished(1, ToolResult::Rejected), end(StopReason::EndTurn)]
         );
         assert_eq!(
             fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
@@ -626,6 +634,86 @@ mod tests {
         assert_eq!(sent[4]["content"], "use bread instead");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_command_runs_and_the_model_gets_output_and_exit_code() {
+        let (server, _dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"command":"cat notes.txt; exit 2"}"#;
+        respond(&server, tool_calls(&[("c1", "run_command", args)])).await;
+        respond(&server, reply(&["Done."])).await;
+
+        let events = prompt_answering(&mut handle, "run", Some(true)).await;
+
+        assert_eq!(
+            events[1..3],
+            [
+                Event::ApprovalRequested {
+                    id: 1,
+                    change: Change::RunCommand {
+                        command: "cat notes.txt; exit 2".into()
+                    }
+                },
+                finished(
+                    1,
+                    ToolResult::Command {
+                        output: "remember the milk\n".into(),
+                        exit: Exit::Code(2)
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "remember the milk\n[exit code 2]"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_a_running_command_and_ends_the_turn() {
+        let (server, _dir, mut handle) = session_with_notes(25).await;
+        let args = r#"{"command":"sleep 30"}"#;
+        respond(&server, tool_calls(&[("c1", "run_command", args)])).await;
+        handle
+            .commands
+            .send(Command::Prompt { text: "run".into() })
+            .await
+            .unwrap();
+
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            loop {
+                let event = handle.events.recv().await.unwrap();
+                if let Event::ApprovalRequested { id, .. } = event {
+                    let approve = Command::Approval { id, approve: true };
+                    handle.commands.send(approve).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    handle.commands.send(Command::Cancel).await.unwrap();
+                }
+                let done = matches!(event, Event::TurnEnded { .. });
+                events.push(event);
+                if done {
+                    break events;
+                }
+            }
+        })
+        .await
+        .expect("cancel should kill the command");
+        assert_eq!(
+            events[2..],
+            [
+                finished(
+                    1,
+                    ToolResult::Command {
+                        output: String::new(),
+                        exit: Exit::Cancelled
+                    }
+                ),
+                end(StopReason::Cancelled)
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn invalid_change_fails_without_asking() {
         let (server, _dir, mut handle) = session_with_notes(25).await;
@@ -636,13 +724,13 @@ mod tests {
         let events = prompt(&mut handle, "write").await;
 
         assert!(
-            matches!(&events[1], Event::ToolCallFinished { status: ToolStatus::Failed, output, .. } if output.contains("outside")),
+            matches!(&events[1], Event::ToolCallFinished { result: ToolResult::Failed(error), .. } if error.contains("outside")),
             "{events:?}"
         );
     }
 
     #[tokio::test]
-    async fn approval_ids_keep_counting_across_turns() {
+    async fn tool_call_ids_keep_counting_across_turns() {
         let (server, _dir, mut handle) = session_with_notes(25).await;
         for path in ["a.txt", "b.txt"] {
             let args = format!(r#"{{"path":"{path}","content":"x"}}"#);
@@ -705,7 +793,7 @@ mod tests {
         assert_eq!(
             events[2..],
             [
-                finished("write_file", ToolStatus::Rejected, ""),
+                finished(1, ToolResult::Rejected),
                 end(StopReason::Cancelled)
             ]
         );
