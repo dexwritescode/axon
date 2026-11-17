@@ -7,7 +7,7 @@ use regex::RegexBuilder;
 use serde_json::Value;
 
 use super::walk::{Glob, listing, relative, walk};
-use super::{optional_bool, optional_str};
+use super::{optional_bool, optional_str, required_str};
 use crate::jail;
 
 const MAX_RESULTS: usize = 200;
@@ -20,7 +20,7 @@ enum Output {
 }
 
 pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
-    let pattern = optional_str(args, "pattern")?.ok_or("pattern is required")?;
+    let pattern = required_str(args, "pattern")?;
     let path = optional_str(args, "path")?.unwrap_or(".");
     let glob = optional_str(args, "glob")?.map(Glob::new).transpose()?;
     let ignore_case = optional_bool(args, "ignore_case")?.unwrap_or(false);

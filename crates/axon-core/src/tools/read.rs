@@ -1,26 +1,24 @@
 //! `read_file`: a range of lines from a text file.
 
-use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
 
-use super::{optional_str, optional_usize};
+use super::{optional_usize, read_text, required_str};
 use crate::jail;
 
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 64 * 1024;
 
 pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
-    let path = optional_str(args, "path")?.ok_or("path is required")?;
+    let path = required_str(args, "path")?;
     let offset = optional_usize(args, "offset")?.unwrap_or(1).max(1);
     let limit = optional_usize(args, "limit")?
         .unwrap_or(MAX_LINES)
         .min(MAX_LINES);
 
     let file = jail::resolve(cwd, path)?;
-    let bytes = fs::read(&file).map_err(|e| format!("{path}: {e}"))?;
-    let text = String::from_utf8(bytes).map_err(|_| format!("{path}: not a UTF-8 text file"))?;
+    let text = read_text(&file, path)?;
 
     let lines: Vec<&str> = text.lines().collect();
     let first = offset - 1;
@@ -56,6 +54,7 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
     use tempfile::TempDir;
 
     fn dir_with(name: &str, contents: &[u8]) -> TempDir {

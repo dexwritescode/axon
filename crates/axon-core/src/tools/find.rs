@@ -4,21 +4,17 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::optional_str;
 use super::walk::{Glob, listing, relative, walk};
-use crate::jail;
+use super::{optional_str, required_str, resolve_dir};
 
 const MAX_FILES: usize = 500;
 
 pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
-    let pattern = optional_str(args, "pattern")?.ok_or("pattern is required")?;
+    let pattern = required_str(args, "pattern")?;
     let path = optional_str(args, "path")?.unwrap_or(".");
     let glob = Glob::new(pattern)?;
 
-    let dir = jail::resolve(cwd, path)?;
-    if !dir.is_dir() {
-        return Err(format!("{path}: not a directory"));
-    }
+    let dir = resolve_dir(cwd, path)?;
 
     let files: Vec<String> = walk(&dir, None)
         .flatten()

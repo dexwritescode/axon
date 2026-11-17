@@ -5,8 +5,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::walk::{listing, relative, walk};
-use super::{optional_str, optional_usize};
-use crate::jail;
+use super::{optional_str, optional_usize, resolve_dir};
 
 const DEFAULT_DEPTH: usize = 2;
 const MAX_DEPTH: usize = 5;
@@ -18,10 +17,7 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
         .unwrap_or(DEFAULT_DEPTH)
         .clamp(1, MAX_DEPTH);
 
-    let dir = jail::resolve(cwd, path)?;
-    if !dir.is_dir() {
-        return Err(format!("{path}: not a directory"));
-    }
+    let dir = resolve_dir(cwd, path)?;
 
     let mut entries = Vec::new();
     for entry in walk(&dir, Some(depth)) {

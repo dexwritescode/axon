@@ -1,5 +1,6 @@
-//! The Axon core: sessions that run an agent loop with read-only tools
-//! and stream it to a frontend. Knows nothing about any frontend.
+//! The Axon core: sessions that run an agent loop with file tools (reads,
+//! and writes the user approves) and stream it to a frontend. Knows
+//! nothing about any frontend.
 
 mod jail;
 mod model;
@@ -16,10 +17,10 @@ use axon_protocol::{SessionError, SessionFactory, SessionHandle};
 use model::ModelClient;
 use turn::Agent;
 
+pub use model::ModelConfig;
+
 /// Model requests per prompt before a turn stops.
 const MAX_TURN_REQUESTS: usize = 25;
-
-pub use model::ModelConfig;
 
 /// Starts core sessions that all talk to the same model.
 pub struct CoreFactory {
