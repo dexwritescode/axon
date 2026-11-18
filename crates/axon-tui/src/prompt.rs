@@ -96,21 +96,23 @@ impl Prompt {
             .map_or(self.text.len(), |i| self.cursor + i);
     }
 
-    /// Up one screen row at `width` columns, as near the same column as it gets.
-    pub(crate) fn up(&mut self, width: usize) {
-        self.move_row(width, -1);
+    /// Up one screen row at `width` columns, as near the same column as it
+    /// gets; false on the first row.
+    pub(crate) fn up(&mut self, width: usize) -> bool {
+        self.move_row(width, -1)
     }
 
-    /// Down one screen row at `width` columns, as near the same column as it gets.
-    pub(crate) fn down(&mut self, width: usize) {
-        self.move_row(width, 1);
+    /// Down one screen row at `width` columns, as near the same column as it
+    /// gets; false on the last row.
+    pub(crate) fn down(&mut self, width: usize) -> bool {
+        self.move_row(width, 1)
     }
 
-    fn move_row(&mut self, width: usize, step: isize) {
+    fn move_row(&mut self, width: usize, step: isize) -> bool {
         let rows = self.rows(width);
         let (col, row) = self.place(&rows, width);
         let Some(target) = row.checked_add_signed(step).filter(|&r| r < rows.len()) else {
-            return;
+            return false;
         };
         let range = rows[target].clone();
         let mut at = range.start;
@@ -130,6 +132,7 @@ impl Prompt {
                 .map_or(0, char::len_utf8);
         }
         self.cursor = at;
+        true
     }
 
     /// Byte ranges of the screen rows at `width` columns, newlines left out.
@@ -344,13 +347,13 @@ mod tests {
         let mut prompt = at("abcdef\nab\nabc|def");
         prompt.up(10);
         assert_eq!(shown(&prompt), "abcdef\nab|\nabcdef");
-        prompt.up(10);
+        assert!(prompt.up(10));
         assert_eq!(shown(&prompt), "ab|cdef\nab\nabcdef");
-        prompt.up(10);
+        assert!(!prompt.up(10));
         assert_eq!(shown(&prompt), "ab|cdef\nab\nabcdef");
         prompt.down(10);
-        prompt.down(10);
-        prompt.down(10);
+        assert!(prompt.down(10));
+        assert!(!prompt.down(10));
         assert_eq!(shown(&prompt), "abcdef\nab\nab|cdef");
     }
 

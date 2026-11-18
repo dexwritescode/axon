@@ -23,6 +23,11 @@ pub(crate) struct App {
     /// A prompt sent while a turn ran: it goes out when the turn ends, or back
     /// into the input if the turn is cancelled.
     pub(crate) queued: Option<String>,
+    /// Prompts sent this session, oldest first.
+    pub(crate) past: Vec<String>,
+    /// While Up and Down step through `past`: the entry shown, and the draft
+    /// that was in the input before.
+    pub(crate) recall: Option<(usize, Prompt)>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
@@ -190,8 +195,9 @@ impl App {
             (KeyCode::Right, _) => input.right(),
             (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => input.home(),
             (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => input.end(),
-            (KeyCode::Up, _) => input.up(self.view.input_width),
-            (KeyCode::Down, _) => input.down(self.view.input_width),
+            // On the first or last row, step through the prompts sent before.
+            (KeyCode::Up, _) if !input.up(self.view.input_width) => self.recall_older(),
+            (KeyCode::Down, _) if !input.down(self.view.input_width) => self.recall_newer(),
             _ => {}
         }
     }
@@ -225,6 +231,10 @@ impl App {
         }
         let text = text.to_string();
         self.input.clear();
+        self.recall = None;
+        if self.past.last() != Some(&text) {
+            self.past.push(text.clone());
+        }
         if self.turn.is_some() {
             self.queued = Some(match self.queued.take() {
                 Some(queued) => format!("{queued}\n{text}"),
@@ -234,6 +244,33 @@ impl App {
         }
         self.turn = Some(Turn::new(Instant::now()));
         Some(Action::Submit(text))
+    }
+
+    /// Show the prompt sent before the one shown, keeping the draft.
+    fn recall_older(&mut self) {
+        let older = match &self.recall {
+            Some((i, _)) => i.checked_sub(1),
+            None => self.past.len().checked_sub(1),
+        };
+        let Some(i) = older else { return };
+        match &mut self.recall {
+            Some((shown, _)) => *shown = i,
+            None => self.recall = Some((i, mem::take(&mut self.input))),
+        }
+        self.input = self.past[i].as_str().into();
+    }
+
+    /// Show the prompt sent after the one shown, or the draft after the newest.
+    fn recall_newer(&mut self) {
+        let Some((shown, _)) = &mut self.recall else {
+            return;
+        };
+        if *shown + 1 < self.past.len() {
+            *shown += 1;
+            self.input = self.past[*shown].as_str().into();
+        } else if let Some((_, draft)) = self.recall.take() {
+            self.input = draft;
+        }
     }
 
     /// Once the turn has ended, the queued prompt to send.
@@ -953,6 +990,79 @@ mod tests {
 
         assert_eq!(app.input.text(), "abc");
         assert_eq!(app.scroll, Some(30));
+    }
+
+    /// Send `text` as a prompt and end its turn.
+    fn send(app: &mut App, text: &str) {
+        type_text(app, text);
+        app.on_key(key(KeyCode::Enter));
+        app.turn = None;
+    }
+
+    fn history_app() -> App {
+        let mut app = App::default();
+        app.view.input_width = 40;
+        app
+    }
+
+    #[test]
+    fn up_and_down_step_through_sent_prompts_then_back_to_the_draft() {
+        let mut app = history_app();
+        send(&mut app, "one");
+        send(&mut app, "two");
+        type_text(&mut app, "draft");
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "two");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "two");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "draft");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn up_moves_through_a_recalled_prompt_before_the_one_before_it() {
+        let mut app = history_app();
+        send(&mut app, "one");
+        app.input = "two\nlines".into();
+        app.on_key(key(KeyCode::Enter));
+        app.turn = None;
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "two\nlines");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "two\nlines");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+    }
+
+    #[test]
+    fn a_prompt_sent_twice_in_a_row_is_recalled_once() {
+        let mut app = history_app();
+        send(&mut app, "one");
+        send(&mut app, "two");
+        send(&mut app, "two");
+
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+    }
+
+    #[test]
+    fn a_queued_prompt_is_recalled_too() {
+        let mut app = history_app();
+        app.turn = Some(Turn::new(Instant::now()));
+        type_text(&mut app, "later");
+        app.on_key(key(KeyCode::Enter));
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "later");
     }
 
     #[test]

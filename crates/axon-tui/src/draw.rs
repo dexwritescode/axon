@@ -498,8 +498,8 @@ mod tests {
         let mut app = app("", "one\ntwo\nthree\nfour\nfive\nsix\nseven");
         // The first input row shown and the cursor's screen row.
         let redraw = |app: &mut App, ups: usize, downs: usize| {
-            (0..ups).for_each(|_| app.input.up(20));
-            (0..downs).for_each(|_| app.input.down(20));
+            (0..ups).for_each(|_| _ = app.input.up(20));
+            (0..downs).for_each(|_| _ = app.input.down(20));
             let screen = render(app, &[], 30, 20);
             app.view = screen.view;
             (screen.rows[15].clone(), screen.cursor.y)
