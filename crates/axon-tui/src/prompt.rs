@@ -39,6 +39,18 @@ impl Prompt {
         self.cursor += c.len_utf8();
     }
 
+    /// Insert pasted `text` at the cursor, its line breaks as newlines and its
+    /// tabs as four spaces.
+    pub(crate) fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        for c in text.chars() {
+            match c {
+                '\t' => (0..4).for_each(|_| self.insert(' ')),
+                c => self.insert(c),
+            }
+        }
+    }
+
     pub(crate) fn backspace(&mut self) {
         if self.before().is_some() {
             self.left();
@@ -218,6 +230,13 @@ mod tests {
     fn rows(text: &str, width: usize) -> Vec<&str> {
         let prompt = Prompt::from(text);
         prompt.rows(width).into_iter().map(|r| &text[r]).collect()
+    }
+
+    #[test]
+    fn paste_keeps_line_breaks_as_newlines_and_expands_tabs() {
+        let mut prompt = at("<|>");
+        prompt.paste("a\r\nb\rc\n\td\u{7}");
+        assert_eq!(shown(&prompt), "<a\nb\nc\n    d|>");
     }
 
     #[test]

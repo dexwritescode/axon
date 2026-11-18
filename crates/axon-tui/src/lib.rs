@@ -14,9 +14,9 @@ use app::{Action, App, Committed};
 use axon_protocol::{Command, Event, SessionError, SessionFactory, SessionHandle};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEvent,
-        KeyEventKind, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as TermEvent, EventStream, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -50,7 +50,12 @@ impl Screen {
         // Built first, so a failure below still restores what was set.
         let screen = Self;
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         // Lets terminals that support it report Shift+Enter apart from Enter.
         let _ = execute!(
             io::stdout(),
@@ -65,6 +70,7 @@ impl Drop for Screen {
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -81,6 +87,7 @@ const TICK: Duration = Duration::from_millis(100);
 enum Input {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Session(Option<Event>),
     /// Time to animate the activity row.
     Tick,
@@ -109,6 +116,7 @@ async fn run_loop(terminal: &mut Tty, session: SessionHandle) -> Result<(), TuiE
                     // Moves and clicks change nothing yet; skip the redraw.
                     _ => continue,
                 },
+                Some(Ok(TermEvent::Paste(text))) => Input::Paste(text),
                 Some(Ok(_)) => Input::Redraw,
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
@@ -153,6 +161,10 @@ async fn step(
         },
         Input::Mouse(mouse) => {
             app.on_mouse(mouse);
+            Some(Vec::new())
+        }
+        Input::Paste(text) => {
+            app.on_paste(&text);
             Some(Vec::new())
         }
         Input::Session(event) => {

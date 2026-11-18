@@ -283,6 +283,14 @@ impl App {
         Some(Action::Submit(text))
     }
 
+    /// Pasted text goes into the input, newlines and all; a waiting change
+    /// takes only y or n.
+    pub(crate) fn on_paste(&mut self, text: &str) {
+        if self.approval.is_none() {
+            self.input.paste(text);
+        }
+    }
+
     pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-i64::from(WHEEL_ROWS)),
