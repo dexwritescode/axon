@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::app::{Activity, App, Committed, Finished, Turn, View};
-use crate::prompt::Prompt;
+use crate::prompt::{Piece, Prompt};
 use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
@@ -230,7 +230,7 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
     }
     if let Some(queued) = &app.queued {
         items.push(
-            Paragraph::new(labelled(QUEUED, theme::MUTED, queued))
+            Paragraph::new(labelled(QUEUED, theme::MUTED, &queued.shown()))
                 .fg(theme::MUTED)
                 .wrap(Wrap { trim: false }),
         );
@@ -298,7 +298,12 @@ fn input(prompt: &Prompt, width: usize, top: usize) -> (Vec<Line<'static>>, Posi
                 0 => Span::from(PROMPT).fg(theme::INPUT).bold(),
                 _ => Span::from(PROMPT_INDENT),
             };
-            Line::from(vec![head, Span::from(prompt.text()[range].to_string())])
+            let mut spans = vec![head];
+            spans.extend(prompt.pieces(range).into_iter().map(|piece| match piece {
+                Piece::Text(text) => Span::from(text.to_string()),
+                Piece::Paste(label) => Span::from(label).fg(theme::MUTED),
+            }));
+            Line::from(spans)
         })
         .collect();
     let cursor = Position::new((PROMPT.len() + col) as u16, (row - skip) as u16);
@@ -333,6 +338,7 @@ fn activity(turn: &Turn) -> Line<'static> {
 /// The activity row once a turn has ended.
 fn finished_line(finished: &Finished, context_limit: Option<u64>) -> Line<'static> {
     let (color, mark, word) = match finished.stop {
+        _ if finished.failed => (theme::ERROR, '✗', "Failed"),
         StopReason::EndTurn => (theme::DONE, '✓', "Finished"),
         StopReason::Cancelled => (theme::ERROR, '✗', "Cancelled"),
         StopReason::MaxTurnRequests | StopReason::MaxTokens => (theme::ERROR, '✗', "Stopped"),
@@ -497,8 +503,8 @@ mod tests {
         let mut app = app("", "one\ntwo\nthree\nfour\nfive\nsix\nseven");
         // The first input row shown and the cursor's screen row.
         let redraw = |app: &mut App, ups: usize, downs: usize| {
-            (0..ups).for_each(|_| app.input.up(20));
-            (0..downs).for_each(|_| app.input.down(20));
+            (0..ups).for_each(|_| _ = app.input.up(20));
+            (0..downs).for_each(|_| _ = app.input.down(20));
             let screen = render(app, &[], 30, 20);
             app.view = screen.view;
             (screen.rows[15].clone(), screen.cursor.y)
@@ -578,11 +584,28 @@ mod tests {
             at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
                 .unwrap(),
             took: Duration::from_millis(125_400),
+            failed: false,
         });
         let screen = render(&app, &[], 40, 14);
 
         assert_eq!(screen.rows[11], "✓ Finished at 14:32 · 2m 5s");
         assert_eq!(screen.buffer[(0, 11)].fg, theme::DONE);
+    }
+
+    #[test]
+    fn a_failed_turn_shows_as_failed() {
+        let mut app = app("", "");
+        app.finished = Some(Finished {
+            stop: StopReason::EndTurn,
+            at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
+                .unwrap(),
+            took: Duration::from_secs(3),
+            failed: true,
+        });
+        let screen = render(&app, &[], 40, 14);
+
+        assert_eq!(screen.rows[11], "✗ Failed at 14:32 · 3s");
+        assert_eq!(screen.buffer[(0, 11)].fg, theme::ERROR);
     }
 
     #[test]
@@ -594,6 +617,7 @@ mod tests {
             at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
                 .unwrap(),
             took: Duration::from_millis(125_400),
+            failed: false,
         });
         let screen = render(&app, &[], 60, 14);
 

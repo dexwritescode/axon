@@ -22,7 +22,12 @@ pub(crate) struct App {
     pub(crate) streaming_reasoning: String,
     /// A prompt sent while a turn ran: it goes out when the turn ends, or back
     /// into the input if the turn is cancelled.
-    pub(crate) queued: Option<String>,
+    pub(crate) queued: Option<Prompt>,
+    /// Prompts sent this session, oldest first.
+    pub(crate) past: Vec<Prompt>,
+    /// While Up and Down step through `past`: the entry shown, and the draft
+    /// that was in the input before.
+    pub(crate) recall: Option<(usize, Prompt)>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
@@ -38,6 +43,22 @@ pub(crate) struct App {
     pub(crate) scroll: Option<u32>,
     /// The screen as last drawn.
     pub(crate) view: View,
+    pub(crate) settings: Settings,
+}
+
+/// How the TUI behaves, set by the binary.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    /// A paste longer than this many chars shows as one token in the input.
+    pub paste_token_chars: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            paste_token_chars: 1000,
+        }
+    }
 }
 
 /// Sizes from the last draw that keys need.
@@ -69,6 +90,8 @@ pub(crate) struct Turn {
     /// Advances on every tick; picks the spinner frame.
     pub(crate) frame: usize,
     pub(crate) activity: Activity,
+    /// An error ended the turn.
+    failed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,6 +99,7 @@ pub(crate) struct Finished {
     pub(crate) stop: StopReason,
     pub(crate) at: DateTime<Local>,
     pub(crate) took: Duration,
+    pub(crate) failed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -104,13 +128,14 @@ impl Turn {
             elapsed: Duration::ZERO,
             frame: 0,
             activity: Activity::Thinking,
+            failed: false,
         }
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Action {
-    Submit(String),
+    Submit(Prompt),
     Answer { id: u64, approve: bool },
     Cancel,
     Quit,
@@ -186,8 +211,8 @@ impl App {
             (KeyCode::Right, _) => input.right(),
             (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => input.home(),
             (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => input.end(),
-            (KeyCode::Up, _) => input.up(self.view.input_width),
-            (KeyCode::Down, _) => input.down(self.view.input_width),
+            (KeyCode::Up, _) if !input.up(self.view.input_width) => self.recall_older(),
+            (KeyCode::Down, _) if !input.down(self.view.input_width) => self.recall_newer(),
             _ => {}
         }
     }
@@ -215,21 +240,51 @@ impl App {
 
     /// Send the input, or queue it while a turn runs.
     fn submit(&mut self) -> Option<Action> {
-        let text = self.input.text().trim();
-        if text.is_empty() {
+        if self.input.is_empty() {
             return None;
         }
-        let text = text.to_string();
+        let prompt = self.input.trimmed();
         self.input.clear();
+        self.recall = None;
+        if self.past.last().map(Prompt::expanded) != Some(prompt.expanded()) {
+            self.past.push(prompt.clone());
+        }
         if self.turn.is_some() {
-            self.queued = Some(match self.queued.take() {
-                Some(queued) => format!("{queued}\n{text}"),
-                None => text,
-            });
+            match &mut self.queued {
+                Some(queued) => queued.push_line(&prompt),
+                None => self.queued = Some(prompt),
+            }
             return None;
         }
         self.turn = Some(Turn::new(Instant::now()));
-        Some(Action::Submit(text))
+        Some(Action::Submit(prompt))
+    }
+
+    /// Show the prompt sent before the one shown, keeping the draft.
+    fn recall_older(&mut self) {
+        let older = match &self.recall {
+            Some((i, _)) => i.checked_sub(1),
+            None => self.past.len().checked_sub(1),
+        };
+        let Some(i) = older else { return };
+        match &mut self.recall {
+            Some((shown, _)) => *shown = i,
+            None => self.recall = Some((i, mem::take(&mut self.input))),
+        }
+        self.input = self.past[i].clone();
+    }
+
+    /// Show the prompt sent after the one shown, or the draft after the newest.
+    fn recall_newer(&mut self) {
+        let Some((shown, _)) = &mut self.recall else {
+            return;
+        };
+        if *shown + 1 < self.past.len() {
+            *shown += 1;
+            self.input = self.past[*shown].clone();
+        } else if let Some((_, draft)) = self.recall.take() {
+            self.input = draft;
+        }
     }
 
     /// Once the turn has ended, the queued prompt to send.
@@ -237,9 +292,17 @@ impl App {
         if self.turn.is_some() {
             return None;
         }
-        let text = self.queued.take()?;
+        let prompt = self.queued.take()?;
         self.turn = Some(Turn::new(Instant::now()));
-        Some(Action::Submit(text))
+        Some(Action::Submit(prompt))
+    }
+
+    /// Pasted text goes into the input, newlines and all; a waiting change
+    /// takes only y or n.
+    pub(crate) fn on_paste(&mut self, text: &str) {
+        if self.approval.is_none() {
+            self.input.paste(text, self.settings.paste_token_chars);
+        }
     }
 
     pub(crate) fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -328,6 +391,9 @@ impl App {
                 Vec::new()
             }
             Event::Error { message } => {
+                if let Some(turn) = &mut self.turn {
+                    turn.failed = true;
+                }
                 let mut committed = self.take_reply();
                 committed.push(Committed::Error(message));
                 committed
@@ -346,6 +412,7 @@ impl App {
                         stop,
                         at: Local::now(),
                         took: turn.started.elapsed(),
+                        failed: turn.failed,
                     });
                 }
                 self.approval = None;
@@ -364,10 +431,11 @@ impl App {
                 if (stop == StopReason::Cancelled || cancelling)
                     && let Some(queued) = self.queued.take()
                 {
-                    self.input = match self.input.text() {
-                        "" => queued.as_str().into(),
-                        typed => format!("{queued}\n{typed}").as_str().into(),
-                    };
+                    let typed = mem::replace(&mut self.input, queued);
+                    if !typed.text().is_empty() {
+                        self.input.push_line(&typed);
+                    }
+                    self.recall = None;
                 }
                 committed
             }
@@ -584,6 +652,17 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_errored_finishes_as_failed() {
+        let mut app = busy_app();
+        app.on_event(Event::Error {
+            message: "boom".into(),
+        });
+        app.on_event(END);
+
+        assert!(app.finished.unwrap().failed);
+    }
+
+    #[test]
     fn committed_reply_is_trimmed() {
         let mut app = App::default();
         app.on_event(delta("\n\nHello\n"));
@@ -679,7 +758,7 @@ mod tests {
         type_text(&mut app, "next");
 
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert_eq!(app.queued.as_deref(), Some("next"));
+        assert_eq!(app.queued.as_ref().map(Prompt::text), Some("next"));
         assert_eq!(app.input.text(), "");
         assert_eq!(app.send_queued(), None, "the turn still runs");
 
@@ -934,6 +1013,95 @@ mod tests {
 
         assert_eq!(app.input.text(), "abc");
         assert_eq!(app.scroll, Some(30));
+    }
+
+    /// Send `text` as a prompt and end its turn.
+    fn send(app: &mut App, text: &str) {
+        type_text(app, text);
+        app.on_key(key(KeyCode::Enter));
+        app.turn = None;
+    }
+
+    fn history_app() -> App {
+        let mut app = App::default();
+        app.view.input_width = 40;
+        app
+    }
+
+    #[test]
+    fn up_and_down_step_through_sent_prompts_then_back_to_the_draft() {
+        let mut app = history_app();
+        send(&mut app, "one");
+        send(&mut app, "two");
+        type_text(&mut app, "draft");
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "two");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "two");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "draft");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn up_moves_through_a_recalled_prompt_before_the_one_before_it() {
+        let mut app = history_app();
+        send(&mut app, "one");
+        app.input = "two\nlines".into();
+        app.on_key(key(KeyCode::Enter));
+        app.turn = None;
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "two\nlines");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "two\nlines");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+    }
+
+    #[test]
+    fn a_prompt_sent_twice_in_a_row_is_recalled_once() {
+        let mut app = history_app();
+        send(&mut app, "one");
+        send(&mut app, "two");
+        send(&mut app, "two");
+
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "one");
+    }
+
+    #[test]
+    fn a_cancel_that_restores_the_queue_ends_recall() {
+        let mut app = history_app();
+        app.turn = Some(Turn::new(Instant::now()));
+        type_text(&mut app, "later");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Up));
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
+        assert_eq!(app.input.text(), "later\nlater");
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "later\nlater");
+    }
+
+    #[test]
+    fn a_queued_prompt_is_recalled_too() {
+        let mut app = history_app();
+        app.turn = Some(Turn::new(Instant::now()));
+        type_text(&mut app, "later");
+        app.on_key(key(KeyCode::Enter));
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input.text(), "later");
     }
 
     #[test]

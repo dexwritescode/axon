@@ -1,14 +1,22 @@
 //! The text being typed, with a cursor, and how it wraps on screen.
 
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
+
+/// Chars that stand for long pastes in `Prompt::text`: Supplementary Private
+/// Use Area-B, which fonts and terminals leave alone. Typed ones are dropped.
+const TOKENS: RangeInclusive<char> = '\u{100000}'..='\u{10FFFD}';
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Prompt {
+    /// The typed text, with one token char for each long paste.
     text: String,
     /// Byte index into `text`, always on a char boundary.
     cursor: usize,
+    /// The text of long pastes; token char `TOKENS.start() + i` stands for
+    /// `pastes[i]`.
+    pastes: Vec<String>,
 }
 
 /// `text` with the cursor at its end.
@@ -17,13 +25,93 @@ impl From<&str> for Prompt {
         Self {
             text: text.into(),
             cursor: text.len(),
+            pastes: Vec::new(),
         }
     }
 }
 
+/// A run of a prompt's row as drawn.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Piece<'a> {
+    Text(&'a str),
+    /// A long paste, drawn as its label.
+    Paste(String),
+}
+
 impl Prompt {
+    /// The typed text, a long paste standing as one private-use char.
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.expanded().trim().is_empty()
+    }
+
+    /// The text with each long paste in full, as sent to the model.
+    pub(crate) fn expanded(&self) -> String {
+        self.map_pastes(|paste| paste.to_string())
+    }
+
+    /// The text with each long paste as its label.
+    pub(crate) fn shown(&self) -> String {
+        self.map_pastes(label)
+    }
+
+    fn map_pastes(&self, f: impl Fn(&str) -> String) -> String {
+        let mut out = String::new();
+        for c in self.text.chars() {
+            match self.paste_of(c) {
+                Some(paste) => out.push_str(&f(paste)),
+                None => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The text without surrounding whitespace, the cursor at its end.
+    pub(crate) fn trimmed(&self) -> Self {
+        let mut trimmed = Self::default();
+        trimmed.append(self, self.text.trim());
+        trimmed
+    }
+
+    /// Append `other` on a new line, the cursor at the end.
+    pub(crate) fn push_line(&mut self, other: &Self) {
+        self.text.push('\n');
+        self.append(other, &other.text);
+    }
+
+    /// Append `text`, a part of `other.text`, with the pastes it holds; the
+    /// cursor at the end.
+    fn append(&mut self, other: &Self, text: &str) {
+        for c in text.chars() {
+            match other.paste_of(c) {
+                Some(paste) => self.push_paste(paste.to_string()),
+                None => self.text.push(c),
+            }
+        }
+        self.cursor = self.text.len();
+    }
+
+    /// The pieces of `range` as drawn: text, and long pastes as labels.
+    pub(crate) fn pieces(&self, range: Range<usize>) -> Vec<Piece<'_>> {
+        let mut pieces = Vec::new();
+        let mut start = range.start;
+        for (i, c) in self.text[range.clone()].char_indices() {
+            if let Some(paste) = self.paste_of(c) {
+                let i = range.start + i;
+                if i > start {
+                    pieces.push(Piece::Text(&self.text[start..i]));
+                }
+                pieces.push(Piece::Paste(label(paste)));
+                start = i + c.len_utf8();
+            }
+        }
+        if range.end > start {
+            pieces.push(Piece::Text(&self.text[start..range.end]));
+        }
+        pieces
     }
 
     pub(crate) fn clear(&mut self) {
@@ -32,11 +120,32 @@ impl Prompt {
 
     /// Insert `c` at the cursor; control chars other than newline are dropped.
     pub(crate) fn insert(&mut self, c: char) {
-        if c.is_control() && c != '\n' {
+        if c.is_control() && c != '\n' || TOKENS.contains(&c) {
             return;
         }
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+    }
+
+    /// Insert pasted `text` at the cursor, its line breaks as newlines. Over
+    /// `token_chars` chars it goes in as one token; otherwise as typed, its
+    /// tabs as four spaces.
+    pub(crate) fn paste(&mut self, text: &str, token_chars: usize) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.chars().count() > token_chars {
+            let at = self.cursor;
+            let end = self.text.split_off(at);
+            self.push_paste(text);
+            self.cursor = self.text.len();
+            self.text.push_str(&end);
+            return;
+        }
+        for c in text.chars() {
+            match c {
+                '\t' => (0..4).for_each(|_| self.insert(' ')),
+                c => self.insert(c),
+            }
+        }
     }
 
     pub(crate) fn backspace(&mut self) {
@@ -96,27 +205,29 @@ impl Prompt {
             .map_or(self.text.len(), |i| self.cursor + i);
     }
 
-    /// Up one screen row at `width` columns, as near the same column as it gets.
-    pub(crate) fn up(&mut self, width: usize) {
-        self.move_row(width, -1);
+    /// Up one screen row at `width` columns, as near the same column as it
+    /// gets; false on the first row.
+    pub(crate) fn up(&mut self, width: usize) -> bool {
+        self.move_row(width, -1)
     }
 
-    /// Down one screen row at `width` columns, as near the same column as it gets.
-    pub(crate) fn down(&mut self, width: usize) {
-        self.move_row(width, 1);
+    /// Down one screen row at `width` columns, as near the same column as it
+    /// gets; false on the last row.
+    pub(crate) fn down(&mut self, width: usize) -> bool {
+        self.move_row(width, 1)
     }
 
-    fn move_row(&mut self, width: usize, step: isize) {
+    fn move_row(&mut self, width: usize, step: isize) -> bool {
         let rows = self.rows(width);
         let (col, row) = self.place(&rows, width);
         let Some(target) = row.checked_add_signed(step).filter(|&r| r < rows.len()) else {
-            return;
+            return false;
         };
         let range = rows[target].clone();
         let mut at = range.start;
         let mut used = 0;
         for (i, c) in self.text[range.clone()].char_indices() {
-            used += c.width().unwrap_or(0);
+            used += self.char_width(c);
             if used > col {
                 break;
             }
@@ -130,6 +241,7 @@ impl Prompt {
                 .map_or(0, char::len_utf8);
         }
         self.cursor = at;
+        true
     }
 
     /// Byte ranges of the screen rows at `width` columns, newlines left out.
@@ -146,7 +258,7 @@ impl Prompt {
             let mut after_space = None;
             for (i, c) in line.char_indices() {
                 let i = start + i;
-                let w = c.width().unwrap_or(0);
+                let w = self.char_width(c);
                 if c == ' ' {
                     col += w;
                     after_space = Some(i + 1);
@@ -155,7 +267,7 @@ impl Prompt {
                 if col + w > width && i > row {
                     let at = after_space.filter(|&s| s > row).unwrap_or(i);
                     rows.push(row..at);
-                    col = self.text[at..i].width();
+                    col = self.str_width(&self.text[at..i]);
                     row = at;
                 }
                 col += w;
@@ -174,8 +286,43 @@ impl Prompt {
 
     fn place(&self, rows: &[Range<usize>], width: usize) -> (usize, usize) {
         let row = row_of(rows, self.cursor);
-        let col = self.text[rows[row].start..self.cursor].width();
+        let col = self.str_width(&self.text[rows[row].start..self.cursor]);
         (col.min(width), row)
+    }
+
+    /// Add `paste` as a token at the end of the text, or in full once the
+    /// tokens run out.
+    fn push_paste(&mut self, paste: String) {
+        let token = char::from_u32(*TOKENS.start() as u32 + self.pastes.len() as u32)
+            .filter(|c| TOKENS.contains(c));
+        match token {
+            Some(token) => {
+                self.pastes.push(paste);
+                self.text.push(token);
+            }
+            None => self.text.push_str(&paste),
+        }
+    }
+
+    /// The long paste `c` stands for, if it is a token.
+    fn paste_of(&self, c: char) -> Option<&str> {
+        if !TOKENS.contains(&c) {
+            return None;
+        }
+        let i = c as u32 - *TOKENS.start() as u32;
+        self.pastes.get(i as usize).map(String::as_str)
+    }
+
+    /// Columns `c` takes: a token takes its label's.
+    fn char_width(&self, c: char) -> usize {
+        match self.paste_of(c) {
+            Some(paste) => label(paste).chars().count(),
+            None => c.width().unwrap_or(0),
+        }
+    }
+
+    fn str_width(&self, text: &str) -> usize {
+        text.chars().map(|c| self.char_width(c)).sum()
     }
 
     fn before(&self) -> Option<char> {
@@ -185,6 +332,11 @@ impl Prompt {
     fn after(&self) -> Option<char> {
         self.text[self.cursor..].chars().next()
     }
+}
+
+/// How a long paste shows in the input and the history.
+fn label(paste: &str) -> String {
+    format!("[pasted {} chars]", paste.chars().count())
 }
 
 /// The row holding byte `at`: the last one starting at or before it.
@@ -202,6 +354,7 @@ mod tests {
         Prompt {
             text: text.replace('|', ""),
             cursor,
+            pastes: Vec::new(),
         }
     }
 
@@ -215,6 +368,107 @@ mod tests {
     fn rows(text: &str, width: usize) -> Vec<&str> {
         let prompt = Prompt::from(text);
         prompt.rows(width).into_iter().map(|r| &text[r]).collect()
+    }
+
+    #[test]
+    fn paste_keeps_line_breaks_as_newlines_and_expands_tabs() {
+        let mut prompt = at("<|>");
+        prompt.paste("a\r\nb\rc\n\td\u{7}", 1000);
+        assert_eq!(shown(&prompt), "<a\nb\nc\n    d|>");
+    }
+
+    #[test]
+    fn a_long_paste_goes_in_as_one_token() {
+        let mut prompt = at("a|b");
+        prompt.paste(&"x\r\n".repeat(6), 10);
+        assert_eq!(prompt.shown(), "a[pasted 12 chars]b");
+        assert_eq!(prompt.expanded(), format!("a{}b", "x\n".repeat(6)));
+        assert_eq!(prompt.cursor_at(40), (18, 0));
+
+        prompt.left();
+        assert_eq!(prompt.cursor_at(40), (1, 0));
+        prompt.delete();
+        assert_eq!(prompt.expanded(), "ab");
+    }
+
+    #[test]
+    fn backspace_deletes_a_paste_token_whole() {
+        let mut prompt = at("|");
+        prompt.paste("0123456789!", 10);
+        prompt.backspace();
+        assert_eq!(prompt.expanded(), "");
+    }
+
+    #[test]
+    fn a_paste_token_wraps_by_its_label() {
+        let mut prompt = Prompt::from("ab ");
+        prompt.paste(&"x".repeat(20), 10);
+        let rows: Vec<_> = prompt
+            .rows(10)
+            .into_iter()
+            .map(|r| prompt.pieces(r))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                vec![Piece::Text("ab ")],
+                vec![Piece::Paste("[pasted 20 chars]".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_private_use_chars_are_dropped() {
+        let mut prompt = Prompt::default();
+        prompt.insert('\u{100000}');
+        prompt.paste("\u{100001}\u{E0A0}", 10);
+        assert_eq!(prompt.text(), "\u{E0A0}");
+    }
+
+    #[test]
+    fn trimmed_keeps_only_the_pastes_still_in_the_text() {
+        let mut prompt = Prompt::default();
+        prompt.paste("deleted paste", 5);
+        prompt.backspace();
+        prompt.paste("kept paste", 5);
+        prompt.insert(' ');
+
+        let trimmed = prompt.trimmed();
+        assert_eq!(trimmed.pastes, ["kept paste"]);
+        assert_eq!(trimmed.expanded(), "kept paste");
+    }
+
+    #[test]
+    fn a_blank_long_paste_is_empty() {
+        let mut prompt = Prompt::default();
+        prompt.paste(&" ".repeat(20), 5);
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn pieces_split_adjacent_pastes() {
+        let mut prompt = Prompt::default();
+        prompt.paste("first paste", 5);
+        prompt.paste("second paste", 5);
+        assert_eq!(
+            prompt.pieces(0..prompt.text().len()),
+            [
+                Piece::Paste("[pasted 11 chars]".into()),
+                Piece::Paste("[pasted 12 chars]".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn push_line_keeps_the_pastes_of_both() {
+        let mut first = Prompt::default();
+        first.paste("one long paste", 5);
+        let mut second = Prompt::from("and ");
+        second.paste("two long paste", 5);
+
+        first.push_line(&second);
+        assert_eq!(first.expanded(), "one long paste\nand two long paste");
+        assert_eq!(first.shown(), "[pasted 14 chars]\nand [pasted 14 chars]");
     }
 
     #[test]
@@ -344,13 +598,13 @@ mod tests {
         let mut prompt = at("abcdef\nab\nabc|def");
         prompt.up(10);
         assert_eq!(shown(&prompt), "abcdef\nab|\nabcdef");
-        prompt.up(10);
+        assert!(prompt.up(10));
         assert_eq!(shown(&prompt), "ab|cdef\nab\nabcdef");
-        prompt.up(10);
+        assert!(!prompt.up(10));
         assert_eq!(shown(&prompt), "ab|cdef\nab\nabcdef");
         prompt.down(10);
-        prompt.down(10);
-        prompt.down(10);
+        assert!(prompt.down(10));
+        assert!(!prompt.down(10));
         assert_eq!(shown(&prompt), "abcdef\nab\nab|cdef");
     }
 

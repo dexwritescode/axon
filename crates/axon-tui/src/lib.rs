@@ -10,18 +10,21 @@ mod theme;
 use std::io;
 use std::time::{Duration, Instant};
 
+pub use app::Settings;
+
 use app::{Action, App, Committed};
 use axon_protocol::{Command, Event, SessionError, SessionFactory, SessionHandle};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyEvent,
-        KeyEventKind, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as TermEvent, EventStream, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
+use prompt::Prompt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
@@ -34,11 +37,11 @@ pub enum TuiError {
 }
 
 /// Run one session in the terminal until the user quits.
-pub async fn run(factory: &dyn SessionFactory) -> Result<(), TuiError> {
+pub async fn run(factory: &dyn SessionFactory, settings: Settings) -> Result<(), TuiError> {
     let session = factory.new_session(std::env::current_dir()?)?;
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run_loop(&mut terminal, session).await
+    run_loop(&mut terminal, session, settings).await
 }
 
 /// The alternate screen in raw mode, with the mouse captured, for as long as
@@ -51,6 +54,8 @@ impl Screen {
         let screen = Self;
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // Unsupported on the legacy Windows console, where pastes arrive as keys.
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
         // Lets terminals that support it report Shift+Enter apart from Enter.
         let _ = execute!(
             io::stdout(),
@@ -65,6 +70,7 @@ impl Drop for Screen {
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -81,6 +87,7 @@ const TICK: Duration = Duration::from_millis(100);
 enum Input {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Session(Option<Event>),
     /// Time to animate the activity row.
     Tick,
@@ -88,12 +95,19 @@ enum Input {
     Redraw,
 }
 
-async fn run_loop(terminal: &mut Tty, session: SessionHandle) -> Result<(), TuiError> {
+async fn run_loop(
+    terminal: &mut Tty,
+    session: SessionHandle,
+    settings: Settings,
+) -> Result<(), TuiError> {
     let SessionHandle {
         commands,
         mut events,
     } = session;
-    let mut app = App::default();
+    let mut app = App {
+        settings,
+        ..App::default()
+    };
     let mut keys = EventStream::new();
     let mut ticks = tokio::time::interval(TICK);
     let mut history = Vec::new();
@@ -109,6 +123,7 @@ async fn run_loop(terminal: &mut Tty, session: SessionHandle) -> Result<(), TuiE
                     // Moves and clicks change nothing yet; skip the redraw.
                     _ => continue,
                 },
+                Some(Ok(TermEvent::Paste(text))) => Input::Paste(text),
                 Some(Ok(_)) => Input::Redraw,
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
@@ -144,25 +159,21 @@ async fn step(
                     .ok()?;
                 Some(Vec::new())
             }
-            Some(Action::Submit(text)) => {
-                let prompt = Command::Prompt { text: text.clone() };
-                commands.send(prompt).await.ok()?;
-                Some(vec![Committed::User(text)])
-            }
+            Some(Action::Submit(prompt)) => Some(vec![submit(commands, &prompt).await?]),
             None => Some(Vec::new()),
         },
         Input::Mouse(mouse) => {
             app.on_mouse(mouse);
             Some(Vec::new())
         }
+        Input::Paste(text) => {
+            app.on_paste(&text);
+            Some(Vec::new())
+        }
         Input::Session(event) => {
             let mut committed = app.on_event(event?);
-            if let Some(Action::Submit(text)) = app.send_queued() {
-                commands
-                    .send(Command::Prompt { text: text.clone() })
-                    .await
-                    .ok()?;
-                committed.push(Committed::User(text));
+            if let Some(Action::Submit(prompt)) = app.send_queued() {
+                committed.push(submit(commands, &prompt).await?);
             }
             Some(committed)
         }
@@ -172,6 +183,13 @@ async fn step(
         }
         Input::Redraw => Some(Vec::new()),
     }
+}
+
+/// Send `prompt` in full; its history line shows long pastes as labels.
+async fn submit(commands: &mpsc::Sender<Command>, prompt: &Prompt) -> Option<Committed> {
+    let text = prompt.expanded();
+    commands.send(Command::Prompt { text }).await.ok()?;
+    Some(Committed::User(prompt.shown()))
 }
 
 /// Draw the screen and remember the history pane's size for scrolling.
@@ -207,6 +225,22 @@ mod tests {
 
         assert_eq!(committed, Some(vec![Committed::User("hi".into())]));
         assert!(matches!(sent.recv().await, Some(Command::Prompt { text }) if text == "hi"));
+    }
+
+    #[tokio::test]
+    async fn submit_sends_long_pastes_in_full_and_shows_them_as_labels() {
+        let (commands, mut sent) = mpsc::channel(1);
+        let mut app = app_with_input("see ");
+        app.settings.paste_token_chars = 5;
+        app.on_paste("long paste");
+
+        let committed = step(&mut app, &commands, key(KeyCode::Enter)).await;
+
+        let shown = Committed::User("see [pasted 10 chars]".into());
+        assert_eq!(committed, Some(vec![shown]));
+        assert!(
+            matches!(sent.recv().await, Some(Command::Prompt { text }) if text == "see long paste")
+        );
     }
 
     #[tokio::test]
