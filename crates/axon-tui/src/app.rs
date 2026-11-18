@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::time::{Duration, Instant};
 
-use axon_protocol::{Change, Event, StopReason, ToolResult};
+use axon_protocol::{Change, Event, Past, StopReason, ToolResult};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
@@ -416,6 +416,13 @@ impl App {
                 self.context_limit = tokens;
                 Vec::new()
             }
+            Event::History { items } => items
+                .into_iter()
+                .flat_map(|item| match item {
+                    Past::Prompt(text) => vec![Committed::User(text)],
+                    Past::Event(event) => self.on_event(event),
+                })
+                .collect(),
             Event::TurnEnded { stop } => {
                 if let Some(turn) = self.turn.take() {
                     self.finished = Some(Finished {
@@ -497,6 +504,33 @@ mod tests {
     const END: Event = Event::TurnEnded {
         stop: StopReason::EndTurn,
     };
+
+    #[test]
+    fn history_commits_what_the_session_showed_without_a_finished_line() {
+        let mut app = App::default();
+        let items = vec![
+            Past::Prompt("hi".into()),
+            Past::Event(Event::ReasoningDelta { text: "Hm".into() }),
+            Past::Event(delta("Hello")),
+            Past::Event(END),
+            Past::Prompt("stop".into()),
+            Past::Event(Event::TurnEnded {
+                stop: StopReason::Cancelled,
+            }),
+        ];
+
+        assert_eq!(
+            app.on_event(Event::History { items }),
+            [
+                Committed::User("hi".into()),
+                Committed::Thought("Hm".into()),
+                Committed::Agent("Hello".into()),
+                Committed::User("stop".into()),
+                Committed::Cancelled,
+            ]
+        );
+        assert!(app.finished.is_none() && app.turn.is_none());
+    }
 
     #[test]
     fn enter_submits_the_trimmed_input_and_marks_busy() {
