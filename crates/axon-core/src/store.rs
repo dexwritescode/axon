@@ -2,8 +2,8 @@
 //! linked to the one before. `prompt` and `event` entries are what the
 //! frontend showed; `message` entries are the model history.
 
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -95,6 +95,9 @@ pub(crate) struct Store {
     model: String,
     /// The last entry written, the parent of the next.
     last: Option<Uuid>,
+    /// The file, locked so no other axon writes to it; opened by the first
+    /// turn of a new session.
+    file: Option<File>,
 }
 
 impl Store {
@@ -107,6 +110,7 @@ impl Store {
             cwd: cwd.into(),
             model: model.into(),
             last: None,
+            file: None,
         }
     }
 
@@ -142,16 +146,14 @@ impl Store {
             return Ok(None);
         };
         let path = dir(root, cwd).join(format!("{id}.jsonl"));
-        let read = read(&path)?;
+        let mut file = lock(&path)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .with_context(|| path.display().to_string())?;
+        let read = read(&text, &path)?;
         let repaired = match read.complete {
-            Some(len) => OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .and_then(|file| file.set_len(len)),
-            None if !read.ends_in_newline => OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .and_then(|mut file| file.write_all(b"\n")),
+            Some(len) => file.set_len(len),
+            None if !read.ends_in_newline => file.write_all(b"\n"),
             None => Ok(()),
         };
         repaired.with_context(|| path.display().to_string())?;
@@ -161,6 +163,7 @@ impl Store {
             cwd: cwd.into(),
             model: model.into(),
             last: read.last,
+            file: Some(file),
         };
         Ok(Some((store, read.saved)))
     }
@@ -199,14 +202,32 @@ impl Store {
             lines.push('\n');
             self.last = Some(id);
         }
-        let parent = self.path.parent().expect("a session file has a folder");
-        fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .and_then(|mut file| file.write_all(lines.as_bytes()))
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                let parent = self.path.parent().expect("a session file has a folder");
+                fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+                self.file.insert(lock(&self.path)?)
+            }
+        };
+        file.write_all(lines.as_bytes())
             .with_context(|| self.path.display().to_string())
+    }
+}
+
+/// Open a session file to read and append, locked; an error if another
+/// axon has it open.
+fn lock(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .with_context(|| path.display().to_string())?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => bail!("the session is open in another axon"),
+        Err(TryLockError::Error(e)) => Err(e).with_context(|| path.display().to_string()),
     }
 }
 
@@ -258,7 +279,8 @@ fn saved(dir: &Path, cwd: &Path) -> Result<Vec<(Uuid, SystemTime)>> {
         else {
             continue;
         };
-        if started_in(&path)?.as_deref() == Some(cwd) {
+        // A session another axon has open may be locked against reading.
+        if started_in(&path).ok().flatten().as_deref() == Some(cwd) {
             found.push((id, fs::metadata(&path)?.modified()?));
         }
     }
@@ -267,7 +289,7 @@ fn saved(dir: &Path, cwd: &Path) -> Result<Vec<(Uuid, SystemTime)>> {
 
 /// The working directory in a session file's header.
 fn started_in(path: &Path) -> Result<Option<PathBuf>> {
-    let file = fs::File::open(path).with_context(|| path.display().to_string())?;
+    let file = File::open(path).with_context(|| path.display().to_string())?;
     let mut first = String::new();
     BufReader::new(file).read_line(&mut first)?;
     Ok(match serde_json::from_str::<Entry>(&first) {
@@ -294,8 +316,7 @@ struct Read {
 /// Read a session file. Entries a newer axon wrote are skipped, unless they
 /// are messages: the history needs them all. A last turn without its
 /// `TurnEnded` is left out, as it was cut off mid-write.
-fn read(path: &Path) -> Result<Read> {
-    let text = fs::read_to_string(path).with_context(|| path.display().to_string())?;
+fn read(text: &str, path: &Path) -> Result<Read> {
     let mut saved = Saved::default();
     let mut last = None;
     // Where the turn being read started, until it ends.
@@ -396,6 +417,10 @@ mod tests {
     use serde_json::json;
 
     const GOLDEN_0_1_1: &str = include_str!("../tests/sessions/0.1.1.jsonl");
+
+    fn read_file(path: &Path) -> Result<Read> {
+        read(&fs::read_to_string(path).unwrap(), path)
+    }
 
     fn message(value: Value) -> ChatCompletionRequestMessage {
         serde_json::from_value(value).unwrap()
@@ -593,7 +618,7 @@ mod tests {
             last,
             complete,
             ..
-        } = read(&path).unwrap();
+        } = read_file(&path).unwrap();
         assert_eq!(complete, None);
 
         let mut past = Vec::new();
@@ -645,6 +670,7 @@ mod tests {
         let mut store = new_store(root.path());
         store.append(ended("one")).unwrap();
         let last = store.last;
+        drop(store);
 
         let (mut store, saved) = Store::open(
             root.path(),
@@ -706,18 +732,18 @@ mod tests {
             entry(json!({"type": "event", "event": {"type": "turn_ended", "stop": "end_turn"}})),
         ];
         fs::write(&path, lines.join("\n")).unwrap();
-        let past = read(&path).unwrap().saved.past;
+        let past = read_file(&path).unwrap().saved.past;
         assert_eq!(past[0], Past::Prompt("hi".into()));
         assert_eq!(past.len(), 2);
 
         let message = entry(json!({"type": "message", "message": {"role": "wizard"}}));
         fs::write(&path, [lines[0].clone(), message.clone()].join("\n")).unwrap();
-        let err = read(&path).unwrap_err().to_string();
+        let err = read_file(&path).unwrap_err().to_string();
         assert!(err.contains("newer axon") && err.contains("9.0.0"), "{err}");
 
         let ours = message.replace("9.0.0", VERSION);
         fs::write(&path, [lines[0].clone(), ours].join("\n")).unwrap();
-        let err = read(&path).unwrap_err().to_string();
+        let err = read_file(&path).unwrap_err().to_string();
         assert!(err.contains("line 2 is unreadable"), "{err}");
     }
 
@@ -763,9 +789,11 @@ mod tests {
         });
         store.append(turn).unwrap();
         let text = fs::read_to_string(&store.path).unwrap();
+        let path = store.path.clone();
+        drop(store);
         let last_line = text[..text.len() - 1].rfind('\n').unwrap() + 1;
         for cut in [text.len() - 10, last_line, whole.len() + 5] {
-            fs::write(&store.path, &text[..cut]).unwrap();
+            fs::write(&path, &text[..cut]).unwrap();
 
             let (mut store, saved) = open_latest(root.path(), "/work/app").unwrap();
             assert_eq!(fs::read_to_string(&store.path).unwrap(), whole);
@@ -795,10 +823,12 @@ mod tests {
         store.append(ended("one")).unwrap();
         let text = fs::read_to_string(&store.path).unwrap();
         fs::write(&store.path, text.trim_end()).unwrap();
+        drop(store);
 
         let (mut store, saved) = open_latest(root.path(), "/work/app").unwrap();
         assert_eq!(saved.past[0], Past::Prompt("one".into()));
         store.append(ended("two")).unwrap();
+        drop(store);
         let (_, saved) = open_latest(root.path(), "/work/app").unwrap();
         assert_eq!(saved.past[2], Past::Prompt("two".into()));
     }
@@ -811,7 +841,7 @@ mod tests {
         let text = fs::read_to_string(&store.path).unwrap();
         fs::write(&store.path, text.replacen("\"prompt\"", "\"prompt", 1)).unwrap();
 
-        let err = read(&store.path).unwrap_err().to_string();
+        let err = read_file(&store.path).unwrap_err().to_string();
         assert!(err.contains("line 2 is corrupt"), "{err}");
     }
 
@@ -820,6 +850,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut store = Store::new(root.path(), Path::new("/a/b-c"), "m");
         store.append(ended("hi")).unwrap();
+        drop(store);
 
         assert_eq!(
             dir(root.path(), Path::new("/a/b-c")),
@@ -866,7 +897,9 @@ mod tests {
         };
 
         let upper = store.id.to_string()[..8].to_uppercase();
-        assert_eq!(open(&upper).unwrap().unwrap().0.id, store.id);
+        let id = store.id;
+        drop(store);
+        assert_eq!(open(&upper).unwrap().unwrap().0.id, id);
         assert!(open("").is_err());
     }
 
@@ -879,10 +912,23 @@ mod tests {
         newer.append(ended("two")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         older.append(ended("three")).unwrap();
+        let id = older.id;
+        drop((older, newer));
 
-        assert_eq!(
-            open_latest(root.path(), "/work/app").unwrap().0.id,
-            older.id
-        );
+        assert_eq!(open_latest(root.path(), "/work/app").unwrap().0.id, id);
+    }
+
+    #[test]
+    fn a_session_open_in_one_store_cannot_be_opened_in_another() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = new_store(root.path());
+        store.append(ended("hi")).unwrap();
+
+        let err = Store::open(root.path(), Path::new("/work/app"), "m", &Resume::Latest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("open in another axon"), "{err}");
+        drop(store);
+        assert!(open_latest(root.path(), "/work/app").is_some());
     }
 }

@@ -342,7 +342,9 @@ mod tests {
         prompt(&mut handle, "hi").await;
         prompt(&mut handle, "fails").await;
         let id = handle.id.clone();
-        drop(handle);
+        // The session closes its events once it has ended and let go of the file.
+        drop(handle.commands);
+        while handle.events.recv().await.is_some() {}
 
         let (store, saved) = open(root.path(), cwd.path());
         assert_eq!(store.id(), id);
