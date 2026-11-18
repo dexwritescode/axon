@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::turn::{Agent, Approval};
 
 const COMMAND_BUFFER: usize = 16;
-const EVENT_BUFFER: usize = 64;
+pub(crate) const EVENT_BUFFER: usize = 64;
 
 /// Start a session task and return the frontend's end of it.
 pub(crate) fn spawn(

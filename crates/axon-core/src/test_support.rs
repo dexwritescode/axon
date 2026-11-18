@@ -114,7 +114,7 @@ pub(crate) async fn spawn_started(agent: Agent) -> SessionHandle {
         events: mut all,
     } = crate::session::spawn(agent, async { None });
     assert_eq!(all.recv().await, Some(Event::ContextLimit { tokens: None }));
-    let (tx, events) = mpsc::channel(64);
+    let (tx, events) = mpsc::channel(crate::session::EVENT_BUFFER);
     tokio::spawn(async move {
         loop {
             let event = tokio::select! {

@@ -218,7 +218,6 @@ fn cut_chars(text: &str, max: usize) -> Option<&str> {
     text.char_indices().nth(max).map(|(end, _)| &text[..end])
 }
 
-/// The text of the file at `target`; `path` is how errors name it.
 /// A file's content as the model last read or wrote it, by hash, to tell
 /// whether the file changed since.
 #[derive(Debug, PartialEq)]
@@ -242,6 +241,7 @@ fn hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// The text of the file at `target`; `path` is how errors name it.
 fn read_text(target: &Path, path: &str) -> Result<String, String> {
     let bytes = fs::read(target).map_err(|e| format!("{path}: {e}"))?;
     String::from_utf8(bytes).map_err(|_| format!("{path}: not a UTF-8 text file"))

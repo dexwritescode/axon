@@ -337,6 +337,10 @@ impl App {
                 Vec::new()
             }
             Event::TurnEnded { stop } => {
+                let cancelling = self
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.activity == Activity::Cancelling);
                 if let Some(turn) = self.turn.take() {
                     self.finished = Some(Finished {
                         stop,
@@ -352,18 +356,18 @@ impl App {
                     StopReason::MaxTurnRequests => committed.push(Committed::Error(
                         "stopped: too many model requests for one prompt".into(),
                     )),
-                    StopReason::Cancelled => {
-                        committed.push(Committed::Cancelled);
-                        if let Some(queued) = self.queued.take() {
-                            self.input = match self.input.text() {
-                                "" => queued.as_str().into(),
-                                typed => format!("{queued}\n{typed}").as_str().into(),
-                            };
-                        }
-                    }
+                    StopReason::Cancelled => committed.push(Committed::Cancelled),
                     StopReason::MaxTokens => committed.push(Committed::Error(
                         "stopped: the reply reached the token limit (AXON_MAX_TOKENS)".into(),
                     )),
+                }
+                if (stop == StopReason::Cancelled || cancelling)
+                    && let Some(queued) = self.queued.take()
+                {
+                    self.input = match self.input.text() {
+                        "" => queued.as_str().into(),
+                        typed => format!("{queued}\n{typed}").as_str().into(),
+                    };
                 }
                 committed
             }
@@ -703,6 +707,21 @@ mod tests {
 
         assert_eq!(app.input.text(), "first\nsecond\ntyping");
         assert_eq!(app.send_queued(), None);
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_cancelling_keeps_the_queued_prompt_in_the_input() {
+        let mut app = busy_app();
+        type_text(&mut app, "next");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+
+        assert_eq!(app.send_queued(), None);
+        assert_eq!(app.input.text(), "next");
     }
 
     #[test]

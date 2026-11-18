@@ -56,9 +56,11 @@ impl Write {
     /// Write the file, creating missing parent directories, unless it
     /// changed since this change was worked out.
     pub(crate) fn apply(&self) -> Result<String, String> {
-        if let Some(old_text) = &self.old_text
-            && read_text(&self.target, &self.path)? != *old_text
-        {
+        let changed = match &self.old_text {
+            Some(old_text) => read_text(&self.target, &self.path)? != *old_text,
+            None => self.target.exists(),
+        };
+        if changed {
             return Err(format!(
                 "{}: changed while waiting for approval; read it again",
                 self.path
@@ -171,6 +173,16 @@ mod tests {
             fs::read_to_string(cwd.join("notes.txt")).unwrap(),
             "bread\n"
         );
+    }
+
+    #[test]
+    fn apply_refuses_a_new_file_that_appeared_while_waiting_for_approval() {
+        let (_dir, cwd) = dir_with_notes();
+        let write = write_file(&cwd, &json!({"path": "new.txt", "content": "tea\n"})).unwrap();
+        fs::write(cwd.join("new.txt"), "built\n").unwrap();
+
+        assert!(write.apply().unwrap_err().contains("changed while waiting"));
+        assert_eq!(fs::read_to_string(cwd.join("new.txt")).unwrap(), "built\n");
     }
 
     #[test]

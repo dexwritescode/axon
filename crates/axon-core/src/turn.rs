@@ -78,9 +78,8 @@ impl Agent {
                 return Ok(StopReason::Cancelled);
             }
             if reply.truncated {
-                if !reply.text.is_empty() {
-                    history.push(assistant_message(reply.text, &[])?);
-                }
+                // Even when empty, so the next prompt doesn't follow a user message.
+                history.push(assistant_message(reply.text, &[])?);
                 return Ok(StopReason::MaxTokens);
             }
             history.push(assistant_message(reply.text, &reply.calls)?);
@@ -185,8 +184,7 @@ impl Agent {
                     events.send(Event::ReasoningDelta { text }).await?;
                 }
                 Delta::ToolCall(chunk) => {
-                    calls.push(chunk);
-                    if let Some((name, bytes)) = calls.latest() {
+                    if let Some((name, bytes)) = calls.push(chunk) {
                         let name = name.to_string();
                         events
                             .send(Event::ToolCallStreaming { name, bytes })
@@ -403,7 +401,6 @@ mod tests {
     use tokio::sync::mpsc;
     use wiremock::MockServer;
 
-    /// A session working in a temp dir that holds `notes.txt`.
     /// A session in a directory holding notes.txt, which the model has read.
     async fn session_with_notes(max_requests: usize) -> (MockServer, TempDir, SessionHandle) {
         let server = MockServer::start().await;
@@ -667,6 +664,27 @@ mod tests {
             streaming,
             [("list_dir".to_string(), 1), ("list_dir".to_string(), 2)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_before_any_text_still_answers_the_prompt() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let chunks = [chunk(json!({"reasoning_content": "Hmm"}), Some("length"))];
+        respond(&server, sse(&chunks)).await;
+        respond(&server, reply(&["ok"])).await;
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        prompt(&mut handle, "think hard").await;
+        prompt(&mut handle, "again").await;
+
+        let roles: Vec<_> = sent_messages(&server).await[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].clone())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
     }
 
     #[tokio::test]

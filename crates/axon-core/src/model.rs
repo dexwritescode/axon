@@ -11,7 +11,7 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage, ChatCompletionTools,
-        CreateChatCompletionRequestArgs, FinishReason,
+        CreateChatCompletionRequestArgs,
     },
 };
 use futures::{Stream, StreamExt, stream};
@@ -69,7 +69,12 @@ pub(crate) struct ToolCall {
 pub(crate) struct ToolCalls(BTreeMap<u32, ToolCall>);
 
 impl ToolCalls {
-    pub(crate) fn push(&mut self, chunk: ChatCompletionMessageToolCallChunk) {
+    /// Add a fragment; returns the call it belongs to, as its name and the
+    /// bytes of arguments so far, once the name is known.
+    pub(crate) fn push(
+        &mut self,
+        chunk: ChatCompletionMessageToolCallChunk,
+    ) -> Option<(&str, usize)> {
         let call = self.0.entry(chunk.index).or_default();
         if let Some(id) = chunk.id {
             call.id = id;
@@ -82,11 +87,6 @@ impl ToolCalls {
                 call.args.push_str(&args);
             }
         }
-    }
-
-    /// The call being streamed: its name and the bytes of arguments so far.
-    pub(crate) fn latest(&self) -> Option<(&str, usize)> {
-        let (_, call) = self.0.last_key_value()?;
         (!call.name.is_empty()).then_some((call.name.as_str(), call.args.len()))
     }
 
@@ -147,10 +147,14 @@ impl ModelClient {
                     .choices
                     .into_iter()
                     .flat_map(|choice| {
-                        let reasoning = choice.delta.reasoning.filter(|text| !text.is_empty());
+                        let reasoning = choice
+                            .delta
+                            .reasoning
+                            .or(choice.delta.reasoning_content)
+                            .filter(|text| !text.is_empty());
                         let text = choice.delta.content.filter(|text| !text.is_empty());
                         let calls = choice.delta.tool_calls.unwrap_or_default();
-                        let truncated = choice.finish_reason == Some(FinishReason::Length);
+                        let truncated = choice.finish_reason.as_deref() == Some("length");
                         reasoning
                             .map(Delta::Reasoning)
                             .into_iter()
@@ -176,15 +180,17 @@ struct Chunk {
 #[derive(Deserialize)]
 struct Choice {
     delta: ChunkDelta,
-    finish_reason: Option<FinishReason>,
+    /// A string, so a server's own reason (`abort`, `eos`) still parses.
+    finish_reason: Option<String>,
 }
 
+/// Servers name the reasoning `reasoning_content` (LM Studio, llama.cpp) or
+/// `reasoning` (Ollama), and some send both.
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<String>,
-    /// `reasoning_content` from LM Studio, llama.cpp and vLLM; `reasoning` from Ollama.
-    #[serde(alias = "reasoning_content")]
     reasoning: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
 }
 
@@ -235,7 +241,9 @@ mod tests {
             match delta? {
                 Delta::Text(text) => texts.push(text),
                 Delta::Reasoning(text) => texts.push(format!("<reasoning>{text}")),
-                Delta::ToolCall(chunk) => calls.push(chunk),
+                Delta::ToolCall(chunk) => {
+                    calls.push(chunk);
+                }
                 Delta::Truncated => texts.push("<truncated>".into()),
             }
         }
@@ -248,6 +256,17 @@ mod tests {
             name: name.into(),
             args: args.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_both_reasoning_fields_parses() {
+        let chunks = [chunk(
+            json!({"reasoning": "Hmm", "reasoning_content": "Hmm"}),
+            Some("eos"),
+        )];
+        let (_server, client) = client_for(sse(&chunks)).await;
+
+        assert_eq!(collect(&client).await.unwrap().0, ["<reasoning>Hmm"]);
     }
 
     #[tokio::test]
