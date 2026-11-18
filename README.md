@@ -38,7 +38,7 @@ Prompts sent during a turn wait below it as `Next`. When the turn ends, however 
 
 Ctrl+Enter needs a terminal with the kitty keyboard protocol, for example kitty, WezTerm, Ghostty, iTerm2, Alacritty or foot. On Windows it works in any console. Other terminals, such as macOS Terminal, and tmux by default, send it as Enter (it queues) or as Ctrl+J (a new line). Ctrl+S works in every terminal.
 
-Each session is saved when a turn ends, in `~/.axon/sessions` (`%USERPROFILE%\.axon\sessions` on Windows) or in `AXON_SESSIONS_DIR`. Quitting prints the command to resume it. `axon --continue` resumes the newest session started in the current folder and `axon --resume <id>` the one whose id starts with `<id>`; the history shows again and the model gets the conversation so far.
+Each session is saved when a turn ends, in `~/.axon/sessions` (`%USERPROFILE%\.axon\sessions` on Windows) or in `AXON_SESSIONS_DIR`. Quitting prints the command to resume it. `axon --continue` resumes the session last used in the current folder and `axon --resume <id>` the one whose id starts with `<id>`; the history shows again and the model gets the conversation so far.
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
 

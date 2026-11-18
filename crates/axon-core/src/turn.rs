@@ -629,7 +629,8 @@ mod tests {
             sse(&[chunk(json!({"reasoning_content": "Let me list."}), None)]),
         )
         .await;
-        let store = crate::store::Store::new(dir.path(), dir.path(), "test-model");
+        let sessions = TempDir::new().unwrap();
+        let store = crate::store::Store::new(sessions.path(), dir.path(), "test-model");
         let mut handle = crate::session::spawn(
             agent(&server, dir.path()),
             async { None },

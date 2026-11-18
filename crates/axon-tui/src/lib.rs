@@ -160,7 +160,12 @@ async fn run_loop(
     }
     // Ends the session; a running turn is cancelled and saved before its events close.
     drop(commands);
-    let _ = tokio::time::timeout(QUIT_WAIT, async { while events.recv().await.is_some() {} }).await;
+    let drain = async {
+        while let Some(event) = events.recv().await {
+            saved |= matches!(event, Event::TurnEnded { .. });
+        }
+    };
+    let _ = tokio::time::timeout(QUIT_WAIT, drain).await;
     Ok(saved)
 }
 

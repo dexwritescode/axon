@@ -3,8 +3,9 @@
 //! frontend showed; `message` entries are the model history.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use async_openai::types::chat::ChatCompletionRequestMessage;
@@ -73,7 +74,6 @@ impl Turn {
                 text.push_str(more)
             }
             (_, Event::ToolCallStreaming { .. } | Event::Paused { .. }) => {}
-            (_, Event::ContextLimit { .. }) => {}
             _ => self.events.push(event.clone()),
         }
     }
@@ -110,21 +110,27 @@ impl Store {
         }
     }
 
-    /// The saved session `resume` names, or None if there isn't one.
+    /// The saved session `resume` names, or None if there isn't one. A last
+    /// turn left incomplete, by a crash mid-write, is cut from the file.
     pub(crate) fn open(
         root: &Path,
         cwd: &Path,
         model: &str,
         resume: &Resume,
     ) -> Result<Option<(Self, Saved)>> {
-        let ids = saved_ids(&dir(root, cwd))?;
-        let id = match resume {
+        let found = match resume {
             Resume::New => return Ok(Some((Self::new(root, cwd, model), Saved::default()))),
-            Resume::Latest => ids.into_iter().max(),
+            Resume::Latest => saved(&dir(root, cwd), cwd)?
+                .into_iter()
+                .max_by_key(|&(id, used)| (used, id)),
             Resume::Id(prefix) => {
-                let mut matching = ids
+                let prefix = prefix.to_lowercase();
+                if prefix.is_empty() {
+                    bail!("a session id can't be empty");
+                }
+                let mut matching = saved(&dir(root, cwd), cwd)?
                     .into_iter()
-                    .filter(|id| id.to_string().starts_with(prefix.as_str()));
+                    .filter(|(id, _)| id.to_string().starts_with(&prefix));
                 let first = matching.next();
                 if first.is_some() && matching.next().is_some() {
                     bail!("more than one session starts with {prefix}");
@@ -132,24 +138,39 @@ impl Store {
                 first
             }
         };
-        let Some(id) = id else { return Ok(None) };
+        let Some((id, _)) = found else {
+            return Ok(None);
+        };
         let path = dir(root, cwd).join(format!("{id}.jsonl"));
-        let (saved, last) = read(&path)?;
+        let read = read(&path)?;
+        let repaired = match read.complete {
+            Some(len) => OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(len)),
+            None if !read.ends_in_newline => OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(b"\n")),
+            None => Ok(()),
+        };
+        repaired.with_context(|| path.display().to_string())?;
         let store = Self {
             id,
             path,
             cwd: cwd.into(),
             model: model.into(),
-            last,
+            last: read.last,
         };
-        Ok(Some((store, saved)))
+        Ok(Some((store, read.saved)))
     }
 
     pub(crate) fn id(&self) -> String {
         self.id.to_string()
     }
 
-    /// Append a turn, starting the file with a header if it's new.
+    /// Append a turn, starting the file with a header if it's new. Its
+    /// messages come before its events, so `TurnEnded` closes it.
     pub(crate) fn append(&mut self, turn: Turn) -> Result<()> {
         let mut kinds = Vec::new();
         if self.last.is_none() {
@@ -159,19 +180,19 @@ impl Store {
             });
         }
         kinds.push(Kind::Prompt { text: turn.prompt });
-        kinds.extend(turn.events.into_iter().map(|event| Kind::Event { event }));
         kinds.extend(
             turn.messages
                 .into_iter()
                 .map(|message| Kind::Message { message }),
         );
+        kinds.extend(turn.events.into_iter().map(|event| Kind::Event { event }));
         let mut lines = String::new();
         for kind in kinds {
             let id = Uuid::now_v7();
             let entry = Entry {
                 id,
                 parent: self.last,
-                version: env!("CARGO_PKG_VERSION").into(),
+                version: VERSION.into(),
                 kind,
             };
             lines.push_str(&serde_json::to_string(&entry)?);
@@ -189,65 +210,164 @@ impl Store {
     }
 }
 
-/// The folder for sessions started in `cwd`: its path with every other
-/// character than letters and digits made a `-`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Longest folder name made from a working directory, in bytes.
+const MAX_KEY: usize = 100;
+
+/// The folder for sessions started in `cwd`: its path with every character
+/// but ASCII letters and digits made a `-`; a long one is cut and ends with
+/// a hash of the whole path. Different paths can share a folder, so each
+/// session's header says which one it belongs to.
 fn dir(root: &Path, cwd: &Path) -> PathBuf {
-    let key: String = cwd
+    let mut key: String = cwd
         .to_string_lossy()
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
+    if key.len() > MAX_KEY {
+        let hash = fnv(cwd.as_os_str().as_encoded_bytes());
+        key.truncate(MAX_KEY - 17);
+        key.push_str(&format!("-{hash:016x}"));
+    }
     root.join(key)
 }
 
-fn saved_ids(dir: &Path) -> Result<Vec<Uuid>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| dir.display().to_string()),
-    };
-    let mut ids = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "jsonl")
-            && let Some(id) = path.file_stem().and_then(|s| s.to_str()?.parse().ok())
-        {
-            ids.push(id);
-        }
-    }
-    Ok(ids)
+/// FNV-1a, which unlike std's hasher stays the same across Rust versions.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
-/// Read a session file and the id of its last entry. Entries a newer axon
-/// wrote are skipped, unless they are messages: the history needs them all.
-fn read(path: &Path) -> Result<(Saved, Option<Uuid>)> {
+/// The sessions in `dir` started in `cwd`, with when each was last written.
+fn saved(dir: &Path, cwd: &Path) -> Result<Vec<(Uuid, SystemTime)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| dir.display().to_string()),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(id) = path
+            .extension()
+            .filter(|e| *e == "jsonl")
+            .and(path.file_stem())
+            .and_then(|s| s.to_str()?.parse().ok())
+        else {
+            continue;
+        };
+        if started_in(&path)?.as_deref() == Some(cwd) {
+            found.push((id, fs::metadata(&path)?.modified()?));
+        }
+    }
+    Ok(found)
+}
+
+/// The working directory in a session file's header.
+fn started_in(path: &Path) -> Result<Option<PathBuf>> {
+    let file = fs::File::open(path).with_context(|| path.display().to_string())?;
+    let mut first = String::new();
+    BufReader::new(file).read_line(&mut first)?;
+    Ok(match serde_json::from_str::<Entry>(&first) {
+        Ok(Entry {
+            kind: Kind::Header { cwd, .. },
+            ..
+        }) => Some(cwd),
+        _ => None,
+    })
+}
+
+/// A session file as read.
+#[derive(Debug)]
+struct Read {
+    saved: Saved,
+    /// The id of the last entry kept.
+    last: Option<Uuid>,
+    /// When the file ends in an incomplete turn: the length without it.
+    complete: Option<u64>,
+    /// Whether the file is empty or ends in a new line, as appending needs.
+    ends_in_newline: bool,
+}
+
+/// Read a session file. Entries a newer axon wrote are skipped, unless they
+/// are messages: the history needs them all. A last turn without its
+/// `TurnEnded` is left out, as it was cut off mid-write.
+fn read(path: &Path) -> Result<Read> {
     let text = fs::read_to_string(path).with_context(|| path.display().to_string())?;
     let mut saved = Saved::default();
     let mut last = None;
-    for line in text.lines() {
+    // Where the turn being read started, until it ends.
+    let mut open: Option<(u64, usize, usize, Option<Uuid>)> = None;
+    let mut offset = 0;
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    for (n, line) in lines.iter().enumerate() {
+        let start = offset;
+        offset += line.len() as u64;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+            if n + 1 < lines.len() {
+                bail!("{}: line {} is corrupt", path.display(), n + 1);
+            }
+            open.get_or_insert((start, saved.past.len(), saved.history.len(), last));
+            break;
         };
         let value = migrate(value, MIGRATIONS);
-        if let Some(id) = value["id"].as_str().and_then(|id| id.parse().ok()) {
-            last = Some(id);
+        let entry = match serde_json::from_value::<Entry>(value.clone()) {
+            Ok(entry) => entry,
+            Err(_) if value["type"] == "message" => {
+                let newer = value["version"]
+                    .as_str()
+                    .and_then(release)
+                    .is_some_and(|v| Some(v) > release(VERSION));
+                if newer {
+                    bail!(
+                        "{}: a message written by a newer axon ({})",
+                        path.display(),
+                        value["version"]
+                    );
+                }
+                bail!(
+                    "{}: the message on line {} is unreadable",
+                    path.display(),
+                    n + 1
+                );
+            }
+            Err(_) => {
+                if let Some(id) = value["id"].as_str().and_then(|id| id.parse().ok()) {
+                    last = Some(id);
+                }
+                continue;
+            }
+        };
+        match entry.kind {
+            Kind::Header { .. } => {}
+            Kind::Prompt { text } => {
+                open = Some((start, saved.past.len(), saved.history.len(), last));
+                saved.past.push(Past::Prompt(text));
+            }
+            Kind::Event { event } => {
+                if matches!(event, Event::TurnEnded { .. }) {
+                    open = None;
+                }
+                saved.past.push(Past::Event(event));
+            }
+            Kind::Message { message } => saved.history.push(message),
         }
-        match serde_json::from_value::<Entry>(value.clone()) {
-            Ok(entry) => match entry.kind {
-                Kind::Header { .. } => {}
-                Kind::Prompt { text } => saved.past.push(Past::Prompt(text)),
-                Kind::Event { event } => saved.past.push(Past::Event(event)),
-                Kind::Message { message } => saved.history.push(message),
-            },
-            Err(_) if value["type"] == "message" => bail!(
-                "{}: a message written by a newer axon ({})",
-                path.display(),
-                value["version"]
-            ),
-            Err(_) => {}
-        }
+        last = Some(entry.id);
     }
-    Ok((saved, last))
+    let complete = open.map(|(start, past, history, before)| {
+        saved.past.truncate(past);
+        saved.history.truncate(history);
+        last = before;
+        start
+    });
+    Ok(Read {
+        saved,
+        last,
+        complete,
+        ends_in_newline: text.is_empty() || text.ends_with('\n'),
+    })
 }
 
 /// Run each migration whose version is after the one that wrote `entry`,
@@ -418,6 +538,15 @@ mod tests {
             .collect()
     }
 
+    /// A turn that ended, as every turn the session saves does.
+    fn ended(prompt: &str) -> Turn {
+        let mut turn = Turn::new(prompt.into());
+        turn.record(&Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+        turn
+    }
+
     fn new_store(root: &Path) -> Store {
         Store::new(root, Path::new("/work/app"), "test-model")
     }
@@ -459,7 +588,13 @@ mod tests {
     #[test]
     fn the_golden_file_reads_back_as_what_was_shown_and_the_history() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sessions/0.1.1.jsonl");
-        let (saved, last) = read(&path).unwrap();
+        let Read {
+            saved,
+            last,
+            complete,
+            ..
+        } = read(&path).unwrap();
+        assert_eq!(complete, None);
 
         let mut past = Vec::new();
         let mut history = Vec::new();
@@ -508,7 +643,7 @@ mod tests {
     fn a_reopened_session_continues_the_chain_without_a_second_header() {
         let root = tempfile::tempdir().unwrap();
         let mut store = new_store(root.path());
-        store.append(Turn::new("one".into())).unwrap();
+        store.append(ended("one")).unwrap();
         let last = store.last;
 
         let (mut store, saved) = Store::open(
@@ -520,12 +655,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(store.last, last);
-        assert_eq!(saved.past, [Past::Prompt("one".into())]);
-        store.append(Turn::new("two".into())).unwrap();
+        assert_eq!(saved.past[0], Past::Prompt("one".into()));
+        store.append(ended("two")).unwrap();
 
         let text = fs::read_to_string(&store.path).unwrap();
         let types: Vec<_> = masked(&text).iter().map(|v| v["type"].clone()).collect();
-        assert_eq!(types, ["header", "prompt", "prompt"]);
+        assert_eq!(types, ["header", "prompt", "event", "prompt", "event"]);
     }
 
     #[test]
@@ -538,7 +673,7 @@ mod tests {
         let mut ids = Vec::new();
         for prompt in ["first", "second"] {
             let mut store = new_store(root.path());
-            store.append(Turn::new(prompt.into())).unwrap();
+            store.append(ended(prompt)).unwrap();
             ids.push(store.id);
         }
 
@@ -568,16 +703,22 @@ mod tests {
             entry(json!({"type": "prompt", "text": "hi"})),
             entry(json!({"type": "event", "event": {"type": "something_new"}})),
             entry(json!({"type": "fancy"})),
-            "{not json".into(),
+            entry(json!({"type": "event", "event": {"type": "turn_ended", "stop": "end_turn"}})),
         ];
         fs::write(&path, lines.join("\n")).unwrap();
-        let (saved, _) = read(&path).unwrap();
-        assert_eq!(saved.past, [Past::Prompt("hi".into())]);
+        let past = read(&path).unwrap().saved.past;
+        assert_eq!(past[0], Past::Prompt("hi".into()));
+        assert_eq!(past.len(), 2);
 
         let message = entry(json!({"type": "message", "message": {"role": "wizard"}}));
-        fs::write(&path, [lines[0].clone(), message].join("\n")).unwrap();
+        fs::write(&path, [lines[0].clone(), message.clone()].join("\n")).unwrap();
         let err = read(&path).unwrap_err().to_string();
         assert!(err.contains("newer axon") && err.contains("9.0.0"), "{err}");
+
+        let ours = message.replace("9.0.0", VERSION);
+        fs::write(&path, [lines[0].clone(), ours].join("\n")).unwrap();
+        let err = read(&path).unwrap_err().to_string();
+        assert!(err.contains("line 2 is unreadable"), "{err}");
     }
 
     #[test]
@@ -601,5 +742,147 @@ mod tests {
         assert_eq!(steps("0.3.0"), json!(["0.4.0"]));
         assert_eq!(steps("0.4.0-dev"), json!([]));
         assert_eq!(steps("0.4.1"), json!([]));
+    }
+
+    fn open_latest(root: &Path, cwd: &str) -> Option<(Store, Saved)> {
+        Store::open(root, Path::new(cwd), "m", &Resume::Latest).unwrap()
+    }
+
+    #[test]
+    fn a_turn_cut_off_mid_write_is_dropped_and_the_next_one_follows_the_last_whole_one() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = new_store(root.path());
+        write_turns(&mut store);
+        let whole = fs::read_to_string(&store.path).unwrap();
+        let mut turn = Turn::new("cut".into());
+        turn.record(&Event::TextDelta {
+            text: "partial".into(),
+        });
+        turn.record(&Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+        store.append(turn).unwrap();
+        let text = fs::read_to_string(&store.path).unwrap();
+        let last_line = text[..text.len() - 1].rfind('\n').unwrap() + 1;
+        for cut in [text.len() - 10, last_line, whole.len() + 5] {
+            fs::write(&store.path, &text[..cut]).unwrap();
+
+            let (mut store, saved) = open_latest(root.path(), "/work/app").unwrap();
+            assert_eq!(fs::read_to_string(&store.path).unwrap(), whole);
+            assert_eq!(
+                saved.past.last(),
+                Some(&Past::Event(Event::TurnEnded {
+                    stop: StopReason::MaxTokens
+                }))
+            );
+            store.append(ended("next")).unwrap();
+            let entries: Vec<Value> = fs::read_to_string(&store.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let [.., before, next] = &entries[..] else {
+                panic!()
+            };
+            assert_eq!(next["parent"], before["id"]);
+        }
+    }
+
+    #[test]
+    fn a_whole_last_turn_without_its_new_line_gets_one_before_the_next() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = new_store(root.path());
+        store.append(ended("one")).unwrap();
+        let text = fs::read_to_string(&store.path).unwrap();
+        fs::write(&store.path, text.trim_end()).unwrap();
+
+        let (mut store, saved) = open_latest(root.path(), "/work/app").unwrap();
+        assert_eq!(saved.past[0], Past::Prompt("one".into()));
+        store.append(ended("two")).unwrap();
+        let (_, saved) = open_latest(root.path(), "/work/app").unwrap();
+        assert_eq!(saved.past[2], Past::Prompt("two".into()));
+    }
+
+    #[test]
+    fn a_corrupt_line_before_the_end_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = new_store(root.path());
+        write_turns(&mut store);
+        let text = fs::read_to_string(&store.path).unwrap();
+        fs::write(&store.path, text.replacen("\"prompt\"", "\"prompt", 1)).unwrap();
+
+        let err = read(&store.path).unwrap_err().to_string();
+        assert!(err.contains("line 2 is corrupt"), "{err}");
+    }
+
+    #[test]
+    fn folders_that_share_a_key_keep_their_sessions_apart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::new(root.path(), Path::new("/a/b-c"), "m");
+        store.append(ended("hi")).unwrap();
+
+        assert_eq!(
+            dir(root.path(), Path::new("/a/b-c")),
+            dir(root.path(), Path::new("/a/b/c"))
+        );
+        assert!(open_latest(root.path(), "/a/b/c").is_none());
+        assert!(open_latest(root.path(), "/a/b-c").is_some());
+    }
+
+    #[test]
+    fn a_long_folder_gets_a_short_key_that_still_tells_it_apart() {
+        let long = format!("/{}", "é".repeat(300));
+        let key = |path: &str| {
+            dir(Path::new(""), Path::new(path))
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        assert_eq!(key(&long).len(), MAX_KEY);
+        assert_ne!(key(&long), key(&format!("{long}x")));
+        assert_eq!(key("/work/app"), "-work-app");
+    }
+
+    #[test]
+    fn a_new_session_starts_even_when_the_sessions_folder_cannot_be_read() {
+        let root = tempfile::NamedTempFile::new().unwrap();
+
+        let opened = Store::open(root.path(), Path::new("/work/app"), "m", &Resume::New);
+        assert!(opened.unwrap().is_some());
+    }
+
+    #[test]
+    fn an_id_prefix_matches_in_any_case_and_cannot_be_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = new_store(root.path());
+        store.append(ended("hi")).unwrap();
+        let open = |prefix: &str| {
+            Store::open(
+                root.path(),
+                Path::new("/work/app"),
+                "m",
+                &Resume::Id(prefix.into()),
+            )
+        };
+
+        let upper = store.id.to_string()[..8].to_uppercase();
+        assert_eq!(open(&upper).unwrap().unwrap().0.id, store.id);
+        assert!(open("").is_err());
+    }
+
+    #[test]
+    fn continue_picks_the_session_written_last_not_the_one_started_last() {
+        let root = tempfile::tempdir().unwrap();
+        let mut older = new_store(root.path());
+        older.append(ended("one")).unwrap();
+        let mut newer = new_store(root.path());
+        newer.append(ended("two")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        older.append(ended("three")).unwrap();
+
+        assert_eq!(
+            open_latest(root.path(), "/work/app").unwrap().0.id,
+            older.id
+        );
     }
 }
