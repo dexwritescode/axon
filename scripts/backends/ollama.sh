@@ -6,12 +6,7 @@ MODEL="qwen3:0.6b"
 PID_FILE="${TMPDIR:-/tmp}/axon-ollama.pid"
 LOG_FILE="${TMPDIR:-/tmp}/axon-ollama.log"
 
-cmd_up() {
-    if ! command -v ollama &>/dev/null; then
-        echo "ollama not found, installing via brew..." >&2
-        brew install ollama >&2
-    fi
-
+start_server() {
     if ! curl -sf "${OLLAMA_URL}/api/version" &>/dev/null; then
         echo "Starting ollama serve..." >&2
         nohup ollama serve >>"${LOG_FILE}" 2>&1 &
@@ -32,6 +27,14 @@ cmd_up() {
     else
         echo "ollama already running." >&2
     fi
+}
+
+cmd_up() {
+    if ! command -v ollama &>/dev/null; then
+        echo "ollama not found, installing via brew..." >&2
+        brew install ollama >&2
+    fi
+    start_server
 
     echo "Pulling ${MODEL}..." >&2
     ollama pull "${MODEL}" >&2
@@ -61,6 +64,7 @@ cmd_down() {
 }
 
 cmd_purge() {
+    start_server
     echo "Removing ${MODEL}..." >&2
     ollama rm "${MODEL}"
     cmd_down

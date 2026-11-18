@@ -14,7 +14,7 @@ cmd_up() {
         echo "started" > "${STARTED_FILE}"
     fi
 
-    if ! lms ps | grep -q "axon-test"; then
+    if ! lms ps | grep "axon-test" >/dev/null; then
         lms load qwen/qwen3-0.6b --identifier axon-test -y >&2
     fi
 
@@ -23,7 +23,7 @@ cmd_up() {
 }
 
 cmd_down() {
-    if lms ps | grep -q "axon-test"; then
+    if lms ps | grep "axon-test" >/dev/null; then
         lms unload axon-test >&2
     fi
 
