@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// Sent by a frontend to a session.
@@ -19,7 +20,8 @@ pub enum Command {
 }
 
 /// Sent by a session to its frontend.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// The model's context size in tokens, as the server reports it; None when it doesn't. Always the session's first event.
     ContextLimit { tokens: Option<u64> },
@@ -47,7 +49,8 @@ pub enum Event {
 }
 
 /// A change a tool call wants to make, shown to the user for approval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Change {
     /// Create or replace the file at `path` (relative to the working
     /// directory); `old_text` is `None` when the file doesn't exist yet.
@@ -61,7 +64,8 @@ pub enum Change {
 }
 
 /// How a tool call ended.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ToolResult {
     /// What a file tool returned.
     Output(String),
@@ -82,7 +86,8 @@ pub enum ToolResult {
 }
 
 /// How a command ended.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Exit {
     Code(i32),
     /// Ended without an exit code, e.g. killed by a signal on Unix.
@@ -96,7 +101,8 @@ pub enum Exit {
 }
 
 /// Why a turn ended.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model answered without calling more tools, or the turn failed.
     EndTurn,
@@ -127,4 +133,135 @@ pub enum SessionError {
 pub trait SessionFactory: Send + Sync {
     /// Start a session whose tools work inside `cwd`.
     fn new_session(&self, cwd: PathBuf) -> Result<SessionHandle, SessionError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use std::fmt::Debug;
+
+    /// Saved sessions depend on these names; a change here breaks them.
+    fn same<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: T, expected: Value) {
+        assert_eq!(serde_json::to_value(&value).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<T>(expected).unwrap(), value);
+    }
+
+    #[test]
+    fn events_serialize_with_explicit_names() {
+        let text = || "hi".to_string();
+        same(
+            Event::ContextLimit { tokens: Some(8) },
+            json!({"type": "context_limit", "tokens": 8}),
+        );
+        same(
+            Event::TextDelta { text: text() },
+            json!({"type": "text_delta", "text": "hi"}),
+        );
+        same(
+            Event::ReasoningDelta { text: text() },
+            json!({"type": "reasoning_delta", "text": "hi"}),
+        );
+        same(
+            Event::ToolCallStreaming {
+                name: text(),
+                bytes: 3,
+            },
+            json!({"type": "tool_call_streaming", "name": "hi", "bytes": 3}),
+        );
+        same(
+            Event::ToolCallStarted {
+                id: 1,
+                name: text(),
+                args: "{}".into(),
+            },
+            json!({"type": "tool_call_started", "id": 1, "name": "hi", "args": "{}"}),
+        );
+        same(
+            Event::ApprovalRequested {
+                id: 1,
+                change: Change::RunCommand { command: text() },
+            },
+            json!({"type": "approval_requested", "id": 1, "change": {"type": "run_command", "command": "hi"}}),
+        );
+        same(
+            Event::ToolCallFinished {
+                id: 1,
+                result: ToolResult::Rejected,
+            },
+            json!({"type": "tool_call_finished", "id": 1, "result": {"type": "rejected"}}),
+        );
+        same(
+            Event::Paused { secs: 30 },
+            json!({"type": "paused", "secs": 30}),
+        );
+        same(
+            Event::Error { message: text() },
+            json!({"type": "error", "message": "hi"}),
+        );
+        same(
+            Event::TurnEnded {
+                stop: StopReason::EndTurn,
+            },
+            json!({"type": "turn_ended", "stop": "end_turn"}),
+        );
+    }
+
+    #[test]
+    fn changes_serialize_with_explicit_names() {
+        same(
+            Change::WriteFile {
+                path: "a.txt".into(),
+                old_text: None,
+                new_text: "new".into(),
+            },
+            json!({"type": "write_file", "path": "a.txt", "old_text": null, "new_text": "new"}),
+        );
+        same(
+            Change::RunCommand {
+                command: "ls".into(),
+            },
+            json!({"type": "run_command", "command": "ls"}),
+        );
+    }
+
+    #[test]
+    fn tool_results_serialize_with_explicit_names() {
+        same(
+            ToolResult::Output("out".into()),
+            json!({"type": "output", "value": "out"}),
+        );
+        same(
+            ToolResult::Failed("why".into()),
+            json!({"type": "failed", "value": "why"}),
+        );
+        same(ToolResult::Rejected, json!({"type": "rejected"}));
+        same(
+            ToolResult::Command {
+                head: "a".into(),
+                cut: 2,
+                tail: "b".into(),
+                exit: Exit::Code(1),
+            },
+            json!({"type": "command", "value": {
+                "head": "a", "cut": 2, "tail": "b", "exit": {"type": "code", "value": 1}
+            }}),
+        );
+    }
+
+    #[test]
+    fn exits_and_stop_reasons_serialize_with_explicit_names() {
+        same(Exit::Code(0), json!({"type": "code", "value": 0}));
+        same(Exit::Killed, json!({"type": "killed"}));
+        same(
+            Exit::TimedOut { secs: 2 },
+            json!({"type": "timed_out", "value": {"secs": 2}}),
+        );
+        same(Exit::Cancelled, json!({"type": "cancelled"}));
+        same(StopReason::EndTurn, json!("end_turn"));
+        same(StopReason::MaxTurnRequests, json!("max_turn_requests"));
+        same(StopReason::Cancelled, json!("cancelled"));
+        same(StopReason::MaxTokens, json!("max_tokens"));
+    }
 }

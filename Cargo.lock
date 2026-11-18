@@ -235,6 +235,8 @@ dependencies = [
 name = "axon-protocol"
 version = "0.1.1-dev"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
