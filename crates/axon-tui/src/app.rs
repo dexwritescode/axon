@@ -18,6 +18,8 @@ pub(crate) struct App {
     pub(crate) input: Prompt,
     /// The reply streaming in for the current turn.
     pub(crate) streaming_text: String,
+    /// The model's context size in tokens, when the server reported it.
+    pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
     pub(crate) turn: Option<Turn>,
     /// How the last turn ended, shown in the activity row until the next one.
@@ -292,7 +294,10 @@ impl App {
                 committed.push(Committed::Error(message));
                 committed
             }
-            Event::ContextLimit { .. } => Vec::new(),
+            Event::ContextLimit { tokens } => {
+                self.context_limit = tokens;
+                Vec::new()
+            }
             Event::TurnEnded { stop } => {
                 if let Some(turn) = self.turn.take() {
                     self.finished = Some(Finished {
@@ -807,5 +812,16 @@ mod tests {
 
         assert_eq!(app.scroll, Some(30));
         assert_eq!(app.approval, Some(7));
+    }
+
+    #[test]
+    fn the_context_limit_is_kept_for_the_session() {
+        let mut app = App::default();
+
+        app.on_event(Event::ContextLimit {
+            tokens: Some(262144),
+        });
+
+        assert_eq!(app.context_limit, Some(262144));
     }
 }
