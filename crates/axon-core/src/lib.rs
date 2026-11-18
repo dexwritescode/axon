@@ -26,6 +26,9 @@ pub use model::ModelConfig;
 /// Model requests per prompt before a turn stops.
 const MAX_TURN_REQUESTS: usize = 25;
 
+/// How long context discovery waits for the server before the session starts without it.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Starts core sessions that all talk to the same model.
 pub struct CoreFactory {
     config: ModelConfig,
@@ -42,7 +45,7 @@ impl SessionFactory for CoreFactory {
     fn new_session(&self, cwd: PathBuf) -> Result<SessionHandle, SessionError> {
         tokio::runtime::Handle::try_current().map_err(|e| SessionError::Start(e.to_string()))?;
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(DISCOVERY_TIMEOUT)
             .build()
             .map_err(|e| SessionError::Start(e.to_string()))?;
         let cwd = cwd

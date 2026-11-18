@@ -1,74 +1,52 @@
 //! Discover the model's loaded context size from the inference server.
 
 use reqwest::Client;
+use serde_json::Value;
 
-/// Returns the first answer from a list of probes, or None when no probe answers.
+/// Asks LM Studio, vLLM, llama.cpp and Ollama at once; the first of them, in
+/// that order, to report a size wins. None when no server answers.
 pub(crate) async fn discover(
     http: &Client,
     base_url: &str,
     api_key: &str,
     model: &str,
 ) -> Option<u64> {
-    let root = base_url
-        .strip_suffix("/v1")
-        .or_else(|| base_url.strip_suffix("/v1/"))
-        .unwrap_or(base_url);
-    if let Some(n) = lm_studio(http, root, api_key, model).await {
-        return Some(n);
-    }
-    if let Some(n) = vllm(http, base_url, api_key, model).await {
-        return Some(n);
-    }
-    if let Some(n) = llama_cpp(http, root, api_key).await {
-        return Some(n);
-    }
-    ollama(http, root, api_key, model).await
+    let base_url = base_url.trim_end_matches('/');
+    let root = base_url.strip_suffix("/v1").unwrap_or(base_url);
+    let get = |url: String| get_json(http, url, api_key);
+    let (lm_studio, vllm, llama_cpp, ollama) = tokio::join!(
+        get(format!("{root}/api/v0/models/{model}")),
+        get(format!("{base_url}/models")),
+        get(format!("{root}/props")),
+        get(format!("{root}/api/ps")),
+    );
+    lm_studio
+        .and_then(|json| json["loaded_context_length"].as_u64())
+        .or_else(|| {
+            vllm.and_then(|json| {
+                find_model(&json["data"], &["id"], model)?["max_model_len"].as_u64()
+            })
+        })
+        .or_else(|| {
+            llama_cpp.and_then(|json| json["default_generation_settings"]["n_ctx"].as_u64())
+        })
+        .or_else(|| {
+            ollama.and_then(|json| {
+                find_model(&json["models"], &["name", "model"], model)?["context_length"].as_u64()
+            })
+        })
 }
 
-async fn lm_studio(http: &Client, root: &str, api_key: &str, model: &str) -> Option<u64> {
-    let url = format!("{root}/api/v0/models/{model}");
-
-    let response = http.get(&url).bearer_auth(api_key).send().await.ok()?;
-
-    let json: serde_json::Value = response.json().await.ok()?;
-    json["loaded_context_length"].as_u64()
+async fn get_json(http: &Client, url: String, api_key: &str) -> Option<Value> {
+    let response = http.get(url).bearer_auth(api_key).send().await.ok()?;
+    response.error_for_status().ok()?.json().await.ok()
 }
 
-async fn vllm(http: &Client, base_url: &str, api_key: &str, model: &str) -> Option<u64> {
-    let url = format!("{base_url}/models");
-
-    let response = http.get(&url).bearer_auth(api_key).send().await.ok()?;
-
-    let json: serde_json::Value = response.json().await.ok()?;
-    json["data"]
-        .as_array()?
+/// The entry in a list of models whose `keys` field names `model`.
+fn find_model<'a>(list: &'a Value, keys: &[&str], model: &str) -> Option<&'a Value> {
+    list.as_array()?
         .iter()
-        .find(|m| m["id"].as_str() == Some(model))?["max_model_len"]
-        .as_u64()
-}
-
-async fn llama_cpp(http: &Client, root: &str, api_key: &str) -> Option<u64> {
-    let url = format!("{root}/props");
-
-    let response = http.get(&url).bearer_auth(api_key).send().await.ok()?;
-
-    let json: serde_json::Value = response.json().await.ok()?;
-    json["default_generation_settings"]["n_ctx"].as_u64()
-}
-
-async fn ollama(http: &Client, root: &str, api_key: &str, model: &str) -> Option<u64> {
-    let url = format!("{root}/api/ps");
-
-    let response = http.get(&url).bearer_auth(api_key).send().await.ok()?;
-
-    let json: serde_json::Value = response.json().await.ok()?;
-    json["models"]
-        .as_array()?
-        .iter()
-        .find(|m| {
-            m["name"].as_str() == Some(model) || m["model"].as_str() == Some(model)
-        })?["context_length"]
-        .as_u64()
+        .find(|entry| keys.iter().any(|key| entry[*key].as_str() == Some(model)))
 }
 
 #[cfg(test)]
@@ -92,6 +70,45 @@ mod tests {
         let http = Client::new();
         let result = discover(&http, &api_url(&server), "test", "test-model").await;
         assert_eq!(result, Some(128000));
+    }
+
+    #[tokio::test]
+    async fn a_base_url_with_a_trailing_slash_finds_the_same_paths() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":[{"id":"test-model","max_model_len":32768}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let http = Client::new();
+        let result = discover(
+            &http,
+            &format!("{}/", api_url(&server)),
+            "test",
+            "test-model",
+        )
+        .await;
+        assert_eq!(result, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_no_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/models/test-model"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string(r#"{"loaded_context_length": 128000}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let http = Client::new();
+        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        assert_eq!(result, None);
     }
 
     #[tokio::test]

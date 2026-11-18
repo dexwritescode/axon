@@ -17,10 +17,9 @@ async fn live_backend_reports_its_context_and_answers() {
     let context = context::discover(&reqwest::Client::new(), &base_url, "none", &model).await;
     assert!(
         context.is_some(),
-        "discover returned None for model {}",
-        model
+        "discover returned None for model {model}"
     );
-    eprintln!("context: {:?}", context);
+    eprintln!("context: {context:?}");
 
     let config = model::ModelConfig {
         base_url,
@@ -53,8 +52,8 @@ async fn live_backend_reports_its_context_and_answers() {
         }
     }
 
-    eprintln!("reply: {:?}", reply);
-    eprintln!("tool_call_names: {:?}", tool_call_names);
+    eprintln!("reply: {reply:?}");
+    eprintln!("tool_call_names: {tool_call_names:?}");
     assert!(
         !reply.trim().is_empty() || !tool_call_names.is_empty(),
         "expected either non-empty reply text or at least one tool call"

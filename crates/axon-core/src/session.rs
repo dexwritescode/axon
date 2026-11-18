@@ -5,7 +5,6 @@ use std::pin::pin;
 use anyhow::Result;
 use async_openai::types::chat::ChatCompletionRequestMessage;
 use axon_protocol::{Command, Event, SessionHandle, StopReason};
-use futures::Future;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -105,7 +104,9 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{agent, delta, end, prompt, reply, respond, sent_messages, spawn};
+    use crate::test_support::{
+        agent, delta, end, prompt, reply, respond, sent_messages, spawn_started,
+    };
     use serde_json::json;
     use std::path::Path;
     use std::time::Duration;
@@ -113,7 +114,7 @@ mod tests {
     use wiremock::{Mock, MockServer};
 
     async fn session(server: &MockServer) -> SessionHandle {
-        spawn(agent(server, Path::new("."))).await
+        spawn_started(agent(server, Path::new("."))).await
     }
 
     #[tokio::test]
