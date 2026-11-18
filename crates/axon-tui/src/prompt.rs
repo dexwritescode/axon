@@ -4,9 +4,9 @@ use std::ops::{Range, RangeInclusive};
 
 use unicode_width::UnicodeWidthChar;
 
-/// Private-use chars: the ones from `TOKENS.start()` on stand for pastes in
-/// `Prompt::text`; the rest are never typed in.
-const TOKENS: RangeInclusive<char> = '\u{E000}'..='\u{F8FF}';
+/// Chars that stand for long pastes in `Prompt::text`: Supplementary Private
+/// Use Area-B, which fonts and terminals leave alone. Typed ones are dropped.
+const TOKENS: RangeInclusive<char> = '\u{100000}'..='\u{10FFFD}';
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Prompt {
@@ -45,7 +45,7 @@ impl Prompt {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.text.trim().is_empty()
+        self.expanded().trim().is_empty()
     }
 
     /// The text with each long paste in full, as sent to the model.
@@ -71,18 +71,21 @@ impl Prompt {
 
     /// The text without surrounding whitespace, the cursor at its end.
     pub(crate) fn trimmed(&self) -> Self {
-        let text = self.text.trim().to_string();
-        Self {
-            cursor: text.len(),
-            text,
-            pastes: self.pastes.clone(),
-        }
+        let mut trimmed = Self::default();
+        trimmed.append(self, self.text.trim());
+        trimmed
     }
 
     /// Append `other` on a new line, the cursor at the end.
     pub(crate) fn push_line(&mut self, other: &Self) {
         self.text.push('\n');
-        for c in other.text.chars() {
+        self.append(other, &other.text);
+    }
+
+    /// Append `text`, a part of `other.text`, with the pastes it holds; the
+    /// cursor at the end.
+    fn append(&mut self, other: &Self, text: &str) {
+        for c in text.chars() {
             match other.paste_of(c) {
                 Some(paste) => self.push_paste(paste.to_string()),
                 None => self.text.push(c),
@@ -129,7 +132,7 @@ impl Prompt {
     /// tabs as four spaces.
     pub(crate) fn paste(&mut self, text: &str, token_chars: usize) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        if text.chars().count() > token_chars && self.pastes.len() < TOKENS.count() {
+        if text.chars().count() > token_chars {
             let at = self.cursor;
             let end = self.text.split_off(at);
             self.push_paste(text);
@@ -287,18 +290,26 @@ impl Prompt {
         (col.min(width), row)
     }
 
-    /// Add `paste` as a token at the end of the text.
+    /// Add `paste` as a token at the end of the text, or in full once the
+    /// tokens run out.
     fn push_paste(&mut self, paste: String) {
-        let token = (*TOKENS.start() as u32 + self.pastes.len() as u32)
-            .try_into()
-            .expect("in the private-use range");
-        self.pastes.push(paste);
-        self.text.push(token);
+        let token = char::from_u32(*TOKENS.start() as u32 + self.pastes.len() as u32)
+            .filter(|c| TOKENS.contains(c));
+        match token {
+            Some(token) => {
+                self.pastes.push(paste);
+                self.text.push(token);
+            }
+            None => self.text.push_str(&paste),
+        }
     }
 
     /// The long paste `c` stands for, if it is a token.
     fn paste_of(&self, c: char) -> Option<&str> {
-        let i = (c as u32).checked_sub(*TOKENS.start() as u32)?;
+        if !TOKENS.contains(&c) {
+            return None;
+        }
+        let i = c as u32 - *TOKENS.start() as u32;
         self.pastes.get(i as usize).map(String::as_str)
     }
 
@@ -409,9 +420,43 @@ mod tests {
     #[test]
     fn typed_private_use_chars_are_dropped() {
         let mut prompt = Prompt::default();
-        prompt.insert('\u{E000}');
-        prompt.paste("\u{E001}", 10);
-        assert_eq!(prompt.text(), "");
+        prompt.insert('\u{100000}');
+        prompt.paste("\u{100001}\u{E0A0}", 10);
+        assert_eq!(prompt.text(), "\u{E0A0}");
+    }
+
+    #[test]
+    fn trimmed_keeps_only_the_pastes_still_in_the_text() {
+        let mut prompt = Prompt::default();
+        prompt.paste("deleted paste", 5);
+        prompt.backspace();
+        prompt.paste("kept paste", 5);
+        prompt.insert(' ');
+
+        let trimmed = prompt.trimmed();
+        assert_eq!(trimmed.pastes, ["kept paste"]);
+        assert_eq!(trimmed.expanded(), "kept paste");
+    }
+
+    #[test]
+    fn a_blank_long_paste_is_empty() {
+        let mut prompt = Prompt::default();
+        prompt.paste(&" ".repeat(20), 5);
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn pieces_split_adjacent_pastes() {
+        let mut prompt = Prompt::default();
+        prompt.paste("first paste", 5);
+        prompt.paste("second paste", 5);
+        assert_eq!(
+            prompt.pieces(0..prompt.text().len()),
+            [
+                Piece::Paste("[pasted 11 chars]".into()),
+                Piece::Paste("[pasted 12 chars]".into())
+            ]
+        );
     }
 
     #[test]

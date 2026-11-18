@@ -211,7 +211,6 @@ impl App {
             (KeyCode::Right, _) => input.right(),
             (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => input.home(),
             (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => input.end(),
-            // On the first or last row, step through the prompts sent before.
             (KeyCode::Up, _) if !input.up(self.view.input_width) => self.recall_older(),
             (KeyCode::Down, _) if !input.down(self.view.input_width) => self.recall_newer(),
             _ => {}
@@ -293,9 +292,9 @@ impl App {
         if self.turn.is_some() {
             return None;
         }
-        let text = self.queued.take()?;
+        let prompt = self.queued.take()?;
         self.turn = Some(Turn::new(Instant::now()));
-        Some(Action::Submit(text))
+        Some(Action::Submit(prompt))
     }
 
     /// Pasted text goes into the input, newlines and all; a waiting change
@@ -436,6 +435,7 @@ impl App {
                     if !typed.text().is_empty() {
                         self.input.push_line(&typed);
                     }
+                    self.recall = None;
                 }
                 committed
             }
@@ -1075,6 +1075,22 @@ mod tests {
         app.on_key(key(KeyCode::Up));
         app.on_key(key(KeyCode::Up));
         assert_eq!(app.input.text(), "one");
+    }
+
+    #[test]
+    fn a_cancel_that_restores_the_queue_ends_recall() {
+        let mut app = history_app();
+        app.turn = Some(Turn::new(Instant::now()));
+        type_text(&mut app, "later");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Up));
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
+        assert_eq!(app.input.text(), "later\nlater");
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.input.text(), "later\nlater");
     }
 
     #[test]

@@ -53,12 +53,9 @@ impl Screen {
         // Built first, so a failure below still restores what was set.
         let screen = Self;
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        )?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // Unsupported on the legacy Windows console, where pastes arrive as keys.
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
         // Lets terminals that support it report Shift+Enter apart from Enter.
         let _ = execute!(
             io::stdout(),
