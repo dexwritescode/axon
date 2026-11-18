@@ -5,14 +5,14 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::{cut_chars, optional_usize, read_text, required_str};
+use super::{Seen, cut_chars, optional_usize, read_text, required_str};
 use crate::jail;
 
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 32 * 1024;
 const MAX_LINE_CHARS: usize = 2000;
 
-pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
+pub(super) fn run(cwd: &Path, args: &Value) -> Result<(String, Seen), String> {
     let path = required_str(args, "path")?;
     let offset = optional_usize(args, "offset")?.unwrap_or(1).max(1);
     let limit = optional_usize(args, "limit")?
@@ -50,7 +50,7 @@ pub(super) fn run(cwd: &Path, args: &Value) -> Result<String, String> {
             last + 1
         ));
     }
-    Ok(out)
+    Ok((out, Seen::new(&file, &text)))
 }
 
 /// `line`, or its first `MAX_LINE_CHARS` chars and a note saying it was cut.
@@ -79,7 +79,7 @@ mod tests {
     }
 
     fn read(dir: &TempDir, args: Value) -> Result<String, String> {
-        run(&dir.path().canonicalize().unwrap(), &args)
+        run(&dir.path().canonicalize().unwrap(), &args).map(|(output, _)| output)
     }
 
     #[test]

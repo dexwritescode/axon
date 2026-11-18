@@ -12,6 +12,7 @@ pub(crate) use shell::{Printed, Run};
 pub(crate) use write::Write;
 
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
@@ -63,7 +64,7 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
         ),
         schema(
             "write_file",
-            "Create a file or replace its whole content; missing directories are created. The user approves every write. To change part of an existing file, use edit_file.",
+            "Create a file or replace its whole content; missing directories are created. An existing file must be read first, and read again if it changed since. The user approves every write. To change part of an existing file, use edit_file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -75,7 +76,7 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
         ),
         schema(
             "edit_file",
-            "Replace exact text in an existing file. old_string must match the file exactly, including whitespace, and only once unless replace_all is set; read the file first. The user approves every edit.",
+            "Replace exact text in an existing file. old_string must match the file exactly, including whitespace, and only once unless replace_all is set; read the file first, and again if it changed since (e.g. after a command). The user approves every edit.",
             json!({
                 "type": "object",
                 "properties": {
@@ -142,6 +143,8 @@ fn schema(name: &str, description: &str, parameters: Value) -> ChatCompletionToo
 pub(crate) enum Action {
     /// The tool ran; this is its output.
     Output(String),
+    /// `read_file` ran: its output, and the file as the model now knows it.
+    Read { output: String, seen: Seen },
     /// The tool wants to change a file, once the user approves.
     Write(Write),
     /// The tool wants to run a command, once the user approves.
@@ -156,7 +159,7 @@ pub(crate) fn run(cwd: &Path, name: &str, args: &str) -> Result<Action, String> 
         serde_json::from_str(args).map_err(|e| format!("arguments were not valid JSON: {e}"))?
     };
     match name {
-        "read_file" => read::run(cwd, &args).map(Action::Output),
+        "read_file" => read::run(cwd, &args).map(|(output, seen)| Action::Read { output, seen }),
         "list_dir" => list::run(cwd, &args).map(Action::Output),
         "grep" => grep::run(cwd, &args).map(Action::Output),
         "find" => find::run(cwd, &args).map(Action::Output),
@@ -216,6 +219,29 @@ fn cut_chars(text: &str, max: usize) -> Option<&str> {
 }
 
 /// The text of the file at `target`; `path` is how errors name it.
+/// A file's content as the model last read or wrote it, by hash, to tell
+/// whether the file changed since.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Seen {
+    pub(crate) target: PathBuf,
+    pub(crate) hash: u64,
+}
+
+impl Seen {
+    fn new(target: &Path, text: &str) -> Self {
+        Self {
+            target: target.to_path_buf(),
+            hash: hash(text),
+        }
+    }
+}
+
+fn hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn read_text(target: &Path, path: &str) -> Result<String, String> {
     let bytes = fs::read(target).map_err(|e| format!("{path}: {e}"))?;
     String::from_utf8(bytes).map_err(|_| format!("{path}: not a UTF-8 text file"))

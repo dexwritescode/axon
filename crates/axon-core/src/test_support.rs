@@ -102,6 +102,7 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
         cwd: cwd.canonicalize().unwrap(),
         max_requests: 25,
         request_pause: Duration::ZERO,
+        seen: Default::default(),
     }
 }
 

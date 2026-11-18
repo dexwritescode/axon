@@ -1,7 +1,9 @@
 //! The agent loop for one prompt: call the model, run its tool calls, repeat.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
 use crate::prompt;
-use crate::tools::{self, Action, Printed};
+use crate::tools::{self, Action, Printed, Seen};
 
 const CANCELLED: &str = "cancelled by user";
 const REJECTED: &str = "the user rejected this tool call";
@@ -38,6 +40,8 @@ pub(crate) struct Agent {
     pub(crate) max_requests: usize,
     /// Wait between a turn's model requests.
     pub(crate) request_pause: Duration,
+    /// Each file's content hash as the model last read or wrote it.
+    pub(crate) seen: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl Agent {
@@ -116,6 +120,11 @@ impl Agent {
             }
         }
         Ok(StopReason::MaxTurnRequests)
+    }
+
+    fn saw(&self, seen: Seen) {
+        let mut files = self.seen.lock().expect("seen lock");
+        files.insert(seen.target, seen.hash);
     }
 
     /// Wait `request_pause`, saying so; false if cancelled meanwhile.
@@ -211,13 +220,29 @@ impl Agent {
         let action = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
         let outcome = match action {
             Ok(Action::Output(output)) => Outcome::output(output),
-            Ok(Action::Write(write)) => match asking.ask(write.change(), events).await? {
-                Some(true) => match tokio::task::spawn_blocking(move || write.apply()).await? {
-                    Ok(output) => Outcome::output(output),
+            Ok(Action::Read { output, seen }) => {
+                self.saw(seen);
+                Outcome::output(output)
+            }
+            Ok(Action::Write(write)) => {
+                let checked = write.check(&self.seen.lock().expect("seen lock"));
+                match checked {
                     Err(error) => Outcome::failed(error),
-                },
-                answer => Outcome::not_approved(answer),
-            },
+                    Ok(()) => match asking.ask(write.change(), events).await? {
+                        Some(true) => {
+                            let seen = write.seen_after();
+                            match tokio::task::spawn_blocking(move || write.apply()).await? {
+                                Ok(output) => {
+                                    self.saw(seen);
+                                    Outcome::output(output)
+                                }
+                                Err(error) => Outcome::failed(error),
+                            }
+                        }
+                        answer => Outcome::not_approved(answer),
+                    },
+                }
+            }
             Ok(Action::Run(run)) => match asking.ask(run.change(), events).await? {
                 Some(true) => match run.execute(&self.cwd, asking.cancel).await {
                     Ok((printed, exit)) => Outcome::command(printed, exit),
@@ -379,16 +404,92 @@ mod tests {
     use wiremock::MockServer;
 
     /// A session working in a temp dir that holds `notes.txt`.
+    /// A session in a directory holding notes.txt, which the model has read.
     async fn session_with_notes(max_requests: usize) -> (MockServer, TempDir, SessionHandle) {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("notes.txt"), "remember the milk\n").unwrap();
-        let handle = spawn_started(Agent {
+        let agent = Agent {
             max_requests,
             ..agent(&server, dir.path())
-        })
-        .await;
+        };
+        has_read(&agent, "notes.txt");
+        let handle = spawn_started(agent).await;
         (server, dir, handle)
+    }
+
+    fn has_read(agent: &Agent, path: &str) {
+        let args = json!({ "path": path }).to_string();
+        let Ok(Action::Read { seen, .. }) = tools::run(&agent.cwd, "read_file", &args) else {
+            panic!("couldn't read {path}");
+        };
+        agent.saw(seen);
+    }
+
+    #[tokio::test]
+    async fn changing_a_file_the_model_has_not_read_fails_without_asking() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("notes.txt"), "remember the milk\n").unwrap();
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+        let args = r#"{"path":"notes.txt","content":"tea\n"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        respond(&server, reply(&["Ok."])).await;
+
+        let events = prompt(&mut handle, "write").await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ApprovalRequested { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "error: notes.txt: read it before changing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_a_file_that_changed_since_it_was_read_fails_without_asking() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        fs::write(dir.path().join("notes.txt"), "remember the bread\n").unwrap();
+        let args = r#"{"path":"notes.txt","old_string":"bread","new_string":"eggs"}"#;
+        respond(&server, tool_calls(&[("c1", "edit_file", args)])).await;
+        respond(&server, reply(&["Ok."])).await;
+
+        let events = prompt(&mut handle, "edit").await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ApprovalRequested { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "error: notes.txt: changed since you last read it; read it again before changing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_the_model_wrote_can_be_changed_again() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        let first = r#"{"path":"notes.txt","old_string":"milk","new_string":"eggs"}"#;
+        let second = r#"{"path":"notes.txt","old_string":"eggs","new_string":"tea"}"#;
+        respond(
+            &server,
+            tool_calls(&[("c1", "edit_file", first), ("c2", "edit_file", second)]),
+        )
+        .await;
+        respond(&server, reply(&["Done."])).await;
+
+        prompt_answering(&mut handle, "edit twice", Some(true)).await;
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "remember the tea\n"
+        );
     }
 
     #[tokio::test]

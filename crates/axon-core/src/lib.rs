@@ -63,6 +63,7 @@ impl SessionFactory for CoreFactory {
                 cwd,
                 max_requests: MAX_TURN_REQUESTS,
                 request_pause: self.config.request_pause,
+                seen: Default::default(),
             },
             async move { context::discover(&http, backend, &base_url, &api_key, &model).await },
         ))
