@@ -18,6 +18,8 @@ pub(crate) struct App {
     pub(crate) input: Prompt,
     /// The reply streaming in for the current turn.
     pub(crate) streaming_text: String,
+    /// The model's reasoning streaming in, until its reply or a tool call starts.
+    pub(crate) streaming_reasoning: String,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
@@ -76,6 +78,11 @@ pub(crate) struct Finished {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Activity {
     Thinking,
+    /// The model is streaming a call to this tool; `bytes` of arguments so far.
+    Writing {
+        name: String,
+        bytes: usize,
+    },
     Running(String),
     Approving,
     /// Waiting between model requests until the turn's `elapsed` reaches
@@ -111,6 +118,8 @@ pub(crate) enum Action {
 pub(crate) enum Committed {
     User(String),
     Agent(String),
+    /// The model's reasoning before a reply or tool call.
+    Thought(String),
     ToolCall {
         name: String,
         args: String,
@@ -258,9 +267,17 @@ impl App {
 
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
         match event {
+            Event::ReasoningDelta { text } => {
+                self.streaming_reasoning.push_str(&text);
+                Vec::new()
+            }
             Event::TextDelta { text } => {
                 self.streaming_text.push_str(&text);
-                Vec::new()
+                self.take_thought().into_iter().collect()
+            }
+            Event::ToolCallStreaming { name, bytes } => {
+                self.set_activity(Activity::Writing { name, bytes });
+                self.take_thought().into_iter().collect()
             }
             Event::ToolCallStarted { id, name, args } => {
                 self.set_activity(Activity::Running(name.clone()));
@@ -324,14 +341,21 @@ impl App {
         }
     }
 
+    /// The reasoning so far, then the reply so far.
     fn take_reply(&mut self) -> Vec<Committed> {
+        let mut committed: Vec<_> = self.take_thought().into_iter().collect();
         let text = mem::take(&mut self.streaming_text);
         let text = text.trim();
-        if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![Committed::Agent(text.into())]
+        if !text.is_empty() {
+            committed.push(Committed::Agent(text.into()));
         }
+        committed
+    }
+
+    fn take_thought(&mut self) -> Option<Committed> {
+        let text = mem::take(&mut self.streaming_reasoning);
+        let text = text.trim();
+        (!text.is_empty()).then(|| Committed::Thought(text.into()))
     }
 }
 
@@ -584,6 +608,45 @@ mod tests {
 
         assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("too many")));
         assert!(app.turn.is_none());
+    }
+
+    #[test]
+    fn reasoning_streams_then_commits_when_the_reply_starts() {
+        let mut app = busy_app();
+
+        assert!(
+            app.on_event(Event::ReasoningDelta { text: "Hmm".into() })
+                .is_empty()
+        );
+        assert_eq!(app.streaming_reasoning, "Hmm");
+
+        let committed = app.on_event(Event::TextDelta { text: "391".into() });
+
+        assert_eq!(committed, [Committed::Thought("Hmm".into())]);
+        assert!(app.streaming_reasoning.is_empty());
+        assert_eq!(app.streaming_text, "391");
+    }
+
+    #[test]
+    fn a_streaming_tool_call_shows_its_size_and_commits_the_reasoning() {
+        let mut app = busy_app();
+        app.on_event(Event::ReasoningDelta {
+            text: "I'll edit it.".into(),
+        });
+
+        let committed = app.on_event(Event::ToolCallStreaming {
+            name: "edit_file".into(),
+            bytes: 3200,
+        });
+
+        assert_eq!(committed, [Committed::Thought("I'll edit it.".into())]);
+        assert_eq!(
+            app.turn.unwrap().activity,
+            Activity::Writing {
+                name: "edit_file".into(),
+                bytes: 3200
+            }
+        );
     }
 
     #[test]

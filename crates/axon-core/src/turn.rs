@@ -172,7 +172,18 @@ impl Agent {
                     reply.text.push_str(&delta);
                     events.send(Event::TextDelta { text: delta }).await?;
                 }
-                Delta::ToolCall(chunk) => calls.push(chunk),
+                Delta::Reasoning(text) => {
+                    events.send(Event::ReasoningDelta { text }).await?;
+                }
+                Delta::ToolCall(chunk) => {
+                    calls.push(chunk);
+                    if let Some((name, bytes)) = calls.latest() {
+                        let name = name.to_string();
+                        events
+                            .send(Event::ToolCallStreaming { name, bytes })
+                            .await?;
+                    }
+                }
                 Delta::Truncated => reply.truncated = true,
             }
         }
@@ -513,6 +524,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_and_tool_call_progress_reach_the_frontend() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        respond(
+            &server,
+            sse(&[chunk(json!({"reasoning_content": "Let me list."}), None)]),
+        )
+        .await;
+        let mut handle = crate::session::spawn(agent(&server, dir.path()), async { None });
+        handle.events.recv().await;
+        handle
+            .commands
+            .send(Command::Prompt { text: "hi".into() })
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.events.recv().await,
+            Some(Event::ReasoningDelta {
+                text: "Let me list.".into()
+            })
+        );
+
+        respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "list".into(),
+            })
+            .await
+            .unwrap();
+        let mut streaming = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            match event {
+                Event::ToolCallStreaming { name, bytes } => streaming.push((name, bytes)),
+                Event::ToolCallStarted { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            streaming,
+            [("list_dir".to_string(), 1), ("list_dir".to_string(), 2)]
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_cuts_a_pause_short() {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -584,14 +640,18 @@ mod tests {
                 tokio::select! {
                     stop = &mut turn => break stop.unwrap(),
                     Some(event) = received.recv() => {
-                        seen.push(event);
-                        cancel.cancel();
+                        if !matches!(event, Event::ToolCallStreaming { .. }) {
+                            seen.push(event);
+                            cancel.cancel();
+                        }
                     }
                 }
             }
         };
         while let Ok(event) = received.try_recv() {
-            seen.push(event);
+            if !matches!(event, Event::ToolCallStreaming { .. }) {
+                seen.push(event);
+            }
         }
         (stop, seen, history)
     }

@@ -222,6 +222,7 @@ dependencies = [
  "process-wrap",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

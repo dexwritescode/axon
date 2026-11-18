@@ -20,6 +20,7 @@ use crate::prompt::Prompt;
 use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
+const THINK: &str = "Think ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
@@ -62,6 +63,10 @@ fn committed(line: &Committed, width: u16, diff_rows: usize) -> Paragraph<'stati
         Committed::Error(text) => ("Error ", theme::ERROR, text),
         Committed::Cancelled => {
             return Paragraph::new(Line::from("  ✗   cancelled").fg(theme::ERROR));
+        }
+        Committed::Thought(text) => {
+            let line = format!("  ✻   thought · {} chars", size(text.chars().count()));
+            return Paragraph::new(Line::from(line).fg(theme::MUTED));
         }
         Committed::Change(Change::WriteFile {
             path,
@@ -210,6 +215,14 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
         };
         committed(line, area.width, diff_rows)
     }));
+    let reasoning = app.streaming_reasoning.trim_start();
+    if !reasoning.is_empty() {
+        items.push(
+            Paragraph::new(labelled(THINK, theme::MUTED, reasoning))
+                .fg(theme::MUTED)
+                .wrap(Wrap { trim: false }),
+        );
+    }
     let reply = app.streaming_text.trim_start();
     if !reply.is_empty() {
         items.push(Paragraph::new(labelled(AGENT, theme::AGENT, reply)).wrap(Wrap { trim: false }));
@@ -290,6 +303,13 @@ fn activity(turn: &Turn) -> Line<'static> {
     let took = elapsed(turn.elapsed);
     let text = match &turn.activity {
         Activity::Thinking => format!("Thinking… {took} · Esc to cancel"),
+        Activity::Writing { name, bytes: 0 } => format!("Writing {name}… {took} · Esc to cancel"),
+        Activity::Writing { name, bytes } => {
+            format!(
+                "Writing {name}… {} · {took} · Esc to cancel",
+                bytes_size(*bytes)
+            )
+        }
         Activity::Running(tool) => format!("Running {tool}… {took} · Esc to cancel"),
         Activity::Approving => format!("Waiting for approval… {took}"),
         Activity::Cooling { until } if turn.elapsed < *until => {
@@ -325,6 +345,24 @@ fn status(color: Color, mark: char, text: String) -> Line<'static> {
         Span::from(format!("{mark} ")).fg(color),
         Span::from(text).fg(theme::MUTED),
     ])
+}
+
+/// `950` or `4.1k`.
+fn size(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+/// `950 B` or `3.2 KB`.
+fn bytes_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
 }
 
 /// `2m 5s`, to the second.
@@ -576,6 +614,56 @@ mod tests {
 
         turn.activity = Activity::Cancelling;
         assert_eq!(activity(&turn).to_string(), "⠙ Cancelling…");
+    }
+
+    #[test]
+    fn activity_row_shows_a_streaming_tool_call_and_its_size() {
+        let mut turn = busy_turn();
+        turn.activity = Activity::Writing {
+            name: "edit_file".into(),
+            bytes: 3277,
+        };
+        turn.elapsed = Duration::from_secs(12);
+
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Writing edit_file… 3.2 KB · 12s · Esc to cancel"
+        );
+
+        turn.activity = Activity::Writing {
+            name: "edit_file".into(),
+            bytes: 0,
+        };
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Writing edit_file… 12s · Esc to cancel"
+        );
+    }
+
+    #[test]
+    fn a_thought_commits_as_one_line_with_its_size() {
+        let thought = Committed::Thought("x".repeat(4100));
+
+        assert_eq!(
+            text(committed(&thought, 80, COMMITTED_DIFF_ROWS), 80),
+            ["  ✻   thought · 4.1k chars"]
+        );
+    }
+
+    #[test]
+    fn streaming_reasoning_shows_muted_above_the_reply() {
+        let mut app = app("", "");
+        app.turn = Some(busy_turn());
+        app.streaming_reasoning = "Let me check.".into();
+
+        let screen = render(&app, &[], 40, 14);
+
+        let row = screen
+            .rows
+            .iter()
+            .position(|r| r == "Think Let me check.")
+            .unwrap();
+        assert_eq!(screen.buffer[(6, row as u16)].fg, theme::MUTED);
     }
 
     #[test]

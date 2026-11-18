@@ -50,6 +50,7 @@ async fn live_backend_reports_its_context_and_answers() {
         let delta = delta.unwrap();
         match delta {
             Delta::Text(text) => reply.push_str(&text),
+            Delta::Reasoning(_) => {}
             Delta::ToolCall(chunk) => {
                 if let Some(function) = &chunk.function
                     && let Some(name) = &function.name

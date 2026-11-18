@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use axon_protocol::{Command, Event, SessionHandle, StopReason};
+use tokio::sync::mpsc;
 
 use crate::backend::Backend;
 use crate::model::{ModelClient, ModelConfig};
@@ -104,14 +105,33 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
     }
 }
 
-/// Start a session with no context limit (for tests).
+/// Start a session with no context limit, past its first event and without
+/// tool-call progress events, which only `turn`'s progress test checks.
 pub(crate) async fn spawn_started(agent: Agent) -> SessionHandle {
-    let mut handle = crate::session::spawn(agent, async { None });
-    assert_eq!(
-        handle.events.recv().await,
-        Some(Event::ContextLimit { tokens: None })
-    );
-    handle
+    let SessionHandle {
+        commands,
+        events: mut all,
+    } = crate::session::spawn(agent, async { None });
+    assert_eq!(all.recv().await, Some(Event::ContextLimit { tokens: None }));
+    let (tx, events) = mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = tx.closed() => break,
+                event = all.recv() => event,
+            };
+            match event {
+                Some(Event::ToolCallStreaming { .. }) => {}
+                Some(event) => {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    });
+    SessionHandle { commands, events }
 }
 
 pub(crate) fn end(stop: StopReason) -> Event {

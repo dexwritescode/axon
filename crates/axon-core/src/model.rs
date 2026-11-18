@@ -15,6 +15,7 @@ use async_openai::{
     },
 };
 use futures::{Stream, StreamExt, stream};
+use serde::Deserialize;
 
 use crate::backend::Backend;
 
@@ -47,6 +48,8 @@ impl fmt::Debug for ModelConfig {
 #[derive(Debug)]
 pub(crate) enum Delta {
     Text(String),
+    /// A piece of the model's reasoning.
+    Reasoning(String),
     /// A fragment of a tool call; `ToolCalls` puts them back together.
     ToolCall(ChatCompletionMessageToolCallChunk),
     /// The reply hit `max_tokens` and was cut off.
@@ -81,6 +84,12 @@ impl ToolCalls {
         }
     }
 
+    /// The call being streamed: its name and the bytes of arguments so far.
+    pub(crate) fn latest(&self) -> Option<(&str, usize)> {
+        let (_, call) = self.0.last_key_value()?;
+        (!call.name.is_empty()).then_some((call.name.as_str(), call.args.len()))
+    }
+
     /// The calls in the order the model made them.
     pub(crate) fn finish(self) -> Vec<ToolCall> {
         self.0.into_values().collect()
@@ -107,7 +116,7 @@ impl ModelClient {
         }
     }
 
-    /// Stream the model's reply: text deltas and tool-call fragments, in order.
+    /// Stream the model's reply: reasoning, text and tool-call fragments, in order.
     /// Dropping the stream cancels the request.
     pub(crate) async fn stream_chat(
         &self,
@@ -125,7 +134,11 @@ impl ModelClient {
             _ => request.max_completion_tokens(self.max_tokens),
         };
         let request = request.build()?;
-        let stream = self.inner.chat().create_stream(request).await?;
+        let stream = self
+            .inner
+            .chat()
+            .create_stream_byot::<_, Chunk>(request)
+            .await?;
 
         Ok(stream.flat_map(|chunk| {
             let deltas: Vec<Result<Delta>> = match chunk {
@@ -134,11 +147,14 @@ impl ModelClient {
                     .choices
                     .into_iter()
                     .flat_map(|choice| {
+                        let reasoning = choice.delta.reasoning.filter(|text| !text.is_empty());
                         let text = choice.delta.content.filter(|text| !text.is_empty());
                         let calls = choice.delta.tool_calls.unwrap_or_default();
                         let truncated = choice.finish_reason == Some(FinishReason::Length);
-                        text.map(Delta::Text)
+                        reasoning
+                            .map(Delta::Reasoning)
                             .into_iter()
+                            .chain(text.map(Delta::Text))
                             .chain(calls.into_iter().map(Delta::ToolCall))
                             .chain(truncated.then_some(Delta::Truncated))
                     })
@@ -148,6 +164,28 @@ impl ModelClient {
             stream::iter(deltas)
         }))
     }
+}
+
+/// A streamed chunk, read with the reasoning that async-openai's own type drops.
+/// `choices` is required, so an error object in its place fails to parse.
+#[derive(Deserialize)]
+struct Chunk {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    delta: ChunkDelta,
+    finish_reason: Option<FinishReason>,
+}
+
+#[derive(Deserialize)]
+struct ChunkDelta {
+    content: Option<String>,
+    /// `reasoning_content` from LM Studio, llama.cpp and vLLM; `reasoning` from Ollama.
+    #[serde(alias = "reasoning_content")]
+    reasoning: Option<String>,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
 }
 
 /// A server that fails mid-stream sends an error object where a chunk should
@@ -196,6 +234,7 @@ mod tests {
         for delta in stream.collect::<Vec<_>>().await {
             match delta? {
                 Delta::Text(text) => texts.push(text),
+                Delta::Reasoning(text) => texts.push(format!("<reasoning>{text}")),
                 Delta::ToolCall(chunk) => calls.push(chunk),
                 Delta::Truncated => texts.push("<truncated>".into()),
             }
@@ -209,6 +248,21 @@ mod tests {
             name: name.into(),
             args: args.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn reasoning_streams_under_either_field_name() {
+        let chunks = [
+            chunk(json!({"reasoning_content": "Hmm"}), None),
+            chunk(json!({"reasoning": ", so"}), None),
+            chunk(json!({"content": "391"}), None),
+        ];
+        let (_server, client) = client_for(sse(&chunks)).await;
+
+        assert_eq!(
+            collect(&client).await.unwrap().0,
+            ["<reasoning>Hmm", "<reasoning>, so", "391"]
+        );
     }
 
     #[tokio::test]
