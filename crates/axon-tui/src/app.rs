@@ -351,6 +351,7 @@ impl App {
 
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
         match event {
+            Event::UserMessage { .. } => Vec::new(),
             Event::ReasoningDelta { text } => {
                 self.streaming_reasoning.push_str(&text);
                 Vec::new()

@@ -1,5 +1,6 @@
 //! One conversation: a task that owns the history and runs a turn per prompt.
 
+use std::collections::VecDeque;
 use std::pin::pin;
 
 use anyhow::Result;
@@ -38,59 +39,84 @@ async fn run(
 
     let mut history: Vec<ChatCompletionRequestMessage> = Vec::new();
     let mut last_call = 0;
+    let mut leftover = VecDeque::new();
 
-    while let Some(command) = commands.recv().await {
-        match command {
-            Command::Prompt { text } => {
-                let before = history.len();
-                history.push(ChatCompletionRequestMessage::User(text.into()));
-                let result =
-                    turn(&agent, &mut history, &mut last_call, &mut commands, &events).await;
-                let stop = match result {
-                    Ok(stop) => stop,
-                    Err(e) => {
-                        history.truncate(before);
-                        let message = format!("{e:#}");
-                        if events.send(Event::Error { message }).await.is_err() {
-                            return;
-                        }
-                        StopReason::EndTurn
-                    }
-                };
-                if events.send(Event::TurnEnded { stop }).await.is_err() {
+    loop {
+        let text = match leftover.pop_front() {
+            Some(text) => text,
+            None => match commands.recv().await {
+                Some(Command::Prompt { text }) => text,
+                Some(Command::Cancel | Command::Approval { .. }) => continue,
+                None => return,
+            },
+        };
+        let before = history.len();
+        history.push(ChatCompletionRequestMessage::User(text.clone().into()));
+        if events.send(Event::UserMessage { text }).await.is_err() {
+            return;
+        }
+        let (steer, mut steers) = mpsc::unbounded_channel();
+        for text in leftover.drain(..) {
+            let _ = steer.send(text);
+        }
+        let result = turn(
+            &agent,
+            &mut history,
+            &mut last_call,
+            &mut commands,
+            (&steer, &mut steers),
+            &events,
+        )
+        .await;
+        while let Ok(text) = steers.try_recv() {
+            leftover.push_back(text);
+        }
+        let stop = match result {
+            Ok(stop) => stop,
+            Err(e) => {
+                history.truncate(before);
+                let message = format!("{e:#}");
+                if events.send(Event::Error { message }).await.is_err() {
                     return;
                 }
+                StopReason::EndTurn
             }
-            Command::Cancel | Command::Approval { .. } => {}
+        };
+        if events.send(Event::TurnEnded { stop }).await.is_err() || commands.is_closed() {
+            return;
         }
     }
 }
 
 /// Run a turn while still serving commands: `Cancel` stops it, approvals go
-/// to it, and a second `Prompt` is refused. If the frontend goes away, the
-/// turn is cancelled.
+/// to it, and a `Prompt` joins it before its next model request. If the
+/// frontend goes away, the turn is cancelled.
 async fn turn(
     agent: &Agent,
     history: &mut Vec<ChatCompletionRequestMessage>,
     last_call: &mut u64,
     commands: &mut mpsc::Receiver<Command>,
+    (steer, steers): (
+        &mpsc::UnboundedSender<String>,
+        &mut mpsc::UnboundedReceiver<String>,
+    ),
     events: &mpsc::Sender<Event>,
 ) -> Result<StopReason> {
     let cancel = CancellationToken::new();
     let (approve, mut approvals) = mpsc::unbounded_channel();
-    let mut turn = pin!(agent.turn(history, events, &mut approvals, last_call, &cancel));
+    let mut turn = pin!(agent.turn(history, events, &mut approvals, steers, last_call, &cancel));
     let mut frontend_open = true;
     loop {
         tokio::select! {
+            biased;
             result = &mut turn => return result,
             command = commands.recv(), if frontend_open => match command {
                 Some(Command::Cancel) => cancel.cancel(),
                 Some(Command::Approval { id, approve: yes }) => {
                     let _ = approve.send(Approval { id, approve: yes });
                 }
-                Some(Command::Prompt { .. }) => {
-                    let message = "a turn is already running".to_string();
-                    let _ = events.send(Event::Error { message }).await;
+                Some(Command::Prompt { text }) => {
+                    let _ = steer.send(text);
                 }
                 None => {
                     frontend_open = false;
@@ -105,11 +131,12 @@ async fn turn(
 mod tests {
     use super::*;
     use crate::test_support::{
-        agent, delta, end, prompt, reply, respond, sent_messages, spawn_started,
+        agent, delta, end, prompt, reply, respond, sent_messages, spawn_started, tool_calls,
     };
     use serde_json::json;
     use std::path::Path;
     use std::time::Duration;
+    use tempfile::TempDir;
     use wiremock::matchers::body_string_contains;
     use wiremock::{Mock, MockServer};
 
@@ -166,12 +193,106 @@ mod tests {
             .expect("session should stop");
     }
 
+    /// Collect events up to and including the `turns`th `TurnEnded`, leaving
+    /// out tool call events. Each approval request is met with a "steer"
+    /// prompt, then answered with `approve`.
+    async fn turns(handle: &mut SessionHandle, turns: usize, approve: bool) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut ended = 0;
+        while ended < turns {
+            let event = tokio::time::timeout(Duration::from_secs(5), handle.events.recv())
+                .await
+                .expect("turn should end")
+                .unwrap();
+            if let Event::ApprovalRequested { id, .. } = event {
+                let steer = Command::Prompt {
+                    text: "steer".into(),
+                };
+                handle.commands.send(steer).await.unwrap();
+                handle
+                    .commands
+                    .send(Command::Approval { id, approve })
+                    .await
+                    .unwrap();
+            }
+            ended += usize::from(matches!(event, Event::TurnEnded { .. }));
+            if matches!(
+                event,
+                Event::UserMessage { .. } | Event::TextDelta { .. } | Event::TurnEnded { .. }
+            ) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn user(text: &str) -> Event {
+        Event::UserMessage { text: text.into() }
+    }
+
+    async fn write(handle: &SessionHandle, path: &str) {
+        let text = format!("write {path}");
+        handle
+            .commands
+            .send(Command::Prompt { text })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
-    async fn cancel_stops_a_turn_waiting_on_the_model_and_refuses_a_second_prompt() {
+    async fn a_prompt_sent_during_a_turn_joins_it_before_the_next_request() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let args = r#"{"path":"a.txt","content":"x"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        respond(&server, reply(&["done"])).await;
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        write(&handle, "a.txt").await;
+
+        assert_eq!(
+            turns(&mut handle, 1, true).await,
+            [
+                user("write a.txt"),
+                user("steer"),
+                delta("done"),
+                end(StopReason::EndTurn)
+            ]
+        );
+        let second = &sent_messages(&server).await[1];
+        assert_eq!(second[2]["role"], "tool");
+        assert_eq!(second[3], json!({"role": "user", "content": "steer"}));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_turn_ends_without_starts_the_next_turn() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let args = r#"{"path":"b.txt","content":"x"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        respond(&server, reply(&["ok"])).await;
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        write(&handle, "b.txt").await;
+
+        assert_eq!(
+            turns(&mut handle, 2, false).await,
+            [
+                user("write b.txt"),
+                end(StopReason::EndTurn),
+                user("steer"),
+                delta("ok"),
+                end(StopReason::EndTurn)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_sent_before_a_cancel_starts_the_next_turn() {
         let server = MockServer::start().await;
         respond(&server, reply(&["late"]).set_delay(Duration::from_secs(30))).await;
         // A cancelled request isn't counted as answered, so match the next one by its prompt.
-        Mock::given(body_string_contains("after"))
+        Mock::given(body_string_contains("again"))
             .respond_with(reply(&["next"]))
             .with_priority(1)
             .mount(&server)
@@ -191,29 +312,20 @@ mod tests {
         .unwrap();
         send(Command::Cancel).await.unwrap();
 
-        let events = tokio::time::timeout(Duration::from_secs(5), async {
-            [handle.events.recv().await, handle.events.recv().await]
-        })
-        .await
-        .expect("turn should stop without waiting for the model");
         assert_eq!(
-            events,
+            turns(&mut handle, 2, true).await,
             [
-                Some(Event::Error {
-                    message: "a turn is already running".into()
-                }),
-                Some(end(StopReason::Cancelled))
+                user("slow"),
+                end(StopReason::Cancelled),
+                user("again"),
+                delta("next"),
+                end(StopReason::EndTurn)
             ]
-        );
-
-        assert_eq!(
-            prompt(&mut handle, "after").await,
-            [delta("next"), end(StopReason::EndTurn)]
         );
     }
 
     #[tokio::test]
-    async fn dropping_the_command_sender_mid_turn_cancels_it_and_stops_the_session() {
+    async fn dropping_the_command_sender_mid_turn_cancels_it_and_skips_waiting_prompts() {
         let server = MockServer::start().await;
         respond(&server, reply(&["late"]).set_delay(Duration::from_secs(30))).await;
         let SessionHandle {
@@ -225,14 +337,27 @@ mod tests {
             .send(Command::Prompt { text: "hi".into() })
             .await
             .unwrap();
+        commands
+            .send(Command::Prompt {
+                text: "steer".into(),
+            })
+            .await
+            .unwrap();
         drop(commands);
 
         let events = tokio::time::timeout(Duration::from_secs(5), async {
-            [events.recv().await, events.recv().await]
+            [
+                events.recv().await,
+                events.recv().await,
+                events.recv().await,
+            ]
         })
         .await
         .expect("turn should stop without waiting for the model");
-        assert_eq!(events, [Some(end(StopReason::Cancelled)), None]);
+        assert_eq!(
+            events,
+            [Some(user("hi")), Some(end(StopReason::Cancelled)), None]
+        );
     }
 
     #[tokio::test]

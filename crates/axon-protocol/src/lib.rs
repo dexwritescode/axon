@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 /// Sent by a frontend to a session.
 #[derive(Debug)]
 pub enum Command {
-    /// Run a turn for this user message.
+    /// Run a turn for this user message. Sent while a turn runs, it joins
+    /// that turn before its next model request, or starts the next turn if
+    /// the running one makes no further request.
     Prompt { text: String },
     /// Stop the running turn; it ends with `StopReason::Cancelled`.
     /// Does nothing while idle.
@@ -23,6 +25,9 @@ pub enum Command {
 pub enum Event {
     /// The model's context size in tokens, as the server reports it; None when it doesn't. Always the session's first event.
     ContextLimit { tokens: Option<u64> },
+    /// A `Prompt`'s text entered the model's history: first in a turn it
+    /// starts the turn, later it joins the running one.
+    UserMessage { text: String },
     /// A piece of the model's reply, in order.
     TextDelta { text: String },
     /// A piece of the model's reasoning before it replies; not part of the reply.
@@ -40,7 +45,8 @@ pub enum Event {
     ToolCallFinished { id: u64, result: ToolResult },
     /// The turn waits `secs` seconds before its next model request.
     Paused { secs: u64 },
-    /// Something went wrong; the session stays usable.
+    /// The turn failed: its messages leave the history and `TurnEnded`
+    /// follows. The session stays usable.
     Error { message: String },
     /// The turn started by the last `Prompt` is over.
     TurnEnded { stop: StopReason },

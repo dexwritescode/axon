@@ -53,12 +53,14 @@ impl Agent {
     /// File changes and commands wait for an answer on `approvals`; a
     /// rejection ends the turn, so the user can say what they want instead.
     /// Each tool call takes the next id after `last_call`, which the session
-    /// keeps across turns so an old answer can't match a new call.
+    /// keeps across turns so an old answer can't match a new call. Messages
+    /// on `steers` join `history` before each model request.
     pub(crate) async fn turn(
         &self,
         history: &mut Vec<ChatCompletionRequestMessage>,
         events: &mpsc::Sender<Event>,
         approvals: &mut mpsc::UnboundedReceiver<Approval>,
+        steers: &mut mpsc::UnboundedReceiver<String>,
         last_call: &mut u64,
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
@@ -66,6 +68,10 @@ impl Agent {
         for request in 0..self.max_requests {
             if request > 0 && !self.pause(events, cancel).await? {
                 return Ok(StopReason::Cancelled);
+            }
+            while let Ok(text) = steers.try_recv() {
+                history.push(ChatCompletionRequestMessage::User(text.clone().into()));
+                events.send(Event::UserMessage { text }).await?;
             }
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
@@ -639,6 +645,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             handle.events.recv().await,
+            Some(Event::UserMessage { text: "hi".into() })
+        );
+        assert_eq!(
+            handle.events.recv().await,
             Some(Event::ReasoningDelta {
                 text: "Let me list.".into()
             })
@@ -745,6 +755,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut history = vec![ChatCompletionRequestMessage::User("go".into())];
         let (_approve, mut approvals) = mpsc::unbounded_channel();
+        let (_steer, mut steers) = mpsc::unbounded_channel();
         let mut last_call = 0;
         let mut seen = Vec::new();
         let stop = {
@@ -752,6 +763,7 @@ mod tests {
                 &mut history,
                 &events,
                 &mut approvals,
+                &mut steers,
                 &mut last_call,
                 &cancel
             ));
@@ -989,7 +1001,7 @@ mod tests {
         .await
         .expect("cancel should kill the command");
         assert_eq!(
-            events[2..],
+            events[3..],
             [
                 finished(
                     1,
@@ -1108,11 +1120,11 @@ mod tests {
         .await
         .expect("cancel should end the wait");
         assert!(
-            matches!(events[1], Event::ApprovalRequested { id: 1, .. }),
+            matches!(events[2], Event::ApprovalRequested { id: 1, .. }),
             "{events:?}"
         );
         assert_eq!(
-            events[2..],
+            events[3..],
             [
                 finished(1, ToolResult::Rejected),
                 end(StopReason::Cancelled)
