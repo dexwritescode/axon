@@ -1,7 +1,9 @@
 //! The agent loop for one prompt: call the model, run its tool calls, repeat.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
 use crate::prompt;
-use crate::tools::{self, Action, Printed};
+use crate::tools::{self, Action, Printed, Seen};
 
 const CANCELLED: &str = "cancelled by user";
 const REJECTED: &str = "the user rejected this tool call";
@@ -38,6 +40,8 @@ pub(crate) struct Agent {
     pub(crate) max_requests: usize,
     /// Wait between a turn's model requests.
     pub(crate) request_pause: Duration,
+    /// Each file's content hash as the model last read or wrote it.
+    pub(crate) seen: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl Agent {
@@ -72,6 +76,11 @@ impl Agent {
                     history.push(assistant_message(reply.text, &[])?);
                 }
                 return Ok(StopReason::Cancelled);
+            }
+            if reply.truncated {
+                // Even when empty, so the next prompt doesn't follow a user message.
+                history.push(assistant_message(reply.text, &[])?);
+                return Ok(StopReason::MaxTokens);
             }
             history.push(assistant_message(reply.text, &reply.calls)?);
             if reply.calls.is_empty() {
@@ -110,6 +119,11 @@ impl Agent {
             }
         }
         Ok(StopReason::MaxTurnRequests)
+    }
+
+    fn saw(&self, seen: Seen) {
+        let mut files = self.seen.lock().expect("seen lock");
+        files.insert(seen.target, seen.hash);
     }
 
     /// Wait `request_pause`, saying so; false if cancelled meanwhile.
@@ -166,7 +180,18 @@ impl Agent {
                     reply.text.push_str(&delta);
                     events.send(Event::TextDelta { text: delta }).await?;
                 }
-                Delta::ToolCall(chunk) => calls.push(chunk),
+                Delta::Reasoning(text) => {
+                    events.send(Event::ReasoningDelta { text }).await?;
+                }
+                Delta::ToolCall(chunk) => {
+                    if let Some((name, bytes)) = calls.push(chunk) {
+                        let name = name.to_string();
+                        events
+                            .send(Event::ToolCallStreaming { name, bytes })
+                            .await?;
+                    }
+                }
+                Delta::Truncated => reply.truncated = true,
             }
         }
         reply.calls = calls.finish();
@@ -193,13 +218,29 @@ impl Agent {
         let action = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
         let outcome = match action {
             Ok(Action::Output(output)) => Outcome::output(output),
-            Ok(Action::Write(write)) => match asking.ask(write.change(), events).await? {
-                Some(true) => match tokio::task::spawn_blocking(move || write.apply()).await? {
-                    Ok(output) => Outcome::output(output),
+            Ok(Action::Read { output, seen }) => {
+                self.saw(seen);
+                Outcome::output(output)
+            }
+            Ok(Action::Write(write)) => {
+                let checked = write.check(&self.seen.lock().expect("seen lock"));
+                match checked {
                     Err(error) => Outcome::failed(error),
-                },
-                answer => Outcome::not_approved(answer),
-            },
+                    Ok(()) => match asking.ask(write.change(), events).await? {
+                        Some(true) => {
+                            let seen = write.seen_after();
+                            match tokio::task::spawn_blocking(move || write.apply()).await? {
+                                Ok(output) => {
+                                    self.saw(seen);
+                                    Outcome::output(output)
+                                }
+                                Err(error) => Outcome::failed(error),
+                            }
+                        }
+                        answer => Outcome::not_approved(answer),
+                    },
+                }
+            }
             Ok(Action::Run(run)) => match asking.ask(run.change(), events).await? {
                 Some(true) => match run.execute(&self.cwd, asking.cancel).await {
                     Ok((printed, exit)) => Outcome::command(printed, exit),
@@ -316,6 +357,8 @@ struct Reply {
     text: String,
     calls: Vec<ToolCall>,
     cancelled: bool,
+    /// Cut off at the token limit; its tool calls are incomplete.
+    truncated: bool,
 }
 
 fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionRequestMessage> {
@@ -346,8 +389,8 @@ fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionR
 mod tests {
     use super::*;
     use crate::test_support::{
-        agent, client_error, delta, end, prompt, prompt_answering, reply, respond, sent_messages,
-        spawn_started, tool_calls,
+        agent, chunk, client_error, delta, end, prompt, prompt_answering, reply, respond,
+        sent_messages, spawn_started, sse, tool_calls,
     };
     use axon_protocol::SessionHandle;
     use axon_protocol::{Change, Command};
@@ -358,17 +401,92 @@ mod tests {
     use tokio::sync::mpsc;
     use wiremock::MockServer;
 
-    /// A session working in a temp dir that holds `notes.txt`.
+    /// A session in a directory holding notes.txt, which the model has read.
     async fn session_with_notes(max_requests: usize) -> (MockServer, TempDir, SessionHandle) {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("notes.txt"), "remember the milk\n").unwrap();
-        let handle = spawn_started(Agent {
+        let agent = Agent {
             max_requests,
             ..agent(&server, dir.path())
-        })
-        .await;
+        };
+        has_read(&agent, "notes.txt");
+        let handle = spawn_started(agent).await;
         (server, dir, handle)
+    }
+
+    fn has_read(agent: &Agent, path: &str) {
+        let args = json!({ "path": path }).to_string();
+        let Ok(Action::Read { seen, .. }) = tools::run(&agent.cwd, "read_file", &args) else {
+            panic!("couldn't read {path}");
+        };
+        agent.saw(seen);
+    }
+
+    #[tokio::test]
+    async fn changing_a_file_the_model_has_not_read_fails_without_asking() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("notes.txt"), "remember the milk\n").unwrap();
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+        let args = r#"{"path":"notes.txt","content":"tea\n"}"#;
+        respond(&server, tool_calls(&[("c1", "write_file", args)])).await;
+        respond(&server, reply(&["Ok."])).await;
+
+        let events = prompt(&mut handle, "write").await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ApprovalRequested { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "error: notes.txt: read it before changing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_a_file_that_changed_since_it_was_read_fails_without_asking() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        fs::write(dir.path().join("notes.txt"), "remember the bread\n").unwrap();
+        let args = r#"{"path":"notes.txt","old_string":"bread","new_string":"eggs"}"#;
+        respond(&server, tool_calls(&[("c1", "edit_file", args)])).await;
+        respond(&server, reply(&["Ok."])).await;
+
+        let events = prompt(&mut handle, "edit").await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ApprovalRequested { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "error: notes.txt: changed since you last read it; read it again before changing it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_the_model_wrote_can_be_changed_again() {
+        let (server, dir, mut handle) = session_with_notes(25).await;
+        let first = r#"{"path":"notes.txt","old_string":"milk","new_string":"eggs"}"#;
+        let second = r#"{"path":"notes.txt","old_string":"eggs","new_string":"tea"}"#;
+        respond(
+            &server,
+            tool_calls(&[("c1", "edit_file", first), ("c2", "edit_file", second)]),
+        )
+        .await;
+        respond(&server, reply(&["Done."])).await;
+
+        prompt_answering(&mut handle, "edit twice", Some(true)).await;
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "remember the tea\n"
+        );
     }
 
     #[tokio::test]
@@ -484,6 +602,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_cut_at_the_token_limit_ends_the_turn_without_its_tool_calls() {
+        let server = MockServer::start().await;
+        let chunks = [
+            chunk(json!({"content": "Let me look."}), None),
+            chunk(
+                json!({"tool_calls": [{"index": 0, "id": "c", "type": "function", "function": {"name": "list_dir", "arguments": "{\"pa"}}]}),
+                Some("length"),
+            ),
+        ];
+        respond(&server, sse(&chunks)).await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        assert_eq!(
+            prompt(&mut handle, "hi").await,
+            [delta("Let me look."), end(StopReason::MaxTokens)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_tool_call_progress_reach_the_frontend() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        respond(
+            &server,
+            sse(&[chunk(json!({"reasoning_content": "Let me list."}), None)]),
+        )
+        .await;
+        let mut handle = crate::session::spawn(agent(&server, dir.path()), async { None });
+        handle.events.recv().await;
+        handle
+            .commands
+            .send(Command::Prompt { text: "hi".into() })
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.events.recv().await,
+            Some(Event::ReasoningDelta {
+                text: "Let me list.".into()
+            })
+        );
+
+        respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "list".into(),
+            })
+            .await
+            .unwrap();
+        let mut streaming = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            match event {
+                Event::ToolCallStreaming { name, bytes } => streaming.push((name, bytes)),
+                Event::ToolCallStarted { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            streaming,
+            [("list_dir".to_string(), 1), ("list_dir".to_string(), 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_before_any_text_still_answers_the_prompt() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let chunks = [chunk(json!({"reasoning_content": "Hmm"}), Some("length"))];
+        respond(&server, sse(&chunks)).await;
+        respond(&server, reply(&["ok"])).await;
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        prompt(&mut handle, "think hard").await;
+        prompt(&mut handle, "again").await;
+
+        let roles: Vec<_> = sent_messages(&server).await[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].clone())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+    }
+
+    #[tokio::test]
     async fn cancel_cuts_a_pause_short() {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
@@ -555,14 +759,18 @@ mod tests {
                 tokio::select! {
                     stop = &mut turn => break stop.unwrap(),
                     Some(event) = received.recv() => {
-                        seen.push(event);
-                        cancel.cancel();
+                        if !matches!(event, Event::ToolCallStreaming { .. }) {
+                            seen.push(event);
+                            cancel.cancel();
+                        }
                     }
                 }
             }
         };
         while let Ok(event) = received.try_recv() {
-            seen.push(event);
+            if !matches!(event, Event::ToolCallStreaming { .. }) {
+                seen.push(event);
+            }
         }
         (stop, seen, history)
     }

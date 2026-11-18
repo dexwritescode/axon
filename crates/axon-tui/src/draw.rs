@@ -1,7 +1,8 @@
 //! Drawing with ratatui on the full screen: the history pane (logo, finished
 //! lines, the streaming reply), the activity row, a separator and the input.
-//! While a change waits for approval, its diff or command is in the history
-//! and a y/n prompt replaces the input.
+//! While a change waits for approval, its whole diff or command is in the
+//! history and a y/n prompt replaces the input; once answered, the diff is cut
+//! to `COMMITTED_DIFF_ROWS`.
 
 use std::time::Duration;
 
@@ -19,13 +20,15 @@ use crate::prompt::Prompt;
 use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
+const THINK: &str = "Think ";
+const QUEUED: &str = "Next  ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Tool lines show at most this many chars of args or output.
 const TOOL_PREVIEW: usize = 120;
-/// A change shows at most this many rows of its diff.
+/// An answered change shows at most this many rows of its diff.
 const COMMITTED_DIFF_ROWS: usize = 20;
 /// The input shows at most this many rows; longer input scrolls.
 const INPUT_ROWS: usize = 5;
@@ -52,8 +55,9 @@ fn logo() -> Paragraph<'static> {
     )
 }
 
-/// A finished line for the history. Text wraps; tool lines are cut to the width.
-fn committed(line: &Committed, width: u16) -> Paragraph<'static> {
+/// A finished line for the history. Text wraps; tool lines are cut to the
+/// width and a change's diff to `diff_rows`.
+fn committed(line: &Committed, width: u16, diff_rows: usize) -> Paragraph<'static> {
     let (name, color, text) = match line {
         Committed::User(text) => ("You   ", theme::USER, text),
         Committed::Agent(text) => (AGENT, theme::AGENT, text),
@@ -61,19 +65,17 @@ fn committed(line: &Committed, width: u16) -> Paragraph<'static> {
         Committed::Cancelled => {
             return Paragraph::new(Line::from("  ✗   cancelled").fg(theme::ERROR));
         }
+        Committed::Thought(text) => {
+            let line = format!("  ✻   thought · {} chars", size(text.chars().count()));
+            return Paragraph::new(Line::from(line).fg(theme::MUTED));
+        }
         Committed::Change(Change::WriteFile {
             path,
             old_text,
             new_text,
         }) => {
             let width = usize::from(width.max(1));
-            let lines = diff::lines(
-                path,
-                old_text.as_deref(),
-                new_text,
-                width,
-                COMMITTED_DIFF_ROWS,
-            );
+            let lines = diff::lines(path, old_text.as_deref(), new_text, width, diff_rows);
             return Paragraph::new(lines);
         }
         Committed::Change(Change::RunCommand { command }) => ("  $   ", theme::INPUT, command),
@@ -204,10 +206,34 @@ pub(crate) fn screen(frame: &mut Frame, app: &App, history: &[Committed]) -> Vie
 /// past that, `app.scroll` picks the rows shown.
 fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed]) -> View {
     let mut items = vec![logo()];
-    items.extend(history.iter().map(|line| committed(line, area.width)));
+    // The change waiting for approval is the last line; show all of it.
+    let pending = app.approval.map(|_| history.len().saturating_sub(1));
+    items.extend(history.iter().enumerate().map(|(i, line)| {
+        let diff_rows = if Some(i) == pending {
+            usize::MAX
+        } else {
+            COMMITTED_DIFF_ROWS
+        };
+        committed(line, area.width, diff_rows)
+    }));
+    let reasoning = app.streaming_reasoning.trim_start();
+    if !reasoning.is_empty() {
+        items.push(
+            Paragraph::new(labelled(THINK, theme::MUTED, reasoning))
+                .fg(theme::MUTED)
+                .wrap(Wrap { trim: false }),
+        );
+    }
     let reply = app.streaming_text.trim_start();
     if !reply.is_empty() {
         items.push(Paragraph::new(labelled(AGENT, theme::AGENT, reply)).wrap(Wrap { trim: false }));
+    }
+    if let Some(queued) = &app.queued {
+        items.push(
+            Paragraph::new(labelled(QUEUED, theme::MUTED, queued))
+                .fg(theme::MUTED)
+                .wrap(Wrap { trim: false }),
+        );
     }
     let heights: Vec<u32> = items
         .iter()
@@ -285,6 +311,13 @@ fn activity(turn: &Turn) -> Line<'static> {
     let took = elapsed(turn.elapsed);
     let text = match &turn.activity {
         Activity::Thinking => format!("Thinking… {took} · Esc to cancel"),
+        Activity::Writing { name, bytes: 0 } => format!("Writing {name}… {took} · Esc to cancel"),
+        Activity::Writing { name, bytes } => {
+            format!(
+                "Writing {name}… {} · {took} · Esc to cancel",
+                bytes_size(*bytes)
+            )
+        }
         Activity::Running(tool) => format!("Running {tool}… {took} · Esc to cancel"),
         Activity::Approving => format!("Waiting for approval… {took}"),
         Activity::Cooling { until } if turn.elapsed < *until => {
@@ -302,7 +335,7 @@ fn finished_line(finished: &Finished, context_limit: Option<u64>) -> Line<'stati
     let (color, mark, word) = match finished.stop {
         StopReason::EndTurn => (theme::DONE, '✓', "Finished"),
         StopReason::Cancelled => (theme::ERROR, '✗', "Cancelled"),
-        StopReason::MaxTurnRequests => (theme::ERROR, '✗', "Stopped"),
+        StopReason::MaxTurnRequests | StopReason::MaxTokens => (theme::ERROR, '✗', "Stopped"),
     };
     let at = finished.at.format("%H:%M");
     let took = elapsed(finished.took);
@@ -320,6 +353,24 @@ fn status(color: Color, mark: char, text: String) -> Line<'static> {
         Span::from(format!("{mark} ")).fg(color),
         Span::from(text).fg(theme::MUTED),
     ])
+}
+
+/// `950` or `4.1k`.
+fn size(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+/// `950 B` or `3.2 KB`.
+fn bytes_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
 }
 
 /// `2m 5s`, to the second.
@@ -574,6 +625,73 @@ mod tests {
     }
 
     #[test]
+    fn activity_row_shows_a_streaming_tool_call_and_its_size() {
+        let mut turn = busy_turn();
+        turn.activity = Activity::Writing {
+            name: "edit_file".into(),
+            bytes: 3277,
+        };
+        turn.elapsed = Duration::from_secs(12);
+
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Writing edit_file… 3.2 KB · 12s · Esc to cancel"
+        );
+
+        turn.activity = Activity::Writing {
+            name: "edit_file".into(),
+            bytes: 0,
+        };
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Writing edit_file… 12s · Esc to cancel"
+        );
+    }
+
+    #[test]
+    fn a_thought_commits_as_one_line_with_its_size() {
+        let thought = Committed::Thought("x".repeat(4100));
+
+        assert_eq!(
+            text(committed(&thought, 80, COMMITTED_DIFF_ROWS), 80),
+            ["  ✻   thought · 4.1k chars"]
+        );
+    }
+
+    #[test]
+    fn a_queued_prompt_shows_muted_below_the_reply() {
+        let mut app = app("Working on it.", "");
+        app.turn = Some(busy_turn());
+        app.queued = Some("then run the tests".into());
+
+        let screen = render(&app, &[], 40, 14);
+
+        let reply = screen
+            .rows
+            .iter()
+            .position(|r| r == "Agent Working on it.")
+            .unwrap();
+        assert_eq!(screen.rows[reply + 1], "Next  then run the tests");
+        assert_eq!(screen.buffer[(6, reply as u16 + 1)].fg, theme::MUTED);
+    }
+
+    #[test]
+    fn streaming_reasoning_shows_muted_above_the_reply() {
+        let mut app = app("", "");
+        app.turn = Some(busy_turn());
+        app.streaming_reasoning = "Let me check.".into();
+
+        let screen = render(&app, &[], 40, 14);
+
+        let row = screen
+            .rows
+            .iter()
+            .position(|r| r == "Think Let me check.")
+            .unwrap();
+        assert_eq!(screen.buffer[(6, row as u16)].fg, theme::MUTED);
+    }
+
+    #[test]
     fn activity_row_counts_down_a_pause_then_thinks() {
         let mut turn = busy_turn();
         turn.activity = Activity::Cooling {
@@ -609,7 +727,7 @@ mod tests {
             result: ToolResult::Failed("x".repeat(100)),
         };
 
-        let rows = text(committed(&failed, 30), 30);
+        let rows = text(committed(&failed, 30, COMMITTED_DIFF_ROWS), 30);
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].starts_with("  ←   list_dir  xxx"), "{rows:?}");
@@ -617,15 +735,25 @@ mod tests {
 
     #[test]
     fn committed_text_indents_continuation_lines_and_wraps() {
-        let rows = text(committed(&Committed::User("a\nb".into()), 80), 80);
+        let rows = text(
+            committed(&Committed::User("a\nb".into()), 80, COMMITTED_DIFF_ROWS),
+            80,
+        );
         assert_eq!(rows, ["You   a", "      b"]);
 
-        let rows = text(committed(&Committed::Agent("word ".repeat(10)), 20), 20);
+        let rows = text(
+            committed(
+                &Committed::Agent("word ".repeat(10)),
+                20,
+                COMMITTED_DIFF_ROWS,
+            ),
+            20,
+        );
         assert_eq!(rows.len(), 3, "{rows:?}");
     }
 
     #[test]
-    fn approval_shows_the_compact_diff_in_the_history_and_the_prompt_for_the_input() {
+    fn approval_shows_the_whole_diff_in_the_history_and_the_prompt_for_the_input() {
         let mut app = app("I'll write it.", "draft");
         app.turn = Some(busy_turn());
         let history = app.on_event(axon_protocol::Event::ApprovalRequested {
@@ -637,19 +765,24 @@ mod tests {
             },
         });
 
-        let screen = render(&app, &history, 40, 30);
+        let screen = render(&app, &history, 40, 40);
 
-        // The pane's 26 rows hold the end of the logo, the reply and 20 diff rows.
-        assert_eq!(screen.rows[5], "Agent I'll write it.");
-        assert_eq!(screen.rows[6], "  a.txt (new file)");
-        assert_eq!(screen.rows[25], "  … 12 more lines");
-        assert_eq!(screen.rows[26], "");
-        assert!(screen.rows[27].contains("Waiting for approval"));
-        assert_eq!(screen.rows[29], "  [y] accept  [n] reject  · Esc cancels");
+        // The pane's 36 rows hold the end of the logo, the reply and all 31 diff rows.
+        assert_eq!(screen.rows[4], "Agent I'll write it.");
+        assert_eq!(screen.rows[5], "  a.txt (new file)");
+        assert!(screen.rows[35].contains("30"), "{:?}", screen.rows[35]);
+        assert!(!screen.rows.iter().any(|r| r.contains("more lines")));
+        assert_eq!(screen.rows[36], "");
+        assert!(screen.rows[37].contains("Waiting for approval"));
+        assert_eq!(screen.rows[39], "  [y] accept  [n] reject  · Esc cancels");
         assert!(
             !screen.rows.iter().any(|r| r.contains("draft")),
             "the input is hidden"
         );
+
+        app.approval = None;
+        let screen = render(&app, &history, 40, 40);
+        assert!(screen.rows.iter().any(|r| r == "  … 12 more lines"));
     }
 
     #[test]
@@ -659,7 +792,7 @@ mod tests {
             result: ToolResult::Rejected,
         };
         assert_eq!(
-            text(committed(&rejected, 80), 80),
+            text(committed(&rejected, 80, COMMITTED_DIFF_ROWS), 80),
             ["  ✗   edit_file  rejected"]
         );
 
@@ -669,7 +802,7 @@ mod tests {
             new_text: (1..=50).map(|n| format!("{n}\n")).collect(),
         });
         assert_eq!(
-            text(committed(&accepted, 80), 80).len(),
+            text(committed(&accepted, 80, COMMITTED_DIFF_ROWS), 80).len(),
             COMMITTED_DIFF_ROWS
         );
     }
@@ -681,7 +814,7 @@ mod tests {
         });
 
         assert_eq!(
-            text(committed(&command, 80), 80),
+            text(committed(&command, 80, COMMITTED_DIFF_ROWS), 80),
             ["  $   cargo test", "      --quiet"]
         );
     }
@@ -698,7 +831,7 @@ mod tests {
                     exit,
                 },
             };
-            text(committed(&line, 80), 80).join("\n")
+            text(committed(&line, 80, COMMITTED_DIFF_ROWS), 80).join("\n")
         };
 
         assert_eq!(result("ok\n", Exit::Code(0)), "  ←   run_command  ok");

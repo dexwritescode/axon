@@ -1,6 +1,7 @@
 //! `write_file` and `edit_file`: both work out the new text and return a
 //! `Write` to approve; nothing touches the disk until it is applied.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +9,7 @@ use axon_protocol::Change;
 use serde_json::Value;
 
 use super::walk::relative;
-use super::{optional_bool, read_text, required_str};
+use super::{Seen, hash, optional_bool, read_text, required_str};
 use crate::jail;
 
 /// A file change waiting for approval.
@@ -31,8 +32,40 @@ impl Write {
         }
     }
 
-    /// Write the file, creating missing parent directories.
+    /// Refuse to change an existing file the model hasn't read, or that
+    /// changed since it last read or wrote it, going by `seen`.
+    pub(crate) fn check(&self, seen: &HashMap<PathBuf, u64>) -> Result<(), String> {
+        let Some(old_text) = &self.old_text else {
+            return Ok(());
+        };
+        match seen.get(&self.target) {
+            None => Err(format!("{}: read it before changing it", self.path)),
+            Some(&last) if last != hash(old_text) => Err(format!(
+                "{}: changed since you last read it; read it again before changing it",
+                self.path
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// The file as the model knows it once this is applied.
+    pub(crate) fn seen_after(&self) -> Seen {
+        Seen::new(&self.target, &self.new_text)
+    }
+
+    /// Write the file, creating missing parent directories, unless it
+    /// changed since this change was worked out.
     pub(crate) fn apply(&self) -> Result<String, String> {
+        let changed = match &self.old_text {
+            Some(old_text) => read_text(&self.target, &self.path)? != *old_text,
+            None => self.target.exists(),
+        };
+        if changed {
+            return Err(format!(
+                "{}: changed while waiting for approval; read it again",
+                self.path
+            ));
+        }
         if let Some(dir) = self.target.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", self.path))?;
         }
@@ -124,6 +157,32 @@ mod tests {
 
         assert_eq!(write.apply(), Ok("wrote a/b/new.txt".into()));
         assert_eq!(fs::read_to_string(cwd.join("a/b/new.txt")).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn apply_refuses_a_file_changed_while_waiting_for_approval() {
+        let (_dir, cwd) = dir_with_notes();
+        let write = write_file(&cwd, &json!({"path": "notes.txt", "content": "tea\n"})).unwrap();
+        fs::write(cwd.join("notes.txt"), "bread\n").unwrap();
+
+        assert_eq!(
+            write.apply(),
+            Err("notes.txt: changed while waiting for approval; read it again".into())
+        );
+        assert_eq!(
+            fs::read_to_string(cwd.join("notes.txt")).unwrap(),
+            "bread\n"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_new_file_that_appeared_while_waiting_for_approval() {
+        let (_dir, cwd) = dir_with_notes();
+        let write = write_file(&cwd, &json!({"path": "new.txt", "content": "tea\n"})).unwrap();
+        fs::write(cwd.join("new.txt"), "built\n").unwrap();
+
+        assert!(write.apply().unwrap_err().contains("changed while waiting"));
+        assert_eq!(fs::read_to_string(cwd.join("new.txt")).unwrap(), "built\n");
     }
 
     #[test]

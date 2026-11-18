@@ -20,9 +20,10 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 humantime = "2"
 unicode-width = "0.2"
-async-openai = { version = "0.42", features = ["chat-completion"] }
+async-openai = { version = "0.42", features = ["chat-completion", "byot"] }
 futures = "0.3"
 agent-client-protocol = { version = "3", features = ["stdio"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = "1"
 anyhow = "1"

@@ -11,7 +11,7 @@ pub(crate) struct Prompt {
     cursor: usize,
 }
 
-#[cfg(test)]
+/// `text` with the cursor at its end.
 impl From<&str> for Prompt {
     fn from(text: &str) -> Self {
         Self {

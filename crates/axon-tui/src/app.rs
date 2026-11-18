@@ -18,6 +18,11 @@ pub(crate) struct App {
     pub(crate) input: Prompt,
     /// The reply streaming in for the current turn.
     pub(crate) streaming_text: String,
+    /// The model's reasoning streaming in, until its reply or a tool call starts.
+    pub(crate) streaming_reasoning: String,
+    /// A prompt sent while a turn ran: it goes out when the turn ends, or back
+    /// into the input if the turn is cancelled.
+    pub(crate) queued: Option<String>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
@@ -76,6 +81,11 @@ pub(crate) struct Finished {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Activity {
     Thinking,
+    /// The model is streaming a call to this tool; `bytes` of arguments so far.
+    Writing {
+        name: String,
+        bytes: usize,
+    },
     Running(String),
     Approving,
     /// Waiting between model requests until the turn's `elapsed` reaches
@@ -111,6 +121,8 @@ pub(crate) enum Action {
 pub(crate) enum Committed {
     User(String),
     Agent(String),
+    /// The model's reasoning before a reply or tool call.
+    Thought(String),
     ToolCall {
         name: String,
         args: String,
@@ -201,13 +213,31 @@ impl App {
         Some(Action::Answer { id, approve })
     }
 
+    /// Send the input, or queue it while a turn runs.
     fn submit(&mut self) -> Option<Action> {
         let text = self.input.text().trim();
-        if self.turn.is_some() || text.is_empty() {
+        if text.is_empty() {
             return None;
         }
         let text = text.to_string();
         self.input.clear();
+        if self.turn.is_some() {
+            self.queued = Some(match self.queued.take() {
+                Some(queued) => format!("{queued}\n{text}"),
+                None => text,
+            });
+            return None;
+        }
+        self.turn = Some(Turn::new(Instant::now()));
+        Some(Action::Submit(text))
+    }
+
+    /// Once the turn has ended, the queued prompt to send.
+    pub(crate) fn send_queued(&mut self) -> Option<Action> {
+        if self.turn.is_some() {
+            return None;
+        }
+        let text = self.queued.take()?;
         self.turn = Some(Turn::new(Instant::now()));
         Some(Action::Submit(text))
     }
@@ -258,9 +288,17 @@ impl App {
 
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
         match event {
+            Event::ReasoningDelta { text } => {
+                self.streaming_reasoning.push_str(&text);
+                Vec::new()
+            }
             Event::TextDelta { text } => {
                 self.streaming_text.push_str(&text);
-                Vec::new()
+                self.take_thought().into_iter().collect()
+            }
+            Event::ToolCallStreaming { name, bytes } => {
+                self.set_activity(Activity::Writing { name, bytes });
+                self.take_thought().into_iter().collect()
             }
             Event::ToolCallStarted { id, name, args } => {
                 self.set_activity(Activity::Running(name.clone()));
@@ -299,6 +337,10 @@ impl App {
                 Vec::new()
             }
             Event::TurnEnded { stop } => {
+                let cancelling = self
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.activity == Activity::Cancelling);
                 if let Some(turn) = self.turn.take() {
                     self.finished = Some(Finished {
                         stop,
@@ -315,20 +357,38 @@ impl App {
                         "stopped: too many model requests for one prompt".into(),
                     )),
                     StopReason::Cancelled => committed.push(Committed::Cancelled),
+                    StopReason::MaxTokens => committed.push(Committed::Error(
+                        "stopped: the reply reached the token limit (AXON_MAX_TOKENS)".into(),
+                    )),
+                }
+                if (stop == StopReason::Cancelled || cancelling)
+                    && let Some(queued) = self.queued.take()
+                {
+                    self.input = match self.input.text() {
+                        "" => queued.as_str().into(),
+                        typed => format!("{queued}\n{typed}").as_str().into(),
+                    };
                 }
                 committed
             }
         }
     }
 
+    /// The reasoning so far, then the reply so far.
     fn take_reply(&mut self) -> Vec<Committed> {
+        let mut committed: Vec<_> = self.take_thought().into_iter().collect();
         let text = mem::take(&mut self.streaming_text);
         let text = text.trim();
-        if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![Committed::Agent(text.into())]
+        if !text.is_empty() {
+            committed.push(Committed::Agent(text.into()));
         }
+        committed
+    }
+
+    fn take_thought(&mut self) -> Option<Committed> {
+        let text = mem::take(&mut self.streaming_reasoning);
+        let text = text.trim();
+        (!text.is_empty()).then(|| Committed::Thought(text.into()))
     }
 }
 
@@ -389,15 +449,6 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
         assert!(app.turn.is_none());
-    }
-
-    #[test]
-    fn enter_while_busy_keeps_the_input() {
-        let mut app = busy_app();
-        type_text(&mut app, "next");
-
-        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert_eq!(app.input.text(), "next");
     }
 
     #[test]
@@ -581,6 +632,107 @@ mod tests {
 
         assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("too many")));
         assert!(app.turn.is_none());
+    }
+
+    #[test]
+    fn reasoning_streams_then_commits_when_the_reply_starts() {
+        let mut app = busy_app();
+
+        assert!(
+            app.on_event(Event::ReasoningDelta { text: "Hmm".into() })
+                .is_empty()
+        );
+        assert_eq!(app.streaming_reasoning, "Hmm");
+
+        let committed = app.on_event(Event::TextDelta { text: "391".into() });
+
+        assert_eq!(committed, [Committed::Thought("Hmm".into())]);
+        assert!(app.streaming_reasoning.is_empty());
+        assert_eq!(app.streaming_text, "391");
+    }
+
+    #[test]
+    fn a_streaming_tool_call_shows_its_size_and_commits_the_reasoning() {
+        let mut app = busy_app();
+        app.on_event(Event::ReasoningDelta {
+            text: "I'll edit it.".into(),
+        });
+
+        let committed = app.on_event(Event::ToolCallStreaming {
+            name: "edit_file".into(),
+            bytes: 3200,
+        });
+
+        assert_eq!(committed, [Committed::Thought("I'll edit it.".into())]);
+        assert_eq!(
+            app.turn.unwrap().activity,
+            Activity::Writing {
+                name: "edit_file".into(),
+                bytes: 3200
+            }
+        );
+    }
+
+    #[test]
+    fn enter_during_a_turn_queues_the_prompt_until_the_turn_ends() {
+        let mut app = busy_app();
+        type_text(&mut app, "next");
+
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.queued.as_deref(), Some("next"));
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.send_queued(), None, "the turn still runs");
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+
+        assert_eq!(app.send_queued(), Some(Action::Submit("next".into())));
+        assert!(app.turn.is_some());
+        assert_eq!(app.queued, None);
+    }
+
+    #[test]
+    fn a_cancelled_turn_puts_the_queued_prompt_back_in_the_input() {
+        let mut app = busy_app();
+        type_text(&mut app, "first");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "second");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "typing");
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
+
+        assert_eq!(app.input.text(), "first\nsecond\ntyping");
+        assert_eq!(app.send_queued(), None);
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_cancelling_keeps_the_queued_prompt_in_the_input() {
+        let mut app = busy_app();
+        type_text(&mut app, "next");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+
+        assert_eq!(app.send_queued(), None);
+        assert_eq!(app.input.text(), "next");
+    }
+
+    #[test]
+    fn token_limit_is_explained() {
+        let mut app = busy_app();
+
+        let committed = app.on_event(Event::TurnEnded {
+            stop: StopReason::MaxTokens,
+        });
+
+        assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("AXON_MAX_TOKENS")));
     }
 
     #[test]

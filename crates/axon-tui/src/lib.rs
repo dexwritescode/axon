@@ -155,7 +155,17 @@ async fn step(
             app.on_mouse(mouse);
             Some(Vec::new())
         }
-        Input::Session(event) => Some(app.on_event(event?)),
+        Input::Session(event) => {
+            let mut committed = app.on_event(event?);
+            if let Some(Action::Submit(text)) = app.send_queued() {
+                commands
+                    .send(Command::Prompt { text: text.clone() })
+                    .await
+                    .ok()?;
+                committed.push(Committed::User(text));
+            }
+            Some(committed)
+        }
         Input::Tick => {
             app.on_tick(Instant::now());
             Some(Vec::new())

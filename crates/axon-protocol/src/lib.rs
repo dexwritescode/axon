@@ -25,6 +25,11 @@ pub enum Event {
     ContextLimit { tokens: Option<u64> },
     /// A piece of the model's reply, in order.
     TextDelta { text: String },
+    /// A piece of the model's reasoning before it replies; not part of the reply.
+    ReasoningDelta { text: String },
+    /// The model is streaming the arguments of a call to tool `name`; `bytes`
+    /// of them so far.
+    ToolCallStreaming { name: String, bytes: usize },
     /// The model called a tool; `args` is the JSON text it sent. `id` is
     /// unique within the session and names this call in later events.
     ToolCallStarted { id: u64, name: String, args: String },
@@ -99,6 +104,8 @@ pub enum StopReason {
     MaxTurnRequests,
     /// The frontend sent `Command::Cancel`.
     Cancelled,
+    /// A model reply reached the per-request token limit and was cut off.
+    MaxTokens,
 }
 
 /// What a frontend holds: a session's command sender and event receiver.

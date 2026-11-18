@@ -3,10 +3,13 @@
 use reqwest::Client;
 use serde_json::Value;
 
-/// Asks LM Studio, vLLM, llama.cpp and Ollama at once; the first of them, in
-/// that order, to report a size wins. None when no server answers.
+use crate::backend::Backend;
+
+/// Asks the server for the size, each backend in its own way; None when it
+/// doesn't say, or when the backend has no way to ask.
 pub(crate) async fn discover(
     http: &Client,
+    backend: Backend,
     base_url: &str,
     api_key: &str,
     model: &str,
@@ -14,27 +17,23 @@ pub(crate) async fn discover(
     let base_url = base_url.trim_end_matches('/');
     let root = base_url.strip_suffix("/v1").unwrap_or(base_url);
     let get = |url: String| get_json(http, url, api_key);
-    let (lm_studio, vllm, llama_cpp, ollama) = tokio::join!(
-        get(format!("{root}/api/v0/models/{model}")),
-        get(format!("{base_url}/models")),
-        get(format!("{root}/props")),
-        get(format!("{root}/api/ps")),
-    );
-    lm_studio
-        .and_then(|json| json["loaded_context_length"].as_u64())
-        .or_else(|| {
-            vllm.and_then(|json| {
-                find_model(&json["data"], &["id"], model)?["max_model_len"].as_u64()
-            })
-        })
-        .or_else(|| {
-            llama_cpp.and_then(|json| json["default_generation_settings"]["n_ctx"].as_u64())
-        })
-        .or_else(|| {
-            ollama.and_then(|json| {
-                find_model(&json["models"], &["name", "model"], model)?["context_length"].as_u64()
-            })
-        })
+    match backend {
+        Backend::LmStudio => {
+            get(format!("{root}/api/v0/models/{model}")).await?["loaded_context_length"].as_u64()
+        }
+        Backend::Vllm => {
+            let json = get(format!("{base_url}/models")).await?;
+            find_model(&json["data"], &["id"], model)?["max_model_len"].as_u64()
+        }
+        Backend::LlamaCpp => {
+            get(format!("{root}/props")).await?["default_generation_settings"]["n_ctx"].as_u64()
+        }
+        Backend::Ollama => {
+            let json = get(format!("{root}/api/ps")).await?;
+            find_model(&json["models"], &["name", "model"], model)?["context_length"].as_u64()
+        }
+        Backend::OpenAi => None,
+    }
 }
 
 async fn get_json(http: &Client, url: String, api_key: &str) -> Option<Value> {
@@ -68,7 +67,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::LmStudio,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, Some(128000));
     }
 
@@ -87,6 +93,7 @@ mod tests {
         let http = Client::new();
         let result = discover(
             &http,
+            Backend::Vllm,
             &format!("{}/", api_url(&server)),
             "test",
             "test-model",
@@ -107,7 +114,37 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::LmStudio,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn plain_openai_has_no_way_to_ask() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"loaded_context_length": 128000}"#),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let http = Client::new();
+        let result = discover(
+            &http,
+            Backend::OpenAi,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, None);
     }
 
@@ -116,7 +153,14 @@ mod tests {
         let server = MockServer::start().await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::LmStudio,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, None);
     }
 
@@ -134,7 +178,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::Vllm,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, Some(32768));
     }
 
@@ -151,7 +202,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::Vllm,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, None);
     }
 
@@ -168,7 +226,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::LlamaCpp,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, Some(8192));
     }
 
@@ -184,7 +249,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::LlamaCpp,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, None);
     }
 
@@ -202,7 +274,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::Ollama,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, Some(32768));
     }
 
@@ -220,7 +299,14 @@ mod tests {
             .await;
 
         let http = Client::new();
-        let result = discover(&http, &api_url(&server), "test", "test-model").await;
+        let result = discover(
+            &http,
+            Backend::Ollama,
+            &api_url(&server),
+            "test",
+            "test-model",
+        )
+        .await;
         assert_eq!(result, None);
     }
 }
