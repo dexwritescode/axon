@@ -71,16 +71,15 @@ impl Agent {
                 .chain(history.iter().cloned())
                 .collect();
             let reply = self.stream_reply(messages, events, cancel).await?;
-            if reply.cancelled {
-                if !reply.text.is_empty() {
-                    history.push(assistant_message(reply.text, &[])?);
-                }
-                return Ok(StopReason::Cancelled);
-            }
-            if reply.truncated {
+            if reply.cancelled || reply.truncated {
                 // Even when empty, so the next prompt doesn't follow a user message.
                 history.push(assistant_message(reply.text, &[])?);
-                return Ok(StopReason::MaxTokens);
+                let stop = if reply.cancelled {
+                    StopReason::Cancelled
+                } else {
+                    StopReason::MaxTokens
+                };
+                return Ok(stop);
             }
             history.push(assistant_message(reply.text, &reply.calls)?);
             if reply.calls.is_empty() {

@@ -216,7 +216,7 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
         };
         committed(line, area.width, diff_rows)
     }));
-    let reasoning = app.streaming_reasoning.trim_start();
+    let reasoning = app.streaming_reasoning.trim();
     if !reasoning.is_empty() {
         items.push(
             Paragraph::new(labelled(THINK, theme::MUTED, reasoning))
@@ -224,7 +224,7 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
                 .wrap(Wrap { trim: false }),
         );
     }
-    let reply = app.streaming_text.trim_start();
+    let reply = app.streaming_text.trim();
     if !reply.is_empty() {
         items.push(Paragraph::new(labelled(AGENT, theme::AGENT, reply)).wrap(Wrap { trim: false }));
     }
@@ -713,6 +713,19 @@ mod tests {
             .position(|r| r == "Think Let me check.")
             .unwrap();
         assert_eq!(screen.buffer[(6, row as u16)].fg, theme::MUTED);
+    }
+
+    #[test]
+    fn streaming_text_draws_without_its_surrounding_blank_lines() {
+        let mut app = app("\n\nHi\n\n", "");
+        app.turn = Some(busy_turn());
+        app.streaming_reasoning = "\nHm\n\n".into();
+
+        let screen = render(&app, &[], 40, 14);
+
+        let think = screen.rows.iter().position(|r| r == "Think Hm").unwrap();
+        assert_eq!(screen.rows[think + 1..think + 3], ["Agent Hi", ""]);
+        assert!(screen.rows[think + 3].contains("Esc to cancel"));
     }
 
     #[test]

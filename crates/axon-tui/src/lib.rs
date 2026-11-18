@@ -274,6 +274,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_s_cancels_and_the_queue_goes_out_when_the_turn_ends() {
+        let (commands, mut sent) = mpsc::channel(3);
+        let mut app = app_with_input("hi");
+        step(&mut app, &commands, key(KeyCode::Enter)).await;
+        app.input = "now".into();
+
+        let ctrl_s = Input::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        step(&mut app, &commands, ctrl_s).await;
+        let end = Event::TurnEnded {
+            stop: axon_protocol::StopReason::Cancelled,
+        };
+        let committed = step(&mut app, &commands, Input::Session(Some(end))).await;
+
+        assert_eq!(
+            committed,
+            Some(vec![Committed::Cancelled, Committed::User("now".into())])
+        );
+        sent.recv().await;
+        assert!(matches!(sent.recv().await, Some(Command::Cancel)));
+        assert!(matches!(sent.recv().await, Some(Command::Prompt { text }) if text == "now"));
+    }
+
+    #[tokio::test]
     async fn esc_during_a_turn_sends_cancel() {
         let (commands, mut sent) = mpsc::channel(2);
         let mut app = app_with_input("hi");

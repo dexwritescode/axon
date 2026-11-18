@@ -210,6 +210,14 @@ mod tests {
             prompt(&mut handle, "after").await,
             [delta("next"), end(StopReason::EndTurn)]
         );
+        assert_eq!(
+            sent_messages(&server).await.last().unwrap(),
+            &json!([
+                {"role": "user", "content": "slow"},
+                {"role": "assistant", "content": ""},
+                {"role": "user", "content": "after"}
+            ])
+        );
     }
 
     #[tokio::test]

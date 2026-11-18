@@ -21,7 +21,8 @@ TUI keys:
 
 | Key | Action |
 | --- | --- |
-| Enter | send |
+| Enter | send; during a turn, send when it ends |
+| Ctrl+Enter, Ctrl+S | during a turn, stop it and send what waits now |
 | Shift+Enter, Ctrl+J | new line |
 | ←/→, ↑/↓ | move the cursor |
 | ↑ on the first row, ↓ on the last | previous / next sent prompt |
@@ -30,8 +31,12 @@ TUI keys:
 | PageUp/PageDown, mouse wheel | scroll the history |
 | Ctrl+End | jump the history to the bottom |
 | Y / N | approve or reject a change |
-| Esc, Ctrl+C | cancel the turn |
+| Esc, Ctrl+C | cancel the turn; what waits is sent |
 | Ctrl+C when idle, Ctrl+Q | quit |
+
+Prompts sent during a turn wait below it as `Next`. When the turn ends, however it ends, they go to the model together as one message. Ctrl+Enter adds the input to them and stops the turn at once, keeping the reply so far.
+
+Ctrl+Enter needs a terminal with the kitty keyboard protocol, for example kitty, WezTerm, Ghostty, iTerm2, Alacritty or foot. On Windows it works in any console. Other terminals, such as macOS Terminal, and tmux by default, send it as Enter (it queues) or as Ctrl+J (a new line). Ctrl+S works in every terminal.
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
 
