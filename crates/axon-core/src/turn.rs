@@ -10,7 +10,8 @@ use anyhow::Result;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs, FunctionCall,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageContent, FunctionCall,
 };
 use axon_protocol::{Change, Event, Exit, StopReason, ToolResult};
 use futures::StreamExt;
@@ -54,7 +55,9 @@ impl Agent {
     /// rejection ends the turn, so the user can say what they want instead.
     /// Each tool call takes the next id after `last_call`, which the session
     /// keeps across turns so an old answer can't match a new call. Messages
-    /// on `steers` join `history` before each model request.
+    /// on `steers` join `history` before each model request; before the
+    /// first, they join the prompt, as some chat templates reject two user
+    /// messages in a row.
     pub(crate) async fn turn(
         &self,
         history: &mut Vec<ChatCompletionRequestMessage>,
@@ -70,23 +73,22 @@ impl Agent {
                 return Ok(StopReason::Cancelled);
             }
             while let Ok(text) = steers.try_recv() {
-                history.push(ChatCompletionRequestMessage::User(text.clone().into()));
+                push_user(history, &text);
                 events.send(Event::UserMessage { text }).await?;
             }
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
                 .collect();
             let reply = self.stream_reply(messages, events, cancel).await?;
-            if reply.cancelled {
-                if !reply.text.is_empty() {
-                    history.push(assistant_message(reply.text, &[])?);
-                }
-                return Ok(StopReason::Cancelled);
-            }
-            if reply.truncated {
+            if reply.cancelled || reply.truncated {
                 // Even when empty, so the next prompt doesn't follow a user message.
                 history.push(assistant_message(reply.text, &[])?);
-                return Ok(StopReason::MaxTokens);
+                let stop = if reply.cancelled {
+                    StopReason::Cancelled
+                } else {
+                    StopReason::MaxTokens
+                };
+                return Ok(stop);
             }
             history.push(assistant_message(reply.text, &reply.calls)?);
             if reply.calls.is_empty() {
@@ -389,6 +391,18 @@ fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionR
         );
     }
     Ok(message.build()?.into())
+}
+
+/// Add `text` as a user message, or to the last message if it is one.
+fn push_user(history: &mut Vec<ChatCompletionRequestMessage>, text: &str) {
+    if let Some(ChatCompletionRequestMessage::User(user)) = history.last_mut()
+        && let ChatCompletionRequestUserMessageContent::Text(last) = &mut user.content
+    {
+        last.push_str("\n\n");
+        last.push_str(text);
+    } else {
+        history.push(ChatCompletionRequestMessage::User(text.into()));
+    }
 }
 
 #[cfg(test)]

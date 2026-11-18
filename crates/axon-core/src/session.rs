@@ -1,4 +1,4 @@
-//! One conversation: a task that owns the history and runs a turn per prompt.
+//! One conversation: a task that owns the history and runs its turns.
 
 use std::collections::VecDeque;
 use std::pin::pin;
@@ -55,22 +55,15 @@ async fn run(
         if events.send(Event::UserMessage { text }).await.is_err() {
             return;
         }
-        let (steer, mut steers) = mpsc::unbounded_channel();
-        for text in leftover.drain(..) {
-            let _ = steer.send(text);
-        }
         let result = turn(
             &agent,
             &mut history,
             &mut last_call,
             &mut commands,
-            (&steer, &mut steers),
+            &mut leftover,
             &events,
         )
         .await;
-        while let Ok(text) = steers.try_recv() {
-            leftover.push_back(text);
-        }
         let stop = match result {
             Ok(stop) => stop,
             Err(e) => {
@@ -89,42 +82,57 @@ async fn run(
 }
 
 /// Run a turn while still serving commands: `Cancel` stops it, approvals go
-/// to it, and a `Prompt` joins it before its next model request. If the
+/// to it, and a `Prompt` joins it before its next model request. `waiting`
+/// holds prompts for it to take and gets back those it didn't. If the
 /// frontend goes away, the turn is cancelled.
 async fn turn(
     agent: &Agent,
     history: &mut Vec<ChatCompletionRequestMessage>,
     last_call: &mut u64,
     commands: &mut mpsc::Receiver<Command>,
-    (steer, steers): (
-        &mpsc::UnboundedSender<String>,
-        &mut mpsc::UnboundedReceiver<String>,
-    ),
+    waiting: &mut VecDeque<String>,
     events: &mpsc::Sender<Event>,
 ) -> Result<StopReason> {
+    let (steer, mut steers) = mpsc::unbounded_channel();
+    for text in waiting.drain(..) {
+        let _ = steer.send(text);
+    }
     let cancel = CancellationToken::new();
     let (approve, mut approvals) = mpsc::unbounded_channel();
-    let mut turn = pin!(agent.turn(history, events, &mut approvals, steers, last_call, &cancel));
-    let mut frontend_open = true;
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut turn => return result,
-            command = commands.recv(), if frontend_open => match command {
-                Some(Command::Cancel) => cancel.cancel(),
-                Some(Command::Approval { id, approve: yes }) => {
-                    let _ = approve.send(Approval { id, approve: yes });
-                }
-                Some(Command::Prompt { text }) => {
-                    let _ = steer.send(text);
-                }
-                None => {
-                    frontend_open = false;
-                    cancel.cancel();
-                }
-            },
+    let result = {
+        let mut turn = pin!(agent.turn(
+            history,
+            events,
+            &mut approvals,
+            &mut steers,
+            last_call,
+            &cancel
+        ));
+        let mut frontend_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut turn => break result,
+                command = commands.recv(), if frontend_open => match command {
+                    Some(Command::Cancel) => cancel.cancel(),
+                    Some(Command::Approval { id, approve: yes }) => {
+                        let _ = approve.send(Approval { id, approve: yes });
+                    }
+                    Some(Command::Prompt { text }) => {
+                        let _ = steer.send(text);
+                    }
+                    None => {
+                        frontend_open = false;
+                        cancel.cancel();
+                    }
+                },
+            }
         }
+    };
+    while let Ok(text) = steers.try_recv() {
+        waiting.push_back(text);
     }
+    result
 }
 
 #[cfg(test)]
@@ -288,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_prompt_sent_before_a_cancel_starts_the_next_turn() {
+    async fn prompts_sent_before_a_cancel_start_the_next_turn_as_one_message() {
         let server = MockServer::start().await;
         respond(&server, reply(&["late"]).set_delay(Duration::from_secs(30))).await;
         // A cancelled request isn't counted as answered, so match the next one by its prompt.
@@ -298,19 +306,16 @@ mod tests {
             .mount(&server)
             .await;
         let mut handle = session(&server).await;
-        let send = |command| handle.commands.send(command);
 
-        send(Command::Prompt {
-            text: "slow".into(),
-        })
-        .await
-        .unwrap();
-        send(Command::Prompt {
-            text: "again".into(),
-        })
-        .await
-        .unwrap();
-        send(Command::Cancel).await.unwrap();
+        for text in ["slow", "again", "and more"] {
+            let text = text.into();
+            handle
+                .commands
+                .send(Command::Prompt { text })
+                .await
+                .unwrap();
+        }
+        handle.commands.send(Command::Cancel).await.unwrap();
 
         assert_eq!(
             turns(&mut handle, 2, true).await,
@@ -318,9 +323,18 @@ mod tests {
                 user("slow"),
                 end(StopReason::Cancelled),
                 user("again"),
+                user("and more"),
                 delta("next"),
                 end(StopReason::EndTurn)
             ]
+        );
+        assert_eq!(
+            sent_messages(&server).await.last().unwrap(),
+            &json!([
+                {"role": "user", "content": "slow"},
+                {"role": "assistant", "content": ""},
+                {"role": "user", "content": "again\n\nand more"}
+            ])
         );
     }
 

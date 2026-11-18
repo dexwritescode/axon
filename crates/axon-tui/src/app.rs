@@ -24,7 +24,7 @@ pub(crate) struct App {
     /// into the input if the turn is cancelled.
     pub(crate) queued: Option<Prompt>,
     /// Prompts sent and not yet in the model's history, oldest first; each
-    /// `UserMessage` commits one. Steers show muted below the turn.
+    /// `UserMessage` commits one. They show muted below the turn.
     pub(crate) sent: VecDeque<Prompt>,
     /// Prompts sent this session, oldest first.
     pub(crate) past: Vec<Prompt>,
@@ -33,7 +33,7 @@ pub(crate) struct App {
     pub(crate) recall: Option<(usize, Prompt)>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
-    /// The running turn; Enter does nothing until it ends.
+    /// The running turn; Enter queues until it ends.
     pub(crate) turn: Option<Turn>,
     /// How the last turn ended, shown in the activity row until the next one.
     pub(crate) finished: Option<Finished>,
@@ -384,8 +384,6 @@ impl App {
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
         match event {
             Event::UserMessage { text } => {
-                // A steer left over from the last turn starts this one.
-                self.turn.get_or_insert_with(|| Turn::new(Instant::now()));
                 let shown = self.sent.pop_front().map_or(text, |prompt| prompt.shown());
                 let mut committed = self.take_reply();
                 committed.push(Committed::User(shown));
@@ -454,6 +452,10 @@ impl App {
                         took: turn.started.elapsed(),
                         failed: turn.failed,
                     });
+                }
+                if !self.sent.is_empty() {
+                    // A prompt the turn didn't take starts the next one.
+                    self.turn = Some(Turn::new(Instant::now()));
                 }
                 self.approval = None;
                 self.calls.clear();
@@ -878,6 +880,7 @@ mod tests {
             stop: StopReason::EndTurn,
         });
 
+        assert!(app.turn.is_some(), "the steer starts the next turn");
         assert_eq!(app.send_queued(), None, "the steer goes first");
         assert_eq!(
             app.on_event(user_message("steer")),
@@ -888,6 +891,27 @@ mod tests {
             stop: StopReason::EndTurn,
         });
         assert_eq!(app.send_queued(), Some(Action::Submit("queued".into())));
+    }
+
+    #[test]
+    fn a_cancel_with_a_steer_waiting_returns_the_queue_and_runs_the_steer() {
+        let mut app = busy_app();
+        type_text(&mut app, "steer");
+        app.on_key(ctrl_enter());
+        type_text(&mut app, "queued");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
+
+        assert_eq!(app.input.text(), "queued");
+        assert_eq!(activity(&app), &Activity::Thinking);
+        assert_eq!(
+            app.on_event(user_message("steer")),
+            [Committed::User("steer".into())]
+        );
     }
 
     #[test]

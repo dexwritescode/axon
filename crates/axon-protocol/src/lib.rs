@@ -48,7 +48,7 @@ pub enum Event {
     /// The turn failed: its messages leave the history and `TurnEnded`
     /// follows. The session stays usable.
     Error { message: String },
-    /// The turn started by the last `Prompt` is over.
+    /// The running turn is over; a `Prompt` it didn't take starts the next.
     TurnEnded { stop: StopReason },
 }
 
