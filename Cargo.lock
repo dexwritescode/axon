@@ -198,6 +198,7 @@ dependencies = [
  "anyhow",
  "axon-acp",
  "axon-core",
+ "axon-protocol",
  "axon-tui",
  "tokio",
 ]
@@ -222,12 +223,14 @@ dependencies = [
  "process-wrap",
  "regex",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
  "wiremock",
 ]
 
@@ -3042,6 +3045,7 @@ checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

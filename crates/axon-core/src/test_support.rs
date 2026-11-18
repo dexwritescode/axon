@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::Backend;
 use crate::model::{ModelClient, ModelConfig};
+use crate::store::{Saved, Store};
 use crate::turn::Agent;
 
 pub(crate) fn config(base_url: String) -> ModelConfig {
@@ -106,16 +107,32 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
     }
 }
 
-/// Start a session with no context limit, past its first event and without
-/// tool-call progress events, which only `turn`'s progress test checks.
+/// Start a session with no context limit, saved in a temporary folder, past
+/// its first event and without tool-call progress events, which only
+/// `turn`'s progress test checks.
 pub(crate) async fn spawn_started(agent: Agent) -> SessionHandle {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path(), &agent.cwd, "test-model");
+    spawn_saving(agent, store, Saved::default(), root).await
+}
+
+/// Like `spawn_started`, saving to `store` and going on from `saved`;
+/// `keep` lives as long as the session.
+pub(crate) async fn spawn_saving(
+    agent: Agent,
+    store: Store,
+    saved: Saved,
+    keep: impl Send + 'static,
+) -> SessionHandle {
     let SessionHandle {
+        id,
         commands,
         events: mut all,
-    } = crate::session::spawn(agent, async { None });
+    } = crate::session::spawn(agent, async { None }, store, saved);
     assert_eq!(all.recv().await, Some(Event::ContextLimit { tokens: None }));
     let (tx, events) = mpsc::channel(crate::session::EVENT_BUFFER);
     tokio::spawn(async move {
+        let _keep = keep;
         loop {
             let event = tokio::select! {
                 _ = tx.closed() => break,
@@ -132,7 +149,11 @@ pub(crate) async fn spawn_started(agent: Agent) -> SessionHandle {
             }
         }
     });
-    SessionHandle { commands, events }
+    SessionHandle {
+        id,
+        commands,
+        events,
+    }
 }
 
 pub(crate) fn end(stop: StopReason) -> Event {

@@ -1,21 +1,53 @@
 use std::env;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axon_core::{Backend, CoreFactory, ModelConfig};
+use axon_protocol::Resume;
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Tui(Resume),
+    Acp,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match env::args().nth(1).as_deref() {
-        None => {
+    let args: Vec<String> = env::args().skip(1).collect();
+    match cli(&args)? {
+        Cli::Tui(resume) => {
             let lookup = |name: &str| env::var(name).ok();
             let config = model_config(lookup)?;
-            axon_tui::run(&CoreFactory::new(config), tui_settings(lookup)?).await?
+            let sessions = sessions_dir(lookup, env::home_dir())?;
+            let factory = CoreFactory::new(config, sessions);
+            axon_tui::run(&factory, tui_settings(lookup)?, resume).await?
         }
-        Some("acp") => axon_acp::serve().await?,
-        Some(other) => bail!("unknown command: {other}"),
+        Cli::Acp => axon_acp::serve().await?,
     }
     Ok(())
+}
+
+fn cli(args: &[String]) -> Result<Cli> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(match args[..] {
+        [] => Cli::Tui(Resume::New),
+        ["--continue"] => Cli::Tui(Resume::Latest),
+        ["--resume", id] => Cli::Tui(Resume::Id(id.into())),
+        ["--resume"] => bail!("--resume needs a session id"),
+        ["acp"] => Cli::Acp,
+        _ => bail!("unknown command: {}", args.join(" ")),
+    })
+}
+
+/// `AXON_SESSIONS_DIR`, or `.axon/sessions` in the home folder.
+fn sessions_dir(lookup: impl Fn(&str) -> Option<String>, home: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(dir) = lookup("AXON_SESSIONS_DIR") {
+        return Ok(dir.into());
+    }
+    let home = home.context("no home folder to save sessions in; set AXON_SESSIONS_DIR")?;
+    Ok(home.join(".axon").join("sessions"))
 }
 
 /// Defaults to LM Studio's local server; env vars override each field.
@@ -55,6 +87,39 @@ fn tui_settings(lookup: impl Fn(&str) -> Option<String>) -> Result<axon_tui::Set
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn the_command_line_picks_the_frontend_and_the_session() {
+        assert_eq!(cli(&args("")).unwrap(), Cli::Tui(Resume::New));
+        assert_eq!(cli(&args("--continue")).unwrap(), Cli::Tui(Resume::Latest));
+        assert_eq!(
+            cli(&args("--resume 0193")).unwrap(),
+            Cli::Tui(Resume::Id("0193".into()))
+        );
+        assert_eq!(cli(&args("acp")).unwrap(), Cli::Acp);
+        assert!(cli(&args("--resume")).is_err());
+        let err = cli(&args("--continue extra")).unwrap_err();
+        assert!(err.to_string().contains("--continue extra"), "{err}");
+    }
+
+    #[test]
+    fn sessions_are_saved_in_the_home_folder_unless_the_env_var_says_where() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            sessions_dir(|_| None, home.clone()).unwrap(),
+            PathBuf::from("/home/u/.axon/sessions")
+        );
+        let set = |name: &str| (name == "AXON_SESSIONS_DIR").then(|| "/elsewhere".into());
+        assert_eq!(
+            sessions_dir(set, home).unwrap(),
+            PathBuf::from("/elsewhere")
+        );
+        assert!(sessions_dir(|_| None, None).is_err());
+    }
 
     #[test]
     fn model_config_defaults_to_lm_studio() {

@@ -629,7 +629,13 @@ mod tests {
             sse(&[chunk(json!({"reasoning_content": "Let me list."}), None)]),
         )
         .await;
-        let mut handle = crate::session::spawn(agent(&server, dir.path()), async { None });
+        let store = crate::store::Store::new(dir.path(), dir.path(), "test-model");
+        let mut handle = crate::session::spawn(
+            agent(&server, dir.path()),
+            async { None },
+            store,
+            Default::default(),
+        );
         handle.events.recv().await;
         handle
             .commands

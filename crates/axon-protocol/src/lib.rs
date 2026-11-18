@@ -20,7 +20,7 @@ pub enum Command {
 }
 
 /// Sent by a session to its frontend.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// The model's context size in tokens, as the server reports it; None when it doesn't. Always the session's first event.
@@ -46,6 +46,10 @@ pub enum Event {
     Error { message: String },
     /// The turn started by the last `Prompt` is over.
     TurnEnded { stop: StopReason },
+    /// What a resumed session showed before, in order; sent after
+    /// `ContextLimit`, only when there is something.
+    #[serde(skip)]
+    History { items: Vec<Past> },
 }
 
 /// A change a tool call wants to make, shown to the user for approval.
@@ -114,8 +118,29 @@ pub enum StopReason {
     MaxTokens,
 }
 
+/// Something a saved session showed, in order: what the user sent, or an
+/// event the session sent back.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Past {
+    Prompt(String),
+    Event(Event),
+}
+
+/// Which session `SessionFactory::new_session` starts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Resume {
+    /// A new, empty session.
+    New,
+    /// The newest saved session in the working directory.
+    Latest,
+    /// The saved session in the working directory whose id starts with this.
+    Id(String),
+}
+
 /// What a frontend holds: a session's command sender and event receiver.
 pub struct SessionHandle {
+    /// Names the saved session, for `Resume::Id`.
+    pub id: String,
     pub commands: mpsc::Sender<Command>,
     pub events: mpsc::Receiver<Event>,
 }
@@ -126,13 +151,16 @@ pub enum SessionError {
     /// The session could not be started; the message says why.
     #[error("could not start a session: {0}")]
     Start(String),
+    /// There is no saved session to resume.
+    #[error("no saved session to resume here")]
+    NotFound,
 }
 
 /// Creates sessions. Frontends get one from the binary, so they never
 /// depend on the core directly.
 pub trait SessionFactory: Send + Sync {
-    /// Start a session whose tools work inside `cwd`.
-    fn new_session(&self, cwd: PathBuf) -> Result<SessionHandle, SessionError>;
+    /// Start the session `resume` names, whose tools work inside `cwd`.
+    fn new_session(&self, cwd: PathBuf, resume: Resume) -> Result<SessionHandle, SessionError>;
 }
 
 #[cfg(test)]

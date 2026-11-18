@@ -7,13 +7,13 @@ mod draw;
 mod prompt;
 mod theme;
 
-use std::io;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 pub use app::Settings;
 
 use app::{Action, App, Committed};
-use axon_protocol::{Command, Event, SessionError, SessionFactory, SessionHandle};
+use axon_protocol::{Command, Event, Resume, SessionError, SessionFactory, SessionHandle};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -36,12 +36,24 @@ pub enum TuiError {
     Io(#[from] io::Error),
 }
 
-/// Run one session in the terminal until the user quits.
-pub async fn run(factory: &dyn SessionFactory, settings: Settings) -> Result<(), TuiError> {
-    let session = factory.new_session(std::env::current_dir()?)?;
-    let _screen = Screen::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run_loop(&mut terminal, session, settings).await
+/// Run the session `resume` names in the terminal until the user quits,
+/// then say how to resume it.
+pub async fn run(
+    factory: &dyn SessionFactory,
+    settings: Settings,
+    resume: Resume,
+) -> Result<(), TuiError> {
+    let session = factory.new_session(std::env::current_dir()?, resume)?;
+    let id = session.id.clone();
+    let saved = {
+        let _screen = Screen::enter()?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        run_loop(&mut terminal, session, settings).await?
+    };
+    if saved {
+        writeln!(io::stdout(), "resume: axon --resume {id}")?;
+    }
+    Ok(())
 }
 
 /// The alternate screen in raw mode, with the mouse captured, for as long as
@@ -80,6 +92,9 @@ impl Drop for Screen {
 
 type Tty = Terminal<CrosstermBackend<io::Stdout>>;
 
+/// How long quitting waits for the session to save a cancelled turn.
+const QUIT_WAIT: Duration = Duration::from_secs(2);
+
 /// How often the activity row animates.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -95,15 +110,18 @@ enum Input {
     Redraw,
 }
 
+/// Runs until the user quits; whether the session has anything saved.
 async fn run_loop(
     terminal: &mut Tty,
     session: SessionHandle,
     settings: Settings,
-) -> Result<(), TuiError> {
+) -> Result<bool, TuiError> {
     let SessionHandle {
         commands,
         mut events,
+        ..
     } = session;
+    let mut saved = false;
     let mut app = App {
         settings,
         ..App::default()
@@ -126,17 +144,24 @@ async fn run_loop(
                 Some(Ok(TermEvent::Paste(text))) => Input::Paste(text),
                 Some(Ok(_)) => Input::Redraw,
                 Some(Err(e)) => return Err(e.into()),
-                None => return Ok(()),
+                None => break,
             },
             event = events.recv() => Input::Session(event),
             _ = ticks.tick(), if app.turn.is_some() => Input::Tick,
         };
+        if let Input::Session(Some(Event::TurnEnded { .. } | Event::History { .. })) = input {
+            saved = true;
+        }
         let Some(committed) = step(&mut app, &commands, input).await else {
-            return Ok(());
+            break;
         };
         history.extend(committed);
         redraw(terminal, &mut app, &history)?;
     }
+    // Ends the session; a running turn is cancelled and saved before its events close.
+    drop(commands);
+    let _ = tokio::time::timeout(QUIT_WAIT, async { while events.recv().await.is_some() {} }).await;
+    Ok(saved)
 }
 
 /// Apply one input: the lines to commit, or `None` when the TUI should exit.

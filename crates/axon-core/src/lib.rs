@@ -10,6 +10,7 @@ mod live;
 mod model;
 mod prompt;
 mod session;
+mod store;
 #[cfg(test)]
 mod test_support;
 mod tools;
@@ -18,8 +19,9 @@ mod turn;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axon_protocol::{SessionError, SessionFactory, SessionHandle};
+use axon_protocol::{Resume, SessionError, SessionFactory, SessionHandle};
 use model::ModelClient;
+use store::Store;
 use turn::Agent;
 
 pub use backend::{Backend, UnknownBackend};
@@ -34,17 +36,19 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Starts core sessions that all talk to the same model.
 pub struct CoreFactory {
     config: ModelConfig,
+    /// Sessions are saved under here, a folder per working directory.
+    sessions: PathBuf,
 }
 
 impl CoreFactory {
-    pub fn new(config: ModelConfig) -> Self {
-        Self { config }
+    pub fn new(config: ModelConfig, sessions: PathBuf) -> Self {
+        Self { config, sessions }
     }
 }
 
 impl SessionFactory for CoreFactory {
     /// Must be called inside a tokio runtime; the session runs as a task on it.
-    fn new_session(&self, cwd: PathBuf) -> Result<SessionHandle, SessionError> {
+    fn new_session(&self, cwd: PathBuf, resume: Resume) -> Result<SessionHandle, SessionError> {
         tokio::runtime::Handle::try_current().map_err(|e| SessionError::Start(e.to_string()))?;
         let http = reqwest::Client::builder()
             .timeout(DISCOVERY_TIMEOUT)
@@ -53,6 +57,9 @@ impl SessionFactory for CoreFactory {
         let cwd = cwd
             .canonicalize()
             .map_err(|e| SessionError::Start(format!("{}: {e}", cwd.display())))?;
+        let (store, saved) = Store::open(&self.sessions, &cwd, &self.config.model, &resume)
+            .map_err(|e| SessionError::Start(format!("{e:#}")))?
+            .ok_or(SessionError::NotFound)?;
         let backend = self.config.backend;
         let base_url = self.config.base_url.clone();
         let api_key = self.config.api_key.clone();
@@ -66,6 +73,8 @@ impl SessionFactory for CoreFactory {
                 seen: Default::default(),
             },
             async move { context::discover(&http, backend, &base_url, &api_key, &model).await },
+            store,
+            saved,
         ))
     }
 }
@@ -79,29 +88,44 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
-    fn factory(base_url: String) -> CoreFactory {
-        CoreFactory::new(config(base_url))
+    /// A factory saving sessions in a temporary folder, which it returns too.
+    fn factory(base_url: String) -> (CoreFactory, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        (CoreFactory::new(config(base_url), root.path().into()), root)
     }
 
     #[test]
     fn new_session_outside_a_runtime_is_an_error() {
-        let result = factory("http://unused".into()).new_session(".".into());
+        let (factory, _root) = factory("http://unused".into());
+        let result = factory.new_session(".".into(), Resume::New);
 
         assert!(matches!(result, Err(SessionError::Start(_))));
     }
 
     #[tokio::test]
     async fn new_session_in_a_missing_directory_is_an_error() {
-        let result = factory("http://unused".into()).new_session("/no/such/dir".into());
+        let (factory, _root) = factory("http://unused".into());
+        let result = factory.new_session("/no/such/dir".into(), Resume::New);
 
         assert!(matches!(result, Err(SessionError::Start(e)) if e.starts_with("/no/such/dir")));
+    }
+
+    #[tokio::test]
+    async fn resuming_with_nothing_saved_is_not_found() {
+        let (factory, _root) = factory("http://unused".into());
+
+        for resume in [Resume::Latest, Resume::Id("0193".into())] {
+            let result = factory.new_session(".".into(), resume);
+            assert!(matches!(result, Err(SessionError::NotFound)));
+        }
     }
 
     #[tokio::test]
     async fn new_session_streams_a_reply_from_the_configured_model() {
         let server = MockServer::start().await;
         respond(&server, reply(&["Hello"])).await;
-        let mut handle = factory(api_url(&server)).new_session(".".into()).unwrap();
+        let (factory, _root) = factory(api_url(&server));
+        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
 
         assert_eq!(
             handle.events.recv().await,
@@ -123,7 +147,8 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let mut handle = factory(api_url(&server)).new_session(".".into()).unwrap();
+        let (factory, _root) = factory(api_url(&server));
+        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
 
         assert_eq!(
             handle.events.recv().await,
