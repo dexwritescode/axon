@@ -5,6 +5,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use std::path::Path;
+use std::time::Duration;
 
 use axon_protocol::{Command, Event, SessionHandle, StopReason};
 
@@ -16,6 +17,7 @@ pub(crate) fn config(base_url: String) -> ModelConfig {
         base_url,
         api_key: "test".into(),
         model: "test-model".into(),
+        request_pause: Duration::ZERO,
     }
 }
 
@@ -95,7 +97,18 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
         client: ModelClient::new(&config(api_url(server))),
         cwd: cwd.canonicalize().unwrap(),
         max_requests: 25,
+        request_pause: Duration::ZERO,
     }
+}
+
+/// Start a session with no context limit (for tests).
+pub(crate) async fn spawn_started(agent: Agent) -> SessionHandle {
+    let mut handle = crate::session::spawn(agent, async { None });
+    assert_eq!(
+        handle.events.recv().await,
+        Some(Event::ContextLimit { tokens: None })
+    );
+    handle
 }
 
 pub(crate) fn end(stop: StopReason) -> Event {

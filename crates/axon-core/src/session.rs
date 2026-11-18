@@ -14,15 +14,28 @@ const COMMAND_BUFFER: usize = 16;
 const EVENT_BUFFER: usize = 64;
 
 /// Start a session task and return the frontend's end of it.
-pub(crate) fn spawn(agent: Agent) -> SessionHandle {
+pub(crate) fn spawn(
+    agent: Agent,
+    context_limit: impl Future<Output = Option<u64>> + Send + 'static,
+) -> SessionHandle {
     let (commands, command_rx) = mpsc::channel(COMMAND_BUFFER);
     let (event_tx, events) = mpsc::channel(EVENT_BUFFER);
-    tokio::spawn(run(agent, command_rx, event_tx));
+    tokio::spawn(run(agent, context_limit, command_rx, event_tx));
     SessionHandle { commands, events }
 }
 
 /// Runs until the frontend drops its command sender or its event receiver.
-async fn run(agent: Agent, mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
+async fn run(
+    agent: Agent,
+    context_limit: impl Future<Output = Option<u64>> + Send,
+    mut commands: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Event>,
+) {
+    let tokens = context_limit.await;
+    if events.send(Event::ContextLimit { tokens }).await.is_err() {
+        return;
+    }
+
     let mut history: Vec<ChatCompletionRequestMessage> = Vec::new();
     let mut last_call = 0;
 
@@ -91,22 +104,24 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{agent, delta, end, prompt, reply, respond, sent_messages};
+    use crate::test_support::{
+        agent, delta, end, prompt, reply, respond, sent_messages, spawn_started,
+    };
     use serde_json::json;
     use std::path::Path;
     use std::time::Duration;
     use wiremock::matchers::body_string_contains;
     use wiremock::{Mock, MockServer};
 
-    fn session(server: &MockServer) -> SessionHandle {
-        spawn(agent(server, Path::new(".")))
+    async fn session(server: &MockServer) -> SessionHandle {
+        spawn_started(agent(server, Path::new("."))).await
     }
 
     #[tokio::test]
     async fn prompt_streams_deltas_then_ends_the_turn() {
         let server = MockServer::start().await;
         respond(&server, reply(&["Hello", ", world"])).await;
-        let mut handle = session(&server);
+        let mut handle = session(&server).await;
 
         assert_eq!(
             prompt(&mut handle, "hi").await,
@@ -119,7 +134,7 @@ mod tests {
         let server = MockServer::start().await;
         respond(&server, reply(&["Hel", "lo"])).await;
         respond(&server, reply(&["Bye"])).await;
-        let mut handle = session(&server);
+        let mut handle = session(&server).await;
 
         prompt(&mut handle, "hi").await;
         prompt(&mut handle, "bye").await;
@@ -138,7 +153,7 @@ mod tests {
     async fn session_stops_when_the_event_receiver_is_dropped() {
         let server = MockServer::start().await;
         respond(&server, reply(&["Hello"])).await;
-        let SessionHandle { commands, events } = session(&server);
+        let SessionHandle { commands, events } = session(&server).await;
         drop(events);
 
         commands
@@ -161,7 +176,7 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
-        let mut handle = session(&server);
+        let mut handle = session(&server).await;
         let send = |command| handle.commands.send(command);
 
         send(Command::Prompt {
@@ -204,7 +219,7 @@ mod tests {
         let SessionHandle {
             commands,
             mut events,
-        } = session(&server);
+        } = session(&server).await;
 
         commands
             .send(Command::Prompt { text: "hi".into() })
@@ -224,7 +239,7 @@ mod tests {
     async fn cancel_while_idle_does_nothing() {
         let server = MockServer::start().await;
         respond(&server, reply(&["ok"])).await;
-        let mut handle = session(&server);
+        let mut handle = session(&server).await;
 
         handle.commands.send(Command::Cancel).await.unwrap();
 

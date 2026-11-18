@@ -37,3 +37,4 @@ two-face = "0.5"
 tempfile = "3"
 tokio-util = "0.7"
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }

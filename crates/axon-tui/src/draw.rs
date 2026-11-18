@@ -181,7 +181,7 @@ pub(crate) fn screen(frame: &mut Frame, app: &App, history: &[Committed]) -> Vie
     };
     let status = match (&app.turn, &app.finished) {
         (Some(turn), _) => activity(turn),
-        (None, Some(finished)) => finished_line(finished),
+        (None, Some(finished)) => finished_line(finished, app.context_limit),
         (None, None) => Line::default(),
     };
     frame.render_widget(status, activity_area);
@@ -287,13 +287,18 @@ fn activity(turn: &Turn) -> Line<'static> {
         Activity::Thinking => format!("Thinking… {took} · Esc to cancel"),
         Activity::Running(tool) => format!("Running {tool}… {took} · Esc to cancel"),
         Activity::Approving => format!("Waiting for approval… {took}"),
+        Activity::Cooling { until } if turn.elapsed < *until => {
+            let left = elapsed(*until - turn.elapsed);
+            format!("Cooling down… {left} · Esc to cancel")
+        }
+        Activity::Cooling { .. } => format!("Thinking… {took} · Esc to cancel"),
         Activity::Cancelling => "Cancelling…".into(),
     };
     status(theme::AGENT, spinner, text)
 }
 
 /// The activity row once a turn has ended.
-fn finished_line(finished: &Finished) -> Line<'static> {
+fn finished_line(finished: &Finished, context_limit: Option<u64>) -> Line<'static> {
     let (color, mark, word) = match finished.stop {
         StopReason::EndTurn => (theme::DONE, '✓', "Finished"),
         StopReason::Cancelled => (theme::ERROR, '✗', "Cancelled"),
@@ -301,7 +306,12 @@ fn finished_line(finished: &Finished) -> Line<'static> {
     };
     let at = finished.at.format("%H:%M");
     let took = elapsed(finished.took);
-    status(color, mark, format!("{word} at {at} · {took}"))
+    let context = match context_limit {
+        Some(tokens) if tokens >= 1000 => format!(" · {}k context", tokens / 1000),
+        Some(tokens) => format!(" · {tokens} context"),
+        None => String::new(),
+    };
+    status(color, mark, format!("{word} at {at} · {took}{context}"))
 }
 
 /// A coloured mark, then muted text.
@@ -525,6 +535,24 @@ mod tests {
     }
 
     #[test]
+    fn the_finished_line_shows_the_context_limit_when_known() {
+        let mut app = app("", "");
+        app.context_limit = Some(262_144);
+        app.finished = Some(Finished {
+            stop: StopReason::EndTurn,
+            at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
+                .unwrap(),
+            took: Duration::from_millis(125_400),
+        });
+        let screen = render(&app, &[], 60, 14);
+
+        assert_eq!(
+            screen.rows[11],
+            "✓ Finished at 14:32 · 2m 5s · 262k context"
+        );
+    }
+
+    #[test]
     fn elapsed_time_rolls_over_into_minutes_and_hours() {
         assert_eq!(elapsed(Duration::from_millis(900)), "0s");
         assert_eq!(elapsed(Duration::from_secs(59)), "59s");
@@ -543,6 +571,25 @@ mod tests {
 
         turn.activity = Activity::Cancelling;
         assert_eq!(activity(&turn).to_string(), "⠙ Cancelling…");
+    }
+
+    #[test]
+    fn activity_row_counts_down_a_pause_then_thinks() {
+        let mut turn = busy_turn();
+        turn.activity = Activity::Cooling {
+            until: Duration::from_secs(30),
+        };
+        turn.elapsed = Duration::from_secs(5);
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Cooling down… 25s · Esc to cancel"
+        );
+
+        turn.elapsed = Duration::from_secs(30);
+        assert_eq!(
+            activity(&turn).to_string(),
+            "⠋ Thinking… 30s · Esc to cancel"
+        );
     }
 
     #[test]

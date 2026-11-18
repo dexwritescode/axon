@@ -221,6 +221,7 @@ dependencies = [
  "ignore",
  "process-wrap",
  "regex",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::pin::pin;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_openai::types::chat::{
@@ -35,6 +36,8 @@ pub(crate) struct Agent {
     pub(crate) cwd: PathBuf,
     /// Model requests per prompt before the turn stops.
     pub(crate) max_requests: usize,
+    /// Wait between a turn's model requests.
+    pub(crate) request_pause: Duration,
 }
 
 impl Agent {
@@ -56,7 +59,10 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
         let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
-        for _ in 0..self.max_requests {
+        for request in 0..self.max_requests {
+            if request > 0 && !self.pause(events, cancel).await? {
+                return Ok(StopReason::Cancelled);
+            }
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
                 .collect();
@@ -104,6 +110,24 @@ impl Agent {
             }
         }
         Ok(StopReason::MaxTurnRequests)
+    }
+
+    /// Wait `request_pause`, saying so; false if cancelled meanwhile.
+    async fn pause(
+        &self,
+        events: &mpsc::Sender<Event>,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        if self.request_pause.is_zero() {
+            return Ok(true);
+        }
+        let secs = self.request_pause.as_secs();
+        events.send(Event::Paused { secs }).await?;
+        Ok(tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            _ = tokio::time::sleep(self.request_pause) => true,
+        })
     }
 
     /// Stream one model reply, forwarding its text. On cancel, the request is
@@ -321,10 +345,9 @@ fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session;
     use crate::test_support::{
         agent, client_error, delta, end, prompt, prompt_answering, reply, respond, sent_messages,
-        tool_calls,
+        spawn_started, tool_calls,
     };
     use axon_protocol::SessionHandle;
     use axon_protocol::{Change, Command};
@@ -340,10 +363,11 @@ mod tests {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("notes.txt"), "remember the milk\n").unwrap();
-        let handle = session::spawn(Agent {
+        let handle = spawn_started(Agent {
             max_requests,
             ..agent(&server, dir.path())
-        });
+        })
+        .await;
         (server, dir, handle)
     }
 
@@ -436,6 +460,57 @@ mod tests {
 
         assert_eq!(events.last(), Some(&end(StopReason::MaxTurnRequests)));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn requests_after_the_first_wait_for_the_pause() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(Agent {
+            request_pause: Duration::from_millis(300),
+            ..agent(&server, dir.path())
+        })
+        .await;
+        respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
+        respond(&server, reply(&["done"])).await;
+
+        let started = std::time::Instant::now();
+        let events = prompt(&mut handle, "list").await;
+
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let pauses = events.iter().filter(|e| matches!(e, Event::Paused { .. }));
+        assert_eq!(pauses.collect::<Vec<_>>(), [&Event::Paused { secs: 0 }]);
+        assert_eq!(events.last(), Some(&end(StopReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn cancel_cuts_a_pause_short() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(Agent {
+            request_pause: Duration::from_secs(60),
+            ..agent(&server, dir.path())
+        })
+        .await;
+        respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
+        handle
+            .commands
+            .send(Command::Prompt {
+                text: "list".into(),
+            })
+            .await
+            .unwrap();
+
+        while let Some(event) = handle.events.recv().await {
+            if event == (Event::Paused { secs: 60 }) {
+                break;
+            }
+        }
+        handle.commands.send(Command::Cancel).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await;
+
+        assert_eq!(ended.unwrap(), Some(end(StopReason::Cancelled)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

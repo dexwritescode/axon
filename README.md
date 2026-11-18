@@ -33,3 +33,11 @@ TUI keys:
 | Ctrl+C when idle, Ctrl+Q | quit |
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`.
+
+To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0).
+
+At session start Axon asks the server for the model's loaded context size (LM Studio, vLLM, llama.cpp and Ollama report it) and shows it after each turn, e.g. `✓ Finished at 14:32 · 2m 5s · 262k context`. Ollama and LM Studio report it only while the model is loaded.
+
+## Test against real servers (macOS)
+
+`scripts/backend-test.sh NAME` installs a backend with Homebrew or `lms`, starts it, loads a small Qwen3 0.6B model, runs the ignored live test (context discovery and a reply), then stops what it started. NAME is `ollama`, `llamacpp` or `lmstudio`. Downloads stay cached; `scripts/backends/NAME.sh purge` removes them. These scripts are macOS-only dev tooling.

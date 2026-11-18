@@ -18,6 +18,8 @@ pub(crate) struct App {
     pub(crate) input: Prompt,
     /// The reply streaming in for the current turn.
     pub(crate) streaming_text: String,
+    /// The model's context size in tokens, when the server reported it.
+    pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
     pub(crate) turn: Option<Turn>,
     /// How the last turn ended, shown in the activity row until the next one.
@@ -76,6 +78,11 @@ pub(crate) enum Activity {
     Thinking,
     Running(String),
     Approving,
+    /// Waiting between model requests until the turn's `elapsed` reaches
+    /// `until`; thinking after that.
+    Cooling {
+        until: Duration,
+    },
     /// Cancel was sent; the turn ends when the session confirms it.
     Cancelling,
 }
@@ -275,10 +282,21 @@ impl App {
                 let name = self.calls.remove(&id).unwrap_or_default();
                 vec![Committed::ToolResult { name, result }]
             }
+            Event::Paused { secs } => {
+                if let Some(turn) = &self.turn {
+                    let until = turn.started.elapsed() + Duration::from_secs(secs);
+                    self.set_activity(Activity::Cooling { until });
+                }
+                Vec::new()
+            }
             Event::Error { message } => {
                 let mut committed = self.take_reply();
                 committed.push(Committed::Error(message));
                 committed
+            }
+            Event::ContextLimit { tokens } => {
+                self.context_limit = tokens;
+                Vec::new()
             }
             Event::TurnEnded { stop } => {
                 if let Some(turn) = self.turn.take() {
@@ -577,6 +595,17 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_cools_down_until_its_end() {
+        let mut app = busy_app();
+
+        assert!(app.on_event(Event::Paused { secs: 30 }).is_empty());
+        let Activity::Cooling { until } = *activity(&app) else {
+            panic!("{:?}", activity(&app));
+        };
+        assert!(until >= Duration::from_secs(30) && until < Duration::from_secs(31));
+    }
+
+    #[test]
     fn turn_end_without_text_commits_nothing() {
         let mut app = busy_app();
 
@@ -783,5 +812,16 @@ mod tests {
 
         assert_eq!(app.scroll, Some(30));
         assert_eq!(app.approval, Some(7));
+    }
+
+    #[test]
+    fn the_context_limit_is_kept_for_the_session() {
+        let mut app = App::default();
+
+        app.on_event(Event::ContextLimit {
+            tokens: Some(262144),
+        });
+
+        assert_eq!(app.context_limit, Some(262144));
     }
 }
