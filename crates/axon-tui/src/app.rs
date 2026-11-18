@@ -20,8 +20,8 @@ pub(crate) struct App {
     pub(crate) streaming_text: String,
     /// The model's reasoning streaming in, until its reply or a tool call starts.
     pub(crate) streaming_reasoning: String,
-    /// A prompt sent while a turn ran: it goes out when the turn ends, or back
-    /// into the input if the turn is cancelled.
+    /// Prompts sent while a turn ran, joined by new lines: they go out when
+    /// the turn ends, however it ends.
     pub(crate) queued: Option<Prompt>,
     /// Prompts sent this session, oldest first.
     pub(crate) past: Vec<Prompt>,
@@ -30,7 +30,7 @@ pub(crate) struct App {
     pub(crate) recall: Option<(usize, Prompt)>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
-    /// The running turn; Enter does nothing until it ends.
+    /// The running turn; Enter queues until it ends.
     pub(crate) turn: Option<Turn>,
     /// How the last turn ended, shown in the activity row until the next one.
     pub(crate) finished: Option<Finished>,
@@ -225,7 +225,9 @@ impl App {
             (KeyCode::Char('y' | 'Y'), KeyModifiers::NONE | KeyModifiers::SHIFT) => true,
             (KeyCode::Char('n' | 'N'), KeyModifiers::NONE | KeyModifiers::SHIFT) => false,
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Some(Action::Quit),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+            (KeyCode::Char('c' | 's'), KeyModifiers::CONTROL)
+            | (KeyCode::Enter, KeyModifiers::CONTROL)
+            | (KeyCode::Esc, _) => {
                 self.approval = None;
                 return self.cancel();
             }
@@ -810,13 +812,30 @@ mod tests {
 
     #[test]
     fn ctrl_enter_with_nothing_queued_or_typed_leaves_the_turn_running() {
-        let mut app = busy_app();
+        for send_now in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            ctrl('s'),
+        ] {
+            let mut app = busy_app();
+            type_text(&mut app, "  ");
 
-        assert_eq!(
-            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
-            None
-        );
-        assert_eq!(*activity(&app), Activity::Thinking);
+            assert_eq!(app.on_key(send_now), None);
+            assert_eq!(*activity(&app), Activity::Thinking);
+        }
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_cancelling_still_sends_the_queue() {
+        let mut app = busy_app();
+        type_text(&mut app, "next");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+
+        assert_eq!(app.send_queued(), Some(Action::Submit("next".into())));
     }
 
     #[test]
@@ -973,12 +992,18 @@ mod tests {
     }
 
     #[test]
-    fn esc_while_asked_cancels_the_turn() {
-        let mut app = asked_app();
+    fn esc_ctrl_enter_and_ctrl_s_while_asked_cancel_the_turn() {
+        for cancel in [
+            key(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            ctrl('s'),
+        ] {
+            let mut app = asked_app();
 
-        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Cancel));
-        assert!(app.approval.is_none());
-        assert_eq!(*activity(&app), Activity::Cancelling);
+            assert_eq!(app.on_key(cancel), Some(Action::Cancel));
+            assert!(app.approval.is_none());
+            assert_eq!(*activity(&app), Activity::Cancelling);
+        }
     }
 
     fn scrolled_app() -> App {

@@ -36,7 +36,7 @@ TUI keys:
 
 Prompts sent during a turn wait below it as `Next`. When the turn ends, however it ends, they go to the model together as one message. Ctrl+Enter adds the input to them and stops the turn at once, keeping the reply so far.
 
-Ctrl+Enter needs a terminal with the kitty keyboard protocol, for example kitty, WezTerm, Ghostty, iTerm2, Alacritty or foot. Other terminals, such as macOS Terminal and the Windows console, and tmux by default, send it as Enter (it queues) or as Ctrl+J (a new line). Ctrl+S works in every terminal.
+Ctrl+Enter needs a terminal with the kitty keyboard protocol, for example kitty, WezTerm, Ghostty, iTerm2, Alacritty or foot. On Windows it works in any console. Other terminals, such as macOS Terminal, and tmux by default, send it as Enter (it queues) or as Ctrl+J (a new line). Ctrl+S works in every terminal.
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
 
