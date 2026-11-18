@@ -2,6 +2,7 @@
 //! and writes the user approves) and stream it to a frontend. Knows
 //! nothing about any frontend.
 
+mod backend;
 mod context;
 mod jail;
 #[cfg(test)]
@@ -21,6 +22,7 @@ use axon_protocol::{SessionError, SessionFactory, SessionHandle};
 use model::ModelClient;
 use turn::Agent;
 
+pub use backend::{Backend, UnknownBackend};
 pub use model::ModelConfig;
 
 /// Model requests per prompt before a turn stops.
@@ -51,6 +53,7 @@ impl SessionFactory for CoreFactory {
         let cwd = cwd
             .canonicalize()
             .map_err(|e| SessionError::Start(format!("{}: {e}", cwd.display())))?;
+        let backend = self.config.backend;
         let base_url = self.config.base_url.clone();
         let api_key = self.config.api_key.clone();
         let model = self.config.model.clone();
@@ -61,7 +64,7 @@ impl SessionFactory for CoreFactory {
                 max_requests: MAX_TURN_REQUESTS,
                 request_pause: self.config.request_pause,
             },
-            async move { context::discover(&http, &base_url, &api_key, &model).await },
+            async move { context::discover(&http, backend, &base_url, &api_key, &model).await },
         ))
     }
 }

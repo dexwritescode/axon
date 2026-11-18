@@ -16,8 +16,11 @@ use async_openai::{
 };
 use futures::{Stream, StreamExt, stream};
 
+use crate::backend::Backend;
+
 /// Where to find the model and which one to use.
 pub struct ModelConfig {
+    pub backend: Backend,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -30,6 +33,7 @@ pub struct ModelConfig {
 impl fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModelConfig")
+            .field("backend", &self.backend)
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
@@ -86,6 +90,7 @@ impl ToolCalls {
 pub(crate) struct ModelClient {
     inner: Client<OpenAIConfig>,
     model: String,
+    backend: Backend,
     max_tokens: u32,
 }
 
@@ -97,6 +102,7 @@ impl ModelClient {
         Self {
             inner: Client::with_config(openai),
             model: config.model.clone(),
+            backend: config.backend,
             max_tokens: config.max_tokens,
         }
     }
@@ -108,13 +114,17 @@ impl ModelClient {
         messages: Vec<ChatCompletionRequestMessage>,
         tools: Vec<ChatCompletionTools>,
     ) -> Result<impl Stream<Item = Result<Delta>> + use<>> {
-        let request = CreateChatCompletionRequestArgs::default()
+        let mut request = CreateChatCompletionRequestArgs::default();
+        request
             .model(&self.model)
             .messages(messages)
             .tools(tools)
-            .stream(true)
-            .max_completion_tokens(self.max_tokens)
-            .build()?;
+            .stream(true);
+        match self.backend {
+            Backend::Ollama => request.max_tokens(self.max_tokens),
+            _ => request.max_completion_tokens(self.max_tokens),
+        };
+        let request = request.build()?;
         let stream = self.inner.chat().create_stream(request).await?;
 
         Ok(stream.flat_map(|chunk| {
@@ -209,6 +219,21 @@ mod tests {
             .mount(&server)
             .await;
         let client = ModelClient::new(&config(api_url(&server)));
+
+        assert_eq!(collect(&client).await.unwrap().0, ["ok"]);
+    }
+
+    #[tokio::test]
+    async fn ollama_requests_use_max_tokens_which_it_honours() {
+        let server = MockServer::start().await;
+        Mock::given(body_partial_json(json!({"max_tokens": 4096})))
+            .respond_with(reply(&["ok"]))
+            .mount(&server)
+            .await;
+        let client = ModelClient::new(&ModelConfig {
+            backend: Backend::Ollama,
+            ..config(api_url(&server))
+        });
 
         assert_eq!(collect(&client).await.unwrap().0, ["ok"]);
     }

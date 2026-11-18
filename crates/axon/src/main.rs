@@ -2,7 +2,7 @@ use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use axon_core::{CoreFactory, ModelConfig};
+use axon_core::{Backend, CoreFactory, ModelConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,11 +24,15 @@ fn model_config(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig> 
     let pause = pause.parse().with_context(|| {
         format!("AXON_REQUEST_PAUSE_SECS: not a whole number of seconds: {pause}")
     })?;
+    let backend: Backend = var("AXON_BACKEND", "lmstudio")
+        .parse()
+        .context("AXON_BACKEND")?;
     let max_tokens = var("AXON_MAX_TOKENS", "16384");
     let max_tokens = max_tokens
         .parse()
         .with_context(|| format!("AXON_MAX_TOKENS: not a whole number: {max_tokens}"))?;
     Ok(ModelConfig {
+        backend,
         base_url: var("OPENAI_BASE_URL", "http://localhost:1234/v1"),
         api_key: var("OPENAI_API_KEY", "lm-studio"),
         model: var("AXON_MODEL", "qwen/qwen3.6-35b-a3b"),
@@ -45,6 +49,7 @@ mod tests {
     fn model_config_defaults_to_lm_studio() {
         let config = model_config(|_| None).unwrap();
 
+        assert_eq!(config.backend, Backend::LmStudio);
         assert_eq!(config.base_url, "http://localhost:1234/v1");
         assert_eq!(config.api_key, "lm-studio");
         assert_eq!(config.model, "qwen/qwen3.6-35b-a3b");
@@ -57,6 +62,7 @@ mod tests {
         let config = model_config(|name| match name {
             "AXON_REQUEST_PAUSE_SECS" => Some("30".into()),
             "AXON_MAX_TOKENS" => Some("2048".into()),
+            "AXON_BACKEND" => Some("ollama".into()),
             _ => Some(format!("{name}-value")),
         })
         .unwrap();
@@ -66,6 +72,18 @@ mod tests {
         assert_eq!(config.model, "AXON_MODEL-value");
         assert_eq!(config.request_pause, Duration::from_secs(30));
         assert_eq!(config.max_tokens, 2048);
+        assert_eq!(config.backend, Backend::Ollama);
+    }
+
+    #[test]
+    fn an_unknown_backend_is_an_error() {
+        let err = model_config(|name| (name == "AXON_BACKEND").then(|| "lm-studio".into()));
+
+        let message = format!("{:#}", err.unwrap_err());
+        assert!(
+            message.contains("AXON_BACKEND") && message.contains("lmstudio"),
+            "{message}"
+        );
     }
 
     #[test]

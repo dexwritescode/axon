@@ -9,11 +9,13 @@ use std::time::Duration;
 
 use axon_protocol::{Command, Event, SessionHandle, StopReason};
 
+use crate::backend::Backend;
 use crate::model::{ModelClient, ModelConfig};
 use crate::turn::Agent;
 
 pub(crate) fn config(base_url: String) -> ModelConfig {
     ModelConfig {
+        backend: Backend::LmStudio,
         base_url,
         api_key: "test".into(),
         model: "test-model".into(),

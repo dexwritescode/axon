@@ -32,13 +32,13 @@ TUI keys:
 | Esc, Ctrl+C | cancel the turn |
 | Ctrl+C when idle, Ctrl+Q | quit |
 
-To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`.
+To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
 
 To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0).
 
 Each model reply may take at most `AXON_MAX_TOKENS` tokens, reasoning included (default 16384); a reply cut off there ends the turn.
 
-At session start Axon asks the server for the model's loaded context size (LM Studio, vLLM, llama.cpp and Ollama report it) and shows it after each turn, e.g. `✓ Finished at 14:32 · 2m 5s · 262k context`. Ollama and LM Studio report it only while the model is loaded.
+At session start Axon asks the backend for the model's loaded context size (all but `openai` report it) and shows it after each turn, e.g. `✓ Finished at 14:32 · 2m 5s · 262k context`. Ollama and LM Studio report it only while the model is loaded.
 
 ## Test against real servers (macOS)
 
