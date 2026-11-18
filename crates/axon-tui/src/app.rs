@@ -20,6 +20,9 @@ pub(crate) struct App {
     pub(crate) streaming_text: String,
     /// The model's reasoning streaming in, until its reply or a tool call starts.
     pub(crate) streaming_reasoning: String,
+    /// A prompt sent while a turn ran: it goes out when the turn ends, or back
+    /// into the input if the turn is cancelled.
+    pub(crate) queued: Option<String>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
     /// The running turn; Enter does nothing until it ends.
@@ -210,13 +213,31 @@ impl App {
         Some(Action::Answer { id, approve })
     }
 
+    /// Send the input, or queue it while a turn runs.
     fn submit(&mut self) -> Option<Action> {
         let text = self.input.text().trim();
-        if self.turn.is_some() || text.is_empty() {
+        if text.is_empty() {
             return None;
         }
         let text = text.to_string();
         self.input.clear();
+        if self.turn.is_some() {
+            self.queued = Some(match self.queued.take() {
+                Some(queued) => format!("{queued}\n{text}"),
+                None => text,
+            });
+            return None;
+        }
+        self.turn = Some(Turn::new(Instant::now()));
+        Some(Action::Submit(text))
+    }
+
+    /// Once the turn has ended, the queued prompt to send.
+    pub(crate) fn send_queued(&mut self) -> Option<Action> {
+        if self.turn.is_some() {
+            return None;
+        }
+        let text = self.queued.take()?;
         self.turn = Some(Turn::new(Instant::now()));
         Some(Action::Submit(text))
     }
@@ -331,7 +352,15 @@ impl App {
                     StopReason::MaxTurnRequests => committed.push(Committed::Error(
                         "stopped: too many model requests for one prompt".into(),
                     )),
-                    StopReason::Cancelled => committed.push(Committed::Cancelled),
+                    StopReason::Cancelled => {
+                        committed.push(Committed::Cancelled);
+                        if let Some(queued) = self.queued.take() {
+                            self.input = match self.input.text() {
+                                "" => queued.as_str().into(),
+                                typed => format!("{queued}\n{typed}").as_str().into(),
+                            };
+                        }
+                    }
                     StopReason::MaxTokens => committed.push(Committed::Error(
                         "stopped: the reply reached the token limit (AXON_MAX_TOKENS)".into(),
                     )),
@@ -416,15 +445,6 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
         assert!(app.turn.is_none());
-    }
-
-    #[test]
-    fn enter_while_busy_keeps_the_input() {
-        let mut app = busy_app();
-        type_text(&mut app, "next");
-
-        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
-        assert_eq!(app.input.text(), "next");
     }
 
     #[test]
@@ -647,6 +667,42 @@ mod tests {
                 bytes: 3200
             }
         );
+    }
+
+    #[test]
+    fn enter_during_a_turn_queues_the_prompt_until_the_turn_ends() {
+        let mut app = busy_app();
+        type_text(&mut app, "next");
+
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.queued.as_deref(), Some("next"));
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.send_queued(), None, "the turn still runs");
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+
+        assert_eq!(app.send_queued(), Some(Action::Submit("next".into())));
+        assert!(app.turn.is_some());
+        assert_eq!(app.queued, None);
+    }
+
+    #[test]
+    fn a_cancelled_turn_puts_the_queued_prompt_back_in_the_input() {
+        let mut app = busy_app();
+        type_text(&mut app, "first");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "second");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "typing");
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
+
+        assert_eq!(app.input.text(), "first\nsecond\ntyping");
+        assert_eq!(app.send_queued(), None);
     }
 
     #[test]

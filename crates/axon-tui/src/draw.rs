@@ -21,6 +21,7 @@ use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
 const THINK: &str = "Think ";
+const QUEUED: &str = "Next  ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
@@ -226,6 +227,13 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
     let reply = app.streaming_text.trim_start();
     if !reply.is_empty() {
         items.push(Paragraph::new(labelled(AGENT, theme::AGENT, reply)).wrap(Wrap { trim: false }));
+    }
+    if let Some(queued) = &app.queued {
+        items.push(
+            Paragraph::new(labelled(QUEUED, theme::MUTED, queued))
+                .fg(theme::MUTED)
+                .wrap(Wrap { trim: false }),
+        );
     }
     let heights: Vec<u32> = items
         .iter()
@@ -648,6 +656,23 @@ mod tests {
             text(committed(&thought, 80, COMMITTED_DIFF_ROWS), 80),
             ["  ✻   thought · 4.1k chars"]
         );
+    }
+
+    #[test]
+    fn a_queued_prompt_shows_muted_below_the_reply() {
+        let mut app = app("Working on it.", "");
+        app.turn = Some(busy_turn());
+        app.queued = Some("then run the tests".into());
+
+        let screen = render(&app, &[], 40, 14);
+
+        let reply = screen
+            .rows
+            .iter()
+            .position(|r| r == "Agent Working on it.")
+            .unwrap();
+        assert_eq!(screen.rows[reply + 1], "Next  then run the tests");
+        assert_eq!(screen.buffer[(6, reply as u16 + 1)].fg, theme::MUTED);
     }
 
     #[test]
