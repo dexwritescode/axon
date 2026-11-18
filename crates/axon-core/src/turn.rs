@@ -345,10 +345,9 @@ fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session;
     use crate::test_support::{
         agent, client_error, delta, end, prompt, prompt_answering, reply, respond, sent_messages,
-        tool_calls,
+        spawn, tool_calls,
     };
     use axon_protocol::SessionHandle;
     use axon_protocol::{Change, Command};
@@ -364,10 +363,11 @@ mod tests {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("notes.txt"), "remember the milk\n").unwrap();
-        let handle = session::spawn(Agent {
+        let handle = spawn(Agent {
             max_requests,
             ..agent(&server, dir.path())
-        });
+        })
+        .await;
         (server, dir, handle)
     }
 
@@ -466,10 +466,11 @@ mod tests {
     async fn requests_after_the_first_wait_for_the_pause() {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let mut handle = session::spawn(Agent {
+        let mut handle = spawn(Agent {
             request_pause: Duration::from_millis(300),
             ..agent(&server, dir.path())
-        });
+        })
+        .await;
         respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
         respond(&server, reply(&["done"])).await;
 
@@ -486,10 +487,11 @@ mod tests {
     async fn cancel_cuts_a_pause_short() {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        let mut handle = session::spawn(Agent {
+        let mut handle = spawn(Agent {
             request_pause: Duration::from_secs(60),
             ..agent(&server, dir.path())
-        });
+        })
+        .await;
         respond(&server, tool_calls(&[("c", "list_dir", "{}")])).await;
         handle
             .commands

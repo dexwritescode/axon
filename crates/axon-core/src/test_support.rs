@@ -101,6 +101,16 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
     }
 }
 
+/// Start a session with no context limit (for tests).
+pub(crate) async fn spawn(agent: Agent) -> SessionHandle {
+    let mut handle = crate::session::spawn(agent, async { None });
+    assert_eq!(
+        handle.events.recv().await,
+        Some(Event::ContextLimit { tokens: None })
+    );
+    handle
+}
+
 pub(crate) fn end(stop: StopReason) -> Event {
     Event::TurnEnded { stop }
 }

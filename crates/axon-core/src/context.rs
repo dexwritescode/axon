@@ -3,10 +3,6 @@
 use reqwest::Client;
 
 /// Returns the first answer from a list of probes, or None when no probe answers.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the context warning will call it")
-)]
 pub(crate) async fn discover(
     http: &Client,
     base_url: &str,

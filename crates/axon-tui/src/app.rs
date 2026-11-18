@@ -292,6 +292,7 @@ impl App {
                 committed.push(Committed::Error(message));
                 committed
             }
+            Event::ContextLimit { .. } => Vec::new(),
             Event::TurnEnded { stop } => {
                 if let Some(turn) = self.turn.take() {
                     self.finished = Some(Finished {

@@ -21,6 +21,8 @@ pub enum Command {
 /// Sent by a session to its frontend.
 #[derive(Debug, PartialEq)]
 pub enum Event {
+    /// The model's context size in tokens, as the server reports it; None when it doesn't. Always the session's first event.
+    ContextLimit { tokens: Option<u64> },
     /// A piece of the model's reply, in order.
     TextDelta { text: String },
     /// The model called a tool; `args` is the JSON text it sent. `id` is
