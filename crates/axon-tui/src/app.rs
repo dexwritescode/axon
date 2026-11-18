@@ -69,6 +69,8 @@ pub(crate) struct Turn {
     /// Advances on every tick; picks the spinner frame.
     pub(crate) frame: usize,
     pub(crate) activity: Activity,
+    /// An error ended the turn.
+    failed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,6 +78,7 @@ pub(crate) struct Finished {
     pub(crate) stop: StopReason,
     pub(crate) at: DateTime<Local>,
     pub(crate) took: Duration,
+    pub(crate) failed: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -104,6 +107,7 @@ impl Turn {
             elapsed: Duration::ZERO,
             frame: 0,
             activity: Activity::Thinking,
+            failed: false,
         }
     }
 }
@@ -328,6 +332,9 @@ impl App {
                 Vec::new()
             }
             Event::Error { message } => {
+                if let Some(turn) = &mut self.turn {
+                    turn.failed = true;
+                }
                 let mut committed = self.take_reply();
                 committed.push(Committed::Error(message));
                 committed
@@ -346,6 +353,7 @@ impl App {
                         stop,
                         at: Local::now(),
                         took: turn.started.elapsed(),
+                        failed: turn.failed,
                     });
                 }
                 self.approval = None;
@@ -581,6 +589,17 @@ mod tests {
                 Committed::Error("boom".into())
             ]
         );
+    }
+
+    #[test]
+    fn a_turn_that_errored_finishes_as_failed() {
+        let mut app = busy_app();
+        app.on_event(Event::Error {
+            message: "boom".into(),
+        });
+        app.on_event(END);
+
+        assert!(app.finished.unwrap().failed);
     }
 
     #[test]

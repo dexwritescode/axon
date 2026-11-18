@@ -333,6 +333,7 @@ fn activity(turn: &Turn) -> Line<'static> {
 /// The activity row once a turn has ended.
 fn finished_line(finished: &Finished, context_limit: Option<u64>) -> Line<'static> {
     let (color, mark, word) = match finished.stop {
+        _ if finished.failed => (theme::ERROR, '✗', "Failed"),
         StopReason::EndTurn => (theme::DONE, '✓', "Finished"),
         StopReason::Cancelled => (theme::ERROR, '✗', "Cancelled"),
         StopReason::MaxTurnRequests | StopReason::MaxTokens => (theme::ERROR, '✗', "Stopped"),
@@ -578,11 +579,28 @@ mod tests {
             at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
                 .unwrap(),
             took: Duration::from_millis(125_400),
+            failed: false,
         });
         let screen = render(&app, &[], 40, 14);
 
         assert_eq!(screen.rows[11], "✓ Finished at 14:32 · 2m 5s");
         assert_eq!(screen.buffer[(0, 11)].fg, theme::DONE);
+    }
+
+    #[test]
+    fn a_failed_turn_shows_as_failed() {
+        let mut app = app("", "");
+        app.finished = Some(Finished {
+            stop: StopReason::EndTurn,
+            at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
+                .unwrap(),
+            took: Duration::from_secs(3),
+            failed: true,
+        });
+        let screen = render(&app, &[], 40, 14);
+
+        assert_eq!(screen.rows[11], "✗ Failed at 14:32 · 3s");
+        assert_eq!(screen.buffer[(0, 11)].fg, theme::ERROR);
     }
 
     #[test]
@@ -594,6 +612,7 @@ mod tests {
             at: chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 11, 17, 14, 32, 0)
                 .unwrap(),
             took: Duration::from_millis(125_400),
+            failed: false,
         });
         let screen = render(&app, &[], 60, 14);
 
