@@ -26,6 +26,7 @@ async fn live_backend_reports_its_context_and_answers() {
         api_key: "none".into(),
         model,
         request_pause: Duration::ZERO,
+        max_tokens: 4096,
     };
     let client = model::ModelClient::new(&config);
 
@@ -49,6 +50,7 @@ async fn live_backend_reports_its_context_and_answers() {
                     tool_call_names.push(name.clone());
                 }
             }
+            Delta::Truncated => panic!("the reply hit the token limit"),
         }
     }
 

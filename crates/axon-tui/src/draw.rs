@@ -307,7 +307,7 @@ fn finished_line(finished: &Finished, context_limit: Option<u64>) -> Line<'stati
     let (color, mark, word) = match finished.stop {
         StopReason::EndTurn => (theme::DONE, '✓', "Finished"),
         StopReason::Cancelled => (theme::ERROR, '✗', "Cancelled"),
-        StopReason::MaxTurnRequests => (theme::ERROR, '✗', "Stopped"),
+        StopReason::MaxTurnRequests | StopReason::MaxTokens => (theme::ERROR, '✗', "Stopped"),
     };
     let at = finished.at.format("%H:%M");
     let took = elapsed(finished.took);

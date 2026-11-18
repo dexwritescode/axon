@@ -99,6 +99,8 @@ pub enum StopReason {
     MaxTurnRequests,
     /// The frontend sent `Command::Cancel`.
     Cancelled,
+    /// A model reply reached the per-request token limit and was cut off.
+    MaxTokens,
 }
 
 /// What a frontend holds: a session's command sender and event receiver.

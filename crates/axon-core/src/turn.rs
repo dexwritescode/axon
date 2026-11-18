@@ -73,6 +73,12 @@ impl Agent {
                 }
                 return Ok(StopReason::Cancelled);
             }
+            if reply.truncated {
+                if !reply.text.is_empty() {
+                    history.push(assistant_message(reply.text, &[])?);
+                }
+                return Ok(StopReason::MaxTokens);
+            }
             history.push(assistant_message(reply.text, &reply.calls)?);
             if reply.calls.is_empty() {
                 return Ok(StopReason::EndTurn);
@@ -167,6 +173,7 @@ impl Agent {
                     events.send(Event::TextDelta { text: delta }).await?;
                 }
                 Delta::ToolCall(chunk) => calls.push(chunk),
+                Delta::Truncated => reply.truncated = true,
             }
         }
         reply.calls = calls.finish();
@@ -316,6 +323,8 @@ struct Reply {
     text: String,
     calls: Vec<ToolCall>,
     cancelled: bool,
+    /// Cut off at the token limit; its tool calls are incomplete.
+    truncated: bool,
 }
 
 fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionRequestMessage> {
@@ -346,8 +355,8 @@ fn assistant_message(text: String, calls: &[ToolCall]) -> Result<ChatCompletionR
 mod tests {
     use super::*;
     use crate::test_support::{
-        agent, client_error, delta, end, prompt, prompt_answering, reply, respond, sent_messages,
-        spawn_started, tool_calls,
+        agent, chunk, client_error, delta, end, prompt, prompt_answering, reply, respond,
+        sent_messages, spawn_started, sse, tool_calls,
     };
     use axon_protocol::SessionHandle;
     use axon_protocol::{Change, Command};
@@ -481,6 +490,26 @@ mod tests {
         let pauses = events.iter().filter(|e| matches!(e, Event::Paused { .. }));
         assert_eq!(pauses.collect::<Vec<_>>(), [&Event::Paused { secs: 0 }]);
         assert_eq!(events.last(), Some(&end(StopReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_at_the_token_limit_ends_the_turn_without_its_tool_calls() {
+        let server = MockServer::start().await;
+        let chunks = [
+            chunk(json!({"content": "Let me look."}), None),
+            chunk(
+                json!({"tool_calls": [{"index": 0, "id": "c", "type": "function", "function": {"name": "list_dir", "arguments": "{\"pa"}}]}),
+                Some("length"),
+            ),
+        ];
+        respond(&server, sse(&chunks)).await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        assert_eq!(
+            prompt(&mut handle, "hi").await,
+            [delta("Let me look."), end(StopReason::MaxTokens)]
+        );
     }
 
     #[tokio::test]

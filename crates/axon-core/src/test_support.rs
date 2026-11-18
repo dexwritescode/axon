@@ -18,6 +18,7 @@ pub(crate) fn config(base_url: String) -> ModelConfig {
         api_key: "test".into(),
         model: "test-model".into(),
         request_pause: Duration::ZERO,
+        max_tokens: 4096,
     }
 }
 

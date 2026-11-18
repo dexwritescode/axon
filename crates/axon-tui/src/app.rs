@@ -315,6 +315,9 @@ impl App {
                         "stopped: too many model requests for one prompt".into(),
                     )),
                     StopReason::Cancelled => committed.push(Committed::Cancelled),
+                    StopReason::MaxTokens => committed.push(Committed::Error(
+                        "stopped: the reply reached the token limit (AXON_MAX_TOKENS)".into(),
+                    )),
                 }
                 committed
             }
@@ -581,6 +584,17 @@ mod tests {
 
         assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("too many")));
         assert!(app.turn.is_none());
+    }
+
+    #[test]
+    fn token_limit_is_explained() {
+        let mut app = busy_app();
+
+        let committed = app.on_event(Event::TurnEnded {
+            stop: StopReason::MaxTokens,
+        });
+
+        assert!(matches!(&committed[..], [Committed::Error(e)] if e.contains("AXON_MAX_TOKENS")));
     }
 
     #[test]

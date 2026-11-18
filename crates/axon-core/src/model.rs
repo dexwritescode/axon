@@ -11,7 +11,7 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage, ChatCompletionTools,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequestArgs, FinishReason,
     },
 };
 use futures::{Stream, StreamExt, stream};
@@ -23,6 +23,8 @@ pub struct ModelConfig {
     pub model: String,
     /// Wait between a turn's model requests, to let the machine cool.
     pub request_pause: Duration,
+    /// Most tokens one model reply may take, reasoning included.
+    pub max_tokens: u32,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -32,6 +34,7 @@ impl fmt::Debug for ModelConfig {
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
             .field("request_pause", &self.request_pause)
+            .field("max_tokens", &self.max_tokens)
             .finish()
     }
 }
@@ -42,6 +45,8 @@ pub(crate) enum Delta {
     Text(String),
     /// A fragment of a tool call; `ToolCalls` puts them back together.
     ToolCall(ChatCompletionMessageToolCallChunk),
+    /// The reply hit `max_tokens` and was cut off.
+    Truncated,
 }
 
 /// A complete tool call. `args` is the JSON text as the model sent it.
@@ -81,6 +86,7 @@ impl ToolCalls {
 pub(crate) struct ModelClient {
     inner: Client<OpenAIConfig>,
     model: String,
+    max_tokens: u32,
 }
 
 impl ModelClient {
@@ -91,6 +97,7 @@ impl ModelClient {
         Self {
             inner: Client::with_config(openai),
             model: config.model.clone(),
+            max_tokens: config.max_tokens,
         }
     }
 
@@ -106,6 +113,7 @@ impl ModelClient {
             .messages(messages)
             .tools(tools)
             .stream(true)
+            .max_completion_tokens(self.max_tokens)
             .build()?;
         let stream = self.inner.chat().create_stream(request).await?;
 
@@ -118,9 +126,11 @@ impl ModelClient {
                     .flat_map(|choice| {
                         let text = choice.delta.content.filter(|text| !text.is_empty());
                         let calls = choice.delta.tool_calls.unwrap_or_default();
+                        let truncated = choice.finish_reason == Some(FinishReason::Length);
                         text.map(Delta::Text)
                             .into_iter()
                             .chain(calls.into_iter().map(Delta::ToolCall))
+                            .chain(truncated.then_some(Delta::Truncated))
                     })
                     .map(Ok)
                     .collect(),
@@ -145,12 +155,13 @@ fn server_error(error: OpenAIError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{api_url, chunk, client_error, config, respond, sse};
+    use crate::test_support::{api_url, chunk, client_error, config, reply, respond, sse};
     use async_openai::types::chat::{
         ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
     };
     use serde_json::json;
-    use wiremock::{MockServer, ResponseTemplate};
+    use wiremock::matchers::body_partial_json;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn user(text: &str) -> ChatCompletionRequestMessage {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -176,6 +187,7 @@ mod tests {
             match delta? {
                 Delta::Text(text) => texts.push(text),
                 Delta::ToolCall(chunk) => calls.push(chunk),
+                Delta::Truncated => texts.push("<truncated>".into()),
             }
         }
         Ok((texts, calls.finish()))
@@ -187,6 +199,29 @@ mod tests {
             name: name.into(),
             args: args.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn requests_ask_for_at_most_max_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(body_partial_json(json!({"max_completion_tokens": 4096})))
+            .respond_with(reply(&["ok"]))
+            .mount(&server)
+            .await;
+        let client = ModelClient::new(&config(api_url(&server)));
+
+        assert_eq!(collect(&client).await.unwrap().0, ["ok"]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_at_the_limit_ends_with_truncated() {
+        let chunks = [chunk(json!({"content": "Once upon"}), Some("length"))];
+        let (_server, client) = client_for(sse(&chunks)).await;
+
+        assert_eq!(
+            collect(&client).await.unwrap().0,
+            ["Once upon", "<truncated>"]
+        );
     }
 
     #[tokio::test]
