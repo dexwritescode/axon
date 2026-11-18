@@ -143,8 +143,7 @@ pub(crate) fn delta(text: &str) -> Event {
     Event::TextDelta { text: text.into() }
 }
 
-/// Send a prompt and collect events after its `UserMessage`, up to and
-/// including `TurnEnded`.
+/// Send a prompt and collect events up to and including `TurnEnded`.
 pub(crate) async fn prompt(handle: &mut SessionHandle, text: &str) -> Vec<Event> {
     prompt_answering(handle, text, None).await
 }
@@ -160,8 +159,6 @@ pub(crate) async fn prompt_answering(
         .send(Command::Prompt { text: text.into() })
         .await
         .unwrap();
-    let first = handle.events.recv().await;
-    assert_eq!(first, Some(Event::UserMessage { text: text.into() }));
     let mut events = Vec::new();
     while let Some(event) = handle.events.recv().await {
         if let (Event::ApprovalRequested { id, .. }, Some(approve)) = (&event, approve) {

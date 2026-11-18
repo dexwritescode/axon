@@ -40,6 +40,7 @@ pub(crate) enum Piece<'a> {
 
 impl Prompt {
     /// The typed text, a long paste standing as one private-use char.
+    #[cfg(test)]
     pub(crate) fn text(&self) -> &str {
         &self.text
     }

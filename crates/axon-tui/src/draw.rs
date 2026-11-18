@@ -22,7 +22,6 @@ use crate::{diff, theme};
 const AGENT: &str = "Agent ";
 const THINK: &str = "Think ";
 const QUEUED: &str = "Next  ";
-const STEER: &str = "Steer ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
@@ -217,7 +216,7 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
         };
         committed(line, area.width, diff_rows)
     }));
-    let reasoning = app.streaming_reasoning.trim_start();
+    let reasoning = app.streaming_reasoning.trim();
     if !reasoning.is_empty() {
         items.push(
             Paragraph::new(labelled(THINK, theme::MUTED, reasoning))
@@ -225,14 +224,13 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
                 .wrap(Wrap { trim: false }),
         );
     }
-    let reply = app.streaming_text.trim_start();
+    let reply = app.streaming_text.trim();
     if !reply.is_empty() {
         items.push(Paragraph::new(labelled(AGENT, theme::AGENT, reply)).wrap(Wrap { trim: false }));
     }
-    let steers = app.sent.iter().map(|steer| (STEER, steer));
-    for (label, prompt) in steers.chain(app.queued.as_ref().map(|queued| (QUEUED, queued))) {
+    if let Some(queued) = &app.queued {
         items.push(
-            Paragraph::new(labelled(label, theme::MUTED, &prompt.shown()))
+            Paragraph::new(labelled(QUEUED, theme::MUTED, &queued.shown()))
                 .fg(theme::MUTED)
                 .wrap(Wrap { trim: false }),
         );
@@ -685,10 +683,9 @@ mod tests {
     }
 
     #[test]
-    fn steers_then_the_queued_prompt_show_muted_below_the_reply() {
+    fn a_queued_prompt_shows_muted_below_the_reply() {
         let mut app = app("Working on it.", "");
         app.turn = Some(busy_turn());
-        app.sent.push_back("use tabs".into());
         app.queued = Some("then run the tests".into());
 
         let screen = render(&app, &[], 40, 14);
@@ -698,10 +695,8 @@ mod tests {
             .iter()
             .position(|r| r == "Agent Working on it.")
             .unwrap();
-        assert_eq!(screen.rows[reply + 1], "Steer use tabs");
-        assert_eq!(screen.rows[reply + 2], "Next  then run the tests");
+        assert_eq!(screen.rows[reply + 1], "Next  then run the tests");
         assert_eq!(screen.buffer[(6, reply as u16 + 1)].fg, theme::MUTED);
-        assert_eq!(screen.buffer[(6, reply as u16 + 2)].fg, theme::MUTED);
     }
 
     #[test]
@@ -718,6 +713,19 @@ mod tests {
             .position(|r| r == "Think Let me check.")
             .unwrap();
         assert_eq!(screen.buffer[(6, row as u16)].fg, theme::MUTED);
+    }
+
+    #[test]
+    fn streaming_text_draws_without_its_surrounding_blank_lines() {
+        let mut app = app("\n\nHi\n\n", "");
+        app.turn = Some(busy_turn());
+        app.streaming_reasoning = "\nHm\n\n".into();
+
+        let screen = render(&app, &[], 40, 14);
+
+        let think = screen.rows.iter().position(|r| r == "Think Hm").unwrap();
+        assert_eq!(screen.rows[think + 1..think + 3], ["Agent Hi", ""]);
+        assert!(screen.rows[think + 3].contains("Esc to cancel"));
     }
 
     #[test]

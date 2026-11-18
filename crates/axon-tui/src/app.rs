@@ -1,6 +1,6 @@
 //! UI state and how keys and session events change it. No terminal I/O.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::mem;
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,6 @@ pub(crate) struct App {
     /// A prompt sent while a turn ran: it goes out when the turn ends, or back
     /// into the input if the turn is cancelled.
     pub(crate) queued: Option<Prompt>,
-    /// Prompts sent and not yet in the model's history, oldest first; each
-    /// `UserMessage` commits one. They show muted below the turn.
-    pub(crate) sent: VecDeque<Prompt>,
     /// Prompts sent this session, oldest first.
     pub(crate) past: Vec<Prompt>,
     /// While Up and Down step through `past`: the entry shown, and the draft
@@ -33,7 +30,7 @@ pub(crate) struct App {
     pub(crate) recall: Option<(usize, Prompt)>,
     /// The model's context size in tokens, when the server reported it.
     pub(crate) context_limit: Option<u64>,
-    /// The running turn; Enter queues until it ends.
+    /// The running turn; Enter does nothing until it ends.
     pub(crate) turn: Option<Turn>,
     /// How the last turn ended, shown in the activity row until the next one.
     pub(crate) finished: Option<Finished>,
@@ -190,9 +187,8 @@ impl App {
                 self.input.insert('\n');
                 None
             }
-            // Ctrl+Enter needs the kitty keyboard protocol; Ctrl+S works anywhere.
             (KeyCode::Enter, KeyModifiers::CONTROL)
-            | (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer(),
+            | (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.send_now(),
             (KeyCode::Enter, _) => self.submit(),
             _ => {
                 self.edit(key);
@@ -246,34 +242,6 @@ impl App {
 
     /// Send the input, or queue it while a turn runs.
     fn submit(&mut self) -> Option<Action> {
-        let prompt = self.take_input()?;
-        if self.turn.is_some() {
-            match &mut self.queued {
-                Some(queued) => queued.push_line(&prompt),
-                None => self.queued = Some(prompt),
-            }
-            return None;
-        }
-        self.turn = Some(Turn::new(Instant::now()));
-        self.send(prompt)
-    }
-
-    /// Send the input into the running turn; with none, or while it is
-    /// cancelled, the same as Enter.
-    fn steer(&mut self) -> Option<Action> {
-        let running = self
-            .turn
-            .as_ref()
-            .is_some_and(|turn| turn.activity != Activity::Cancelling);
-        if !running {
-            return self.submit();
-        }
-        let prompt = self.take_input()?;
-        self.send(prompt)
-    }
-
-    /// Empty the input into a prompt to send, remembering it for recall.
-    fn take_input(&mut self) -> Option<Prompt> {
         if self.input.is_empty() {
             return None;
         }
@@ -283,12 +251,25 @@ impl App {
         if self.past.last().map(Prompt::expanded) != Some(prompt.expanded()) {
             self.past.push(prompt.clone());
         }
-        Some(prompt)
+        if self.turn.is_some() {
+            match &mut self.queued {
+                Some(queued) => queued.push_line(&prompt),
+                None => self.queued = Some(prompt),
+            }
+            return None;
+        }
+        self.turn = Some(Turn::new(Instant::now()));
+        Some(Action::Submit(prompt))
     }
 
-    fn send(&mut self, prompt: Prompt) -> Option<Action> {
-        self.sent.push_back(prompt.clone());
-        Some(Action::Submit(prompt))
+    /// Queue the input, then cancel the turn so the queue is sent at once.
+    fn send_now(&mut self) -> Option<Action> {
+        if self.turn.is_none() {
+            return self.submit();
+        }
+        self.submit();
+        self.queued.as_ref()?;
+        self.cancel()
     }
 
     /// Show the prompt sent before the one shown, keeping the draft.
@@ -318,15 +299,14 @@ impl App {
         }
     }
 
-    /// Once the turn has ended, and no steer left over starts the next one,
-    /// the queued prompt to send.
+    /// Once the turn has ended, the queued prompt to send.
     pub(crate) fn send_queued(&mut self) -> Option<Action> {
-        if self.turn.is_some() || !self.sent.is_empty() {
+        if self.turn.is_some() {
             return None;
         }
         let prompt = self.queued.take()?;
         self.turn = Some(Turn::new(Instant::now()));
-        self.send(prompt)
+        Some(Action::Submit(prompt))
     }
 
     /// Pasted text goes into the input, newlines and all; a waiting change
@@ -383,12 +363,6 @@ impl App {
 
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
         match event {
-            Event::UserMessage { text } => {
-                let shown = self.sent.pop_front().map_or(text, |prompt| prompt.shown());
-                let mut committed = self.take_reply();
-                committed.push(Committed::User(shown));
-                committed
-            }
             Event::ReasoningDelta { text } => {
                 self.streaming_reasoning.push_str(&text);
                 Vec::new()
@@ -441,10 +415,6 @@ impl App {
                 Vec::new()
             }
             Event::TurnEnded { stop } => {
-                let cancelling = self
-                    .turn
-                    .as_ref()
-                    .is_some_and(|turn| turn.activity == Activity::Cancelling);
                 if let Some(turn) = self.turn.take() {
                     self.finished = Some(Finished {
                         stop,
@@ -452,10 +422,6 @@ impl App {
                         took: turn.started.elapsed(),
                         failed: turn.failed,
                     });
-                }
-                if !self.sent.is_empty() {
-                    // A prompt the turn didn't take starts the next one.
-                    self.turn = Some(Turn::new(Instant::now()));
                 }
                 self.approval = None;
                 self.calls.clear();
@@ -469,15 +435,6 @@ impl App {
                     StopReason::MaxTokens => committed.push(Committed::Error(
                         "stopped: the reply reached the token limit (AXON_MAX_TOKENS)".into(),
                     )),
-                }
-                if (stop == StopReason::Cancelled || cancelling)
-                    && let Some(queued) = self.queued.take()
-                {
-                    let typed = mem::replace(&mut self.input, queued);
-                    if !typed.text().is_empty() {
-                        self.input.push_line(&typed);
-                    }
-                    self.recall = None;
                 }
                 committed
             }
@@ -813,39 +770,53 @@ mod tests {
         assert_eq!(app.queued, None);
     }
 
-    fn ctrl_enter() -> KeyEvent {
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
-    }
-
-    fn user_message(text: &str) -> Event {
-        Event::UserMessage { text: text.into() }
-    }
-
     #[test]
-    fn ctrl_enter_during_a_turn_sends_a_steer_that_commits_when_it_joins() {
+    fn a_cancelled_turn_sends_the_queued_prompts_as_one() {
         let mut app = busy_app();
-        type_text(&mut app, "use tabs");
+        type_text(&mut app, "first");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "second");
+        app.on_key(key(KeyCode::Enter));
+        type_text(&mut app, "typing");
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::Cancelled,
+        });
 
         assert_eq!(
-            app.on_key(ctrl_enter()),
-            Some(Action::Submit("use tabs".into()))
+            app.send_queued(),
+            Some(Action::Submit("first\nsecond".into()))
         );
-        assert_eq!(app.input.text(), "");
-        assert_eq!(app.sent, ["use tabs".into()] as [Prompt; 1]);
-        assert_eq!(app.past, ["use tabs".into()] as [Prompt; 1]);
-
-        let committed = app.on_event(user_message("use tabs"));
-
-        assert_eq!(committed, [Committed::User("use tabs".into())]);
-        assert!(app.sent.is_empty());
+        assert_eq!(app.input.text(), "typing");
     }
 
     #[test]
-    fn ctrl_s_steers_too() {
-        let mut app = busy_app();
-        type_text(&mut app, "stop");
+    fn ctrl_enter_and_ctrl_s_queue_the_input_and_cancel_the_turn() {
+        for send_now in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            ctrl('s'),
+        ] {
+            let mut app = busy_app();
+            type_text(&mut app, "first");
+            app.on_key(key(KeyCode::Enter));
+            type_text(&mut app, "now");
 
-        assert_eq!(app.on_key(ctrl('s')), Some(Action::Submit("stop".into())));
+            assert_eq!(app.on_key(send_now), Some(Action::Cancel));
+            assert_eq!(app.queued.as_ref().map(Prompt::text), Some("first\nnow"));
+            assert_eq!(*activity(&app), Activity::Cancelling);
+        }
+    }
+
+    #[test]
+    fn ctrl_enter_with_nothing_queued_or_typed_leaves_the_turn_running() {
+        let mut app = busy_app();
+
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(*activity(&app), Activity::Thinking);
     }
 
     #[test]
@@ -853,97 +824,10 @@ mod tests {
         let mut app = App::default();
         type_text(&mut app, "hi");
 
-        assert_eq!(app.on_key(ctrl_enter()), Some(Action::Submit("hi".into())));
-        assert!(app.turn.is_some());
-    }
-
-    #[test]
-    fn ctrl_enter_while_cancelling_queues_like_enter() {
-        let mut app = busy_app();
-        app.on_key(key(KeyCode::Esc));
-        type_text(&mut app, "next");
-
-        assert_eq!(app.on_key(ctrl_enter()), None);
-        assert_eq!(app.queued.as_ref().map(Prompt::text), Some("next"));
-        assert!(app.sent.is_empty());
-    }
-
-    #[test]
-    fn a_steer_left_over_from_a_turn_starts_the_next_one() {
-        let mut app = busy_app();
-        type_text(&mut app, "steer");
-        app.on_key(ctrl_enter());
-        type_text(&mut app, "queued");
-        app.on_key(key(KeyCode::Enter));
-
-        app.on_event(Event::TurnEnded {
-            stop: StopReason::EndTurn,
-        });
-
-        assert!(app.turn.is_some(), "the steer starts the next turn");
-        assert_eq!(app.send_queued(), None, "the steer goes first");
         assert_eq!(
-            app.on_event(user_message("steer")),
-            [Committed::User("steer".into())]
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(Action::Submit("hi".into()))
         );
-        assert!(app.turn.is_some());
-        app.on_event(Event::TurnEnded {
-            stop: StopReason::EndTurn,
-        });
-        assert_eq!(app.send_queued(), Some(Action::Submit("queued".into())));
-    }
-
-    #[test]
-    fn a_cancel_with_a_steer_waiting_returns_the_queue_and_runs_the_steer() {
-        let mut app = busy_app();
-        type_text(&mut app, "steer");
-        app.on_key(ctrl_enter());
-        type_text(&mut app, "queued");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(key(KeyCode::Esc));
-
-        app.on_event(Event::TurnEnded {
-            stop: StopReason::Cancelled,
-        });
-
-        assert_eq!(app.input.text(), "queued");
-        assert_eq!(activity(&app), &Activity::Thinking);
-        assert_eq!(
-            app.on_event(user_message("steer")),
-            [Committed::User("steer".into())]
-        );
-    }
-
-    #[test]
-    fn a_cancelled_turn_puts_the_queued_prompt_back_in_the_input() {
-        let mut app = busy_app();
-        type_text(&mut app, "first");
-        app.on_key(key(KeyCode::Enter));
-        type_text(&mut app, "second");
-        app.on_key(key(KeyCode::Enter));
-        type_text(&mut app, "typing");
-
-        app.on_event(Event::TurnEnded {
-            stop: StopReason::Cancelled,
-        });
-
-        assert_eq!(app.input.text(), "first\nsecond\ntyping");
-        assert_eq!(app.send_queued(), None);
-    }
-
-    #[test]
-    fn a_turn_that_ends_while_cancelling_keeps_the_queued_prompt_in_the_input() {
-        let mut app = busy_app();
-        type_text(&mut app, "next");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(key(KeyCode::Esc));
-
-        app.on_event(Event::TurnEnded {
-            stop: StopReason::EndTurn,
-        });
-
-        assert_eq!(app.send_queued(), None);
-        assert_eq!(app.input.text(), "next");
     }
 
     #[test]
@@ -1218,22 +1102,6 @@ mod tests {
         app.on_key(key(KeyCode::Up));
         app.on_key(key(KeyCode::Up));
         assert_eq!(app.input.text(), "one");
-    }
-
-    #[test]
-    fn a_cancel_that_restores_the_queue_ends_recall() {
-        let mut app = history_app();
-        app.turn = Some(Turn::new(Instant::now()));
-        type_text(&mut app, "later");
-        app.on_key(key(KeyCode::Enter));
-        app.on_key(key(KeyCode::Up));
-        app.on_event(Event::TurnEnded {
-            stop: StopReason::Cancelled,
-        });
-        assert_eq!(app.input.text(), "later\nlater");
-
-        app.on_key(key(KeyCode::Down));
-        assert_eq!(app.input.text(), "later\nlater");
     }
 
     #[test]
