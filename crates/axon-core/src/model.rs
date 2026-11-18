@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_openai::{
     Client,
     config::OpenAIConfig,
+    error::OpenAIError,
     types::chat::{
         ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage, ChatCompletionTools,
         CreateChatCompletionRequestArgs,
@@ -110,7 +111,7 @@ impl ModelClient {
 
         Ok(stream.flat_map(|chunk| {
             let deltas: Vec<Result<Delta>> = match chunk {
-                Err(e) => vec![Err(e.into())],
+                Err(e) => vec![Err(server_error(e))],
                 Ok(chunk) => chunk
                     .choices
                     .into_iter()
@@ -127,6 +128,18 @@ impl ModelClient {
             stream::iter(deltas)
         }))
     }
+}
+
+/// A server that fails mid-stream sends an error object where a chunk should
+/// be; report its message rather than the failed chunk parse.
+fn server_error(error: OpenAIError) -> anyhow::Error {
+    if let OpenAIError::JSONDeserialize(_, body) = &error
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(message) = json["error"]["message"].as_str().or(json["error"].as_str())
+    {
+        return anyhow::anyhow!("server error: {message}");
+    }
+    error.into()
 }
 
 #[cfg(test)]
@@ -174,6 +187,30 @@ mod tests {
             name: name.into(),
             args: args.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn an_error_object_in_the_stream_reports_the_servers_message() {
+        let error =
+            json!({"error": {"message": "The model has crashed without additional information."}});
+        let (_server, client) = client_for(sse(&[error.to_string()])).await;
+
+        let message = collect(&client).await.unwrap_err().to_string();
+
+        assert_eq!(
+            message,
+            "server error: The model has crashed without additional information."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_string_in_the_stream_reports_it() {
+        let (_server, client) =
+            client_for(sse(&[json!({"error": "model unloaded"}).to_string()])).await;
+
+        let message = collect(&client).await.unwrap_err().to_string();
+
+        assert_eq!(message, "server error: model unloaded");
     }
 
     #[test]
