@@ -21,7 +21,8 @@ TUI keys:
 
 | Key | Action |
 | --- | --- |
-| Enter | send |
+| Enter | send; during a turn, send when it ends |
+| Ctrl+Enter, Ctrl+S | during a turn, steer it |
 | Shift+Enter, Ctrl+J | new line |
 | ←/→, ↑/↓ | move the cursor |
 | ↑ on the first row, ↓ on the last | previous / next sent prompt |
@@ -32,6 +33,10 @@ TUI keys:
 | Y / N | approve or reject a change |
 | Esc, Ctrl+C | cancel the turn |
 | Ctrl+C when idle, Ctrl+Q | quit |
+
+Steering sends a prompt into the running turn: the model gets it before its next request, after the tool calls in flight. If the turn makes no further request (it ends, is cancelled or a change is rejected), the prompt starts the next turn. It shows as `Steer` below the turn until the model gets it.
+
+Ctrl+Enter needs a terminal with the kitty keyboard protocol, for example kitty, WezTerm, Ghostty, Alacritty or foot. Other terminals, such as macOS Terminal and the Windows console, and tmux by default, send it as Enter (it queues) or as Ctrl+J (a new line). Ctrl+S steers in every terminal.
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
 

@@ -159,7 +159,10 @@ async fn step(
                     .ok()?;
                 Some(Vec::new())
             }
-            Some(Action::Submit(prompt)) => Some(vec![submit(commands, &prompt).await?]),
+            Some(Action::Submit(prompt)) => {
+                submit(commands, &prompt).await?;
+                Some(Vec::new())
+            }
             None => Some(Vec::new()),
         },
         Input::Mouse(mouse) => {
@@ -171,9 +174,9 @@ async fn step(
             Some(Vec::new())
         }
         Input::Session(event) => {
-            let mut committed = app.on_event(event?);
+            let committed = app.on_event(event?);
             if let Some(Action::Submit(prompt)) = app.send_queued() {
-                committed.push(submit(commands, &prompt).await?);
+                submit(commands, &prompt).await?;
             }
             Some(committed)
         }
@@ -185,11 +188,10 @@ async fn step(
     }
 }
 
-/// Send `prompt` in full; its history line shows long pastes as labels.
-async fn submit(commands: &mpsc::Sender<Command>, prompt: &Prompt) -> Option<Committed> {
+/// Send `prompt` in full; its history line comes with its `UserMessage`.
+async fn submit(commands: &mpsc::Sender<Command>, prompt: &Prompt) -> Option<()> {
     let text = prompt.expanded();
-    commands.send(Command::Prompt { text }).await.ok()?;
-    Some(Committed::User(prompt.shown()))
+    commands.send(Command::Prompt { text }).await.ok()
 }
 
 /// Draw the screen and remember the history pane's size for scrolling.
@@ -216,15 +218,23 @@ mod tests {
         }
     }
 
+    fn user_message(text: &str) -> Input {
+        Input::Session(Some(Event::UserMessage { text: text.into() }))
+    }
+
     #[tokio::test]
-    async fn submit_sends_a_prompt_and_commits_the_user_line() {
+    async fn submit_sends_a_prompt_and_commits_it_when_it_enters_the_history() {
         let (commands, mut sent) = mpsc::channel(1);
         let mut app = app_with_input("hi");
 
         let committed = step(&mut app, &commands, key(KeyCode::Enter)).await;
 
-        assert_eq!(committed, Some(vec![Committed::User("hi".into())]));
+        assert_eq!(committed, Some(Vec::new()));
         assert!(matches!(sent.recv().await, Some(Command::Prompt { text }) if text == "hi"));
+        assert_eq!(
+            step(&mut app, &commands, user_message("hi")).await,
+            Some(vec![Committed::User("hi".into())])
+        );
     }
 
     #[tokio::test]
@@ -234,13 +244,30 @@ mod tests {
         app.settings.paste_token_chars = 5;
         app.on_paste("long paste");
 
-        let committed = step(&mut app, &commands, key(KeyCode::Enter)).await;
+        step(&mut app, &commands, key(KeyCode::Enter)).await;
 
-        let shown = Committed::User("see [pasted 10 chars]".into());
-        assert_eq!(committed, Some(vec![shown]));
         assert!(
             matches!(sent.recv().await, Some(Command::Prompt { text }) if text == "see long paste")
         );
+        let shown = Committed::User("see [pasted 10 chars]".into());
+        assert_eq!(
+            step(&mut app, &commands, user_message("see long paste")).await,
+            Some(vec![shown])
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_during_a_turn_sends_the_prompt_at_once() {
+        let (commands, mut sent) = mpsc::channel(2);
+        let mut app = app_with_input("hi");
+        step(&mut app, &commands, key(KeyCode::Enter)).await;
+        app.input = "steer".into();
+
+        let ctrl_s = Input::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        step(&mut app, &commands, ctrl_s).await;
+
+        sent.recv().await;
+        assert!(matches!(sent.recv().await, Some(Command::Prompt { text }) if text == "steer"));
     }
 
     #[tokio::test]

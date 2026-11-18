@@ -1,6 +1,6 @@
 //! UI state and how keys and session events change it. No terminal I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,9 @@ pub(crate) struct App {
     /// A prompt sent while a turn ran: it goes out when the turn ends, or back
     /// into the input if the turn is cancelled.
     pub(crate) queued: Option<Prompt>,
+    /// Prompts sent and not yet in the model's history, oldest first; each
+    /// `UserMessage` commits one. Steers show muted below the turn.
+    pub(crate) sent: VecDeque<Prompt>,
     /// Prompts sent this session, oldest first.
     pub(crate) past: Vec<Prompt>,
     /// While Up and Down step through `past`: the entry shown, and the draft
@@ -187,6 +190,9 @@ impl App {
                 self.input.insert('\n');
                 None
             }
+            // Ctrl+Enter needs the kitty keyboard protocol; Ctrl+S works anywhere.
+            (KeyCode::Enter, KeyModifiers::CONTROL)
+            | (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer(),
             (KeyCode::Enter, _) => self.submit(),
             _ => {
                 self.edit(key);
@@ -240,6 +246,34 @@ impl App {
 
     /// Send the input, or queue it while a turn runs.
     fn submit(&mut self) -> Option<Action> {
+        let prompt = self.take_input()?;
+        if self.turn.is_some() {
+            match &mut self.queued {
+                Some(queued) => queued.push_line(&prompt),
+                None => self.queued = Some(prompt),
+            }
+            return None;
+        }
+        self.turn = Some(Turn::new(Instant::now()));
+        self.send(prompt)
+    }
+
+    /// Send the input into the running turn; with none, or while it is
+    /// cancelled, the same as Enter.
+    fn steer(&mut self) -> Option<Action> {
+        let running = self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.activity != Activity::Cancelling);
+        if !running {
+            return self.submit();
+        }
+        let prompt = self.take_input()?;
+        self.send(prompt)
+    }
+
+    /// Empty the input into a prompt to send, remembering it for recall.
+    fn take_input(&mut self) -> Option<Prompt> {
         if self.input.is_empty() {
             return None;
         }
@@ -249,14 +283,11 @@ impl App {
         if self.past.last().map(Prompt::expanded) != Some(prompt.expanded()) {
             self.past.push(prompt.clone());
         }
-        if self.turn.is_some() {
-            match &mut self.queued {
-                Some(queued) => queued.push_line(&prompt),
-                None => self.queued = Some(prompt),
-            }
-            return None;
-        }
-        self.turn = Some(Turn::new(Instant::now()));
+        Some(prompt)
+    }
+
+    fn send(&mut self, prompt: Prompt) -> Option<Action> {
+        self.sent.push_back(prompt.clone());
         Some(Action::Submit(prompt))
     }
 
@@ -287,14 +318,15 @@ impl App {
         }
     }
 
-    /// Once the turn has ended, the queued prompt to send.
+    /// Once the turn has ended, and no steer left over starts the next one,
+    /// the queued prompt to send.
     pub(crate) fn send_queued(&mut self) -> Option<Action> {
-        if self.turn.is_some() {
+        if self.turn.is_some() || !self.sent.is_empty() {
             return None;
         }
         let prompt = self.queued.take()?;
         self.turn = Some(Turn::new(Instant::now()));
-        Some(Action::Submit(prompt))
+        self.send(prompt)
     }
 
     /// Pasted text goes into the input, newlines and all; a waiting change
@@ -351,7 +383,14 @@ impl App {
 
     pub(crate) fn on_event(&mut self, event: Event) -> Vec<Committed> {
         match event {
-            Event::UserMessage { .. } => Vec::new(),
+            Event::UserMessage { text } => {
+                // A steer left over from the last turn starts this one.
+                self.turn.get_or_insert_with(|| Turn::new(Instant::now()));
+                let shown = self.sent.pop_front().map_or(text, |prompt| prompt.shown());
+                let mut committed = self.take_reply();
+                committed.push(Committed::User(shown));
+                committed
+            }
             Event::ReasoningDelta { text } => {
                 self.streaming_reasoning.push_str(&text);
                 Vec::new()
@@ -770,6 +809,85 @@ mod tests {
         assert_eq!(app.send_queued(), Some(Action::Submit("next".into())));
         assert!(app.turn.is_some());
         assert_eq!(app.queued, None);
+    }
+
+    fn ctrl_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
+    }
+
+    fn user_message(text: &str) -> Event {
+        Event::UserMessage { text: text.into() }
+    }
+
+    #[test]
+    fn ctrl_enter_during_a_turn_sends_a_steer_that_commits_when_it_joins() {
+        let mut app = busy_app();
+        type_text(&mut app, "use tabs");
+
+        assert_eq!(
+            app.on_key(ctrl_enter()),
+            Some(Action::Submit("use tabs".into()))
+        );
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.sent, ["use tabs".into()] as [Prompt; 1]);
+        assert_eq!(app.past, ["use tabs".into()] as [Prompt; 1]);
+
+        let committed = app.on_event(user_message("use tabs"));
+
+        assert_eq!(committed, [Committed::User("use tabs".into())]);
+        assert!(app.sent.is_empty());
+    }
+
+    #[test]
+    fn ctrl_s_steers_too() {
+        let mut app = busy_app();
+        type_text(&mut app, "stop");
+
+        assert_eq!(app.on_key(ctrl('s')), Some(Action::Submit("stop".into())));
+    }
+
+    #[test]
+    fn ctrl_enter_while_idle_sends_like_enter() {
+        let mut app = App::default();
+        type_text(&mut app, "hi");
+
+        assert_eq!(app.on_key(ctrl_enter()), Some(Action::Submit("hi".into())));
+        assert!(app.turn.is_some());
+    }
+
+    #[test]
+    fn ctrl_enter_while_cancelling_queues_like_enter() {
+        let mut app = busy_app();
+        app.on_key(key(KeyCode::Esc));
+        type_text(&mut app, "next");
+
+        assert_eq!(app.on_key(ctrl_enter()), None);
+        assert_eq!(app.queued.as_ref().map(Prompt::text), Some("next"));
+        assert!(app.sent.is_empty());
+    }
+
+    #[test]
+    fn a_steer_left_over_from_a_turn_starts_the_next_one() {
+        let mut app = busy_app();
+        type_text(&mut app, "steer");
+        app.on_key(ctrl_enter());
+        type_text(&mut app, "queued");
+        app.on_key(key(KeyCode::Enter));
+
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+
+        assert_eq!(app.send_queued(), None, "the steer goes first");
+        assert_eq!(
+            app.on_event(user_message("steer")),
+            [Committed::User("steer".into())]
+        );
+        assert!(app.turn.is_some());
+        app.on_event(Event::TurnEnded {
+            stop: StopReason::EndTurn,
+        });
+        assert_eq!(app.send_queued(), Some(Action::Submit("queued".into())));
     }
 
     #[test]

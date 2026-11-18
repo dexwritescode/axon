@@ -22,6 +22,7 @@ use crate::{diff, theme};
 const AGENT: &str = "Agent ";
 const THINK: &str = "Think ";
 const QUEUED: &str = "Next  ";
+const STEER: &str = "Steer ";
 const INDENT: &str = "      ";
 const PROMPT: &str = "> ";
 const PROMPT_INDENT: &str = "  ";
@@ -228,9 +229,10 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
     if !reply.is_empty() {
         items.push(Paragraph::new(labelled(AGENT, theme::AGENT, reply)).wrap(Wrap { trim: false }));
     }
-    if let Some(queued) = &app.queued {
+    let steers = app.sent.iter().map(|steer| (STEER, steer));
+    for (label, prompt) in steers.chain(app.queued.as_ref().map(|queued| (QUEUED, queued))) {
         items.push(
-            Paragraph::new(labelled(QUEUED, theme::MUTED, &queued.shown()))
+            Paragraph::new(labelled(label, theme::MUTED, &prompt.shown()))
                 .fg(theme::MUTED)
                 .wrap(Wrap { trim: false }),
         );
@@ -683,9 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_prompt_shows_muted_below_the_reply() {
+    fn steers_then_the_queued_prompt_show_muted_below_the_reply() {
         let mut app = app("Working on it.", "");
         app.turn = Some(busy_turn());
+        app.sent.push_back("use tabs".into());
         app.queued = Some("then run the tests".into());
 
         let screen = render(&app, &[], 40, 14);
@@ -695,8 +698,10 @@ mod tests {
             .iter()
             .position(|r| r == "Agent Working on it.")
             .unwrap();
-        assert_eq!(screen.rows[reply + 1], "Next  then run the tests");
+        assert_eq!(screen.rows[reply + 1], "Steer use tabs");
+        assert_eq!(screen.rows[reply + 2], "Next  then run the tests");
         assert_eq!(screen.buffer[(6, reply as u16 + 1)].fg, theme::MUTED);
+        assert_eq!(screen.buffer[(6, reply as u16 + 2)].fg, theme::MUTED);
     }
 
     #[test]
