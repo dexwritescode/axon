@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::app::{Activity, App, Committed, Finished, Turn, View};
-use crate::prompt::Prompt;
+use crate::prompt::{Piece, Prompt};
 use crate::{diff, theme};
 
 const AGENT: &str = "Agent ";
@@ -230,7 +230,7 @@ fn history_pane(frame: &mut Frame, area: Rect, app: &App, history: &[Committed])
     }
     if let Some(queued) = &app.queued {
         items.push(
-            Paragraph::new(labelled(QUEUED, theme::MUTED, queued))
+            Paragraph::new(labelled(QUEUED, theme::MUTED, &queued.shown()))
                 .fg(theme::MUTED)
                 .wrap(Wrap { trim: false }),
         );
@@ -298,7 +298,12 @@ fn input(prompt: &Prompt, width: usize, top: usize) -> (Vec<Line<'static>>, Posi
                 0 => Span::from(PROMPT).fg(theme::INPUT).bold(),
                 _ => Span::from(PROMPT_INDENT),
             };
-            Line::from(vec![head, Span::from(prompt.text()[range].to_string())])
+            let mut spans = vec![head];
+            spans.extend(prompt.pieces(range).into_iter().map(|piece| match piece {
+                Piece::Text(text) => Span::from(text.to_string()),
+                Piece::Paste(label) => Span::from(label).fg(theme::MUTED),
+            }));
+            Line::from(spans)
         })
         .collect();
     let cursor = Position::new((PROMPT.len() + col) as u16, (row - skip) as u16);

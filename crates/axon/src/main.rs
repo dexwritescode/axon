@@ -8,8 +8,9 @@ use axon_core::{Backend, CoreFactory, ModelConfig};
 async fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
         None => {
-            let config = model_config(|name| env::var(name).ok())?;
-            axon_tui::run(&CoreFactory::new(config)).await?
+            let lookup = |name: &str| env::var(name).ok();
+            let config = model_config(lookup)?;
+            axon_tui::run(&CoreFactory::new(config), tui_settings(lookup)?).await?
         }
         Some("acp") => axon_acp::serve().await?,
         Some(other) => bail!("unknown command: {other}"),
@@ -39,6 +40,16 @@ fn model_config(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig> 
         request_pause: Duration::from_secs(pause),
         max_tokens,
     })
+}
+
+fn tui_settings(lookup: impl Fn(&str) -> Option<String>) -> Result<axon_tui::Settings> {
+    let mut settings = axon_tui::Settings::default();
+    if let Some(chars) = lookup("AXON_PASTE_TOKEN_CHARS") {
+        settings.paste_token_chars = chars
+            .parse()
+            .with_context(|| format!("AXON_PASTE_TOKEN_CHARS: not a whole number: {chars}"))?;
+    }
+    Ok(settings)
 }
 
 #[cfg(test)]
@@ -102,5 +113,14 @@ mod tests {
                 .to_string()
                 .contains("AXON_REQUEST_PAUSE_SECS")
         );
+    }
+
+    #[test]
+    fn tui_settings_read_the_paste_token_size() {
+        assert_eq!(tui_settings(|_| None).unwrap().paste_token_chars, 1000);
+        let set = |name: &str| (name == "AXON_PASTE_TOKEN_CHARS").then(|| "50".into());
+        assert_eq!(tui_settings(set).unwrap().paste_token_chars, 50);
+        let bad = |name: &str| (name == "AXON_PASTE_TOKEN_CHARS").then(|| "lots".into());
+        assert!(tui_settings(bad).is_err());
     }
 }
