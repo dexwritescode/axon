@@ -1,15 +1,16 @@
 //! Runs eval tasks through Axon on the configured model and scores them.
 //! The runs only talk to sessions through `axon-protocol`, like a frontend.
 
+mod git;
 mod run;
 mod suite;
 mod task;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use axon_config::Config;
 use axon_core::CoreFactory;
 
@@ -28,6 +29,9 @@ struct Cli {
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let cli = cli(&args)?;
+    if env::var_os("CARGO_TARGET_DIR").is_some_and(|dir| !dir.is_empty()) {
+        bail!("unset CARGO_TARGET_DIR: the runs share a build folder in <out>/target");
+    }
     let tasks = task::load_all(&cli.tasks)?;
     let config = Config::from_env()?;
     if let Some(parent) = cli.out.parent() {
@@ -35,22 +39,39 @@ async fn main() -> Result<()> {
     }
     fs::create_dir(&cli.out).with_context(|| format!("{}", cli.out.display()))?;
     let out = cli.out.canonicalize()?;
-    // Cargo finds this walking up from each run, so the runs share one build
-    // folder instead of each building from nothing.
+    share_build(&out)?;
+    let model = config.model.model.clone();
+    let factory = CoreFactory::new(config.model, out.join("sessions"));
+    let scores = tokio::select! {
+        scores = suite::suite(&factory, &tasks, cli.runs, &model, &out, run::LIMITS) => scores,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
+    };
+    let unshared = unshare_build(&out);
+    let scores = scores?;
+    unshared?;
+    eprint!("\n{}", suite::summary(&scores));
+    Ok(())
+}
+
+/// Points cargo, which finds `<out>/.cargo` walking up from each run, at one
+/// build folder for all runs instead of each building from nothing.
+fn share_build(out: &Path) -> Result<()> {
     fs::create_dir(out.join(".cargo"))?;
     fs::write(
         out.join(".cargo/config.toml"),
         "[build]\ntarget-dir = \"target\"\n",
     )?;
-    let model = config.model.model.clone();
-    let factory = CoreFactory::new(config.model, out.join("sessions"));
-    let scores = suite::suite(&factory, &tasks, cli.runs, &model, &out, run::LIMITS).await;
-    let target = out.join("target");
-    if target.exists() {
-        fs::remove_dir_all(target)?;
+    Ok(())
+}
+
+/// Deletes the shared build folder and stops pointing cargo at it.
+fn unshare_build(out: &Path) -> Result<()> {
+    for dir in ["target", ".cargo"] {
+        let dir = out.join(dir);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+        }
     }
-    let scores = scores?;
-    eprint!("\n{}", suite::summary(&scores));
     Ok(())
 }
 
@@ -78,6 +99,21 @@ mod tests {
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn the_runs_share_a_build_folder_that_goes_at_the_end() {
+        let out = tempfile::tempdir().unwrap();
+        share_build(out.path()).unwrap();
+        let config = fs::read_to_string(out.path().join(".cargo/config.toml")).unwrap();
+        assert!(config.contains(r#"target-dir = "target""#), "{config}");
+        fs::create_dir_all(out.path().join("target/debug")).unwrap();
+
+        unshare_build(out.path()).unwrap();
+
+        assert!(!out.path().join("target").exists());
+        assert!(!out.path().join(".cargo").exists());
+        unshare_build(out.path()).unwrap();
     }
 
     #[test]

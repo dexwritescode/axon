@@ -3,10 +3,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+use crate::git::git_sync;
 
 /// What `task.toml` holds.
 #[derive(Debug, Deserialize)]
@@ -30,6 +31,9 @@ pub struct Task {
     /// The starting files, copied for each run; with `rev`, the git repo
     /// they are checked out from.
     pub repo: PathBuf,
+    /// The full id of the commit `rev` names, read once at load so a branch
+    /// moving later doesn't change it.
+    pub commit: Option<String>,
     pub spec: Spec,
 }
 
@@ -57,20 +61,20 @@ fn load(dir: &Path) -> Result<Task> {
     if spec.check.is_empty() {
         bail!("{}: check is empty", path.display());
     }
-    let repo = match &spec.rev {
+    let (repo, commit) = match &spec.rev {
         Some(rev) => {
-            let top = git(dir, &["rev-parse", "--show-toplevel"])?;
+            let top = git_sync(dir, &["rev-parse", "--show-toplevel"])?;
             let commit = format!("{rev}^{{commit}}");
-            git(dir, &["rev-parse", "--verify", "--quiet", &commit])
+            let commit = git_sync(dir, &["rev-parse", "--verify", "--quiet", &commit])
                 .with_context(|| format!("{}: no commit {rev}", path.display()))?;
-            PathBuf::from(top.trim())
+            (PathBuf::from(top.trim()), Some(commit.trim().to_string()))
         }
         None => {
             let repo = dir.join("repo");
             if !repo.is_dir() {
                 bail!("{}: no repo folder", dir.display());
             }
-            repo
+            (repo, None)
         }
     };
     let name = dir
@@ -78,25 +82,12 @@ fn load(dir: &Path) -> Result<Task> {
         .context("a task folder has no name")?
         .to_string_lossy()
         .into_owned();
-    Ok(Task { name, repo, spec })
-}
-
-/// Runs git in `dir`; returns stdout, or fails when git does.
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .context("could not run git")?;
-    if !output.status.success() {
-        bail!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(Task {
+        name,
+        repo,
+        commit,
+        spec,
+    })
 }
 
 #[cfg(test)]
@@ -153,16 +144,18 @@ mod tests {
         let top = root.path().canonicalize().unwrap();
         for args in [
             &["init", "-q"][..],
-            &["commit", "-q", "--allow-empty", "-m", "x"],
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+            &["branch", "first"],
+            &["commit", "-q", "--allow-empty", "-m", "two"],
         ] {
-            let ok = Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(args)
-                .current_dir(&top)
-                .status()
-                .unwrap();
-            assert!(ok.success());
+            git_sync(&top, args).unwrap();
         }
+        let id = |rev| {
+            git_sync(&top, &["rev-parse", rev])
+                .unwrap()
+                .trim()
+                .to_string()
+        };
         let tasks = top.join("tasks");
         let dir = tasks.join("t");
         fs::create_dir_all(&dir).unwrap();
@@ -172,6 +165,11 @@ mod tests {
         let task = &load_all(&tasks).unwrap()[0];
         assert_eq!(task.repo.canonicalize().unwrap(), top);
         assert_eq!(task.spec.rev.as_deref(), Some("HEAD"));
+        for rev in ["HEAD", "HEAD^", "first"] {
+            fs::write(dir.join("task.toml"), toml(rev)).unwrap();
+            let task = &load_all(&tasks).unwrap()[0];
+            assert_eq!(task.commit, Some(id(rev)), "{rev}");
+        }
 
         fs::write(dir.join("task.toml"), toml("nope")).unwrap();
         let err = format!("{:#}", load_all(&tasks).unwrap_err());

@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use axon_protocol::{
     Command, Event, Exit, Resume, SessionFactory, SessionHandle, StopReason, ToolResult,
 };
@@ -16,6 +16,7 @@ use process_wrap::tokio::*;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
+use crate::git::{git, git_ok};
 use crate::task::Task;
 
 /// How long a check and a model's turn may take.
@@ -27,7 +28,8 @@ pub struct Limits {
 }
 
 pub const LIMITS: Limits = Limits {
-    check: Duration::from_secs(300),
+    // Room for a cold build of a workspace like Axon's.
+    check: Duration::from_secs(600),
     turn: Duration::from_secs(30 * 60),
 };
 
@@ -37,13 +39,6 @@ const DRAIN: Duration = Duration::from_secs(1);
 
 /// Build output deleted after a run; the source stays to read.
 const BUILD_DIRS: [&str; 4] = ["target", "__pycache__", ".pytest_cache", ".venv"];
-
-/// Stands in for the user's git config, so their hooks, excludes and line
-/// ending settings don't change a run.
-#[cfg(unix)]
-const NO_CONFIG: &str = "/dev/null";
-#[cfg(windows)]
-const NO_CONFIG: &str = "NUL";
 
 /// How a run went; a line of `results.jsonl`.
 #[derive(Debug, Serialize)]
@@ -87,8 +82,8 @@ pub async fn run(
 ) -> Result<Run> {
     let work = dir.join("work");
     let check = &task.spec.check;
-    match &task.spec.rev {
-        Some(rev) => checkout(&task.repo, rev, dir, &work).await?,
+    match &task.commit {
+        Some(commit) => checkout(&task.repo, commit, dir).await?,
         None => copy_dir(&task.repo, &work)?,
     }
     clean(&work)?;
@@ -98,7 +93,7 @@ pub async fn run(
     let start = git(&work, &["rev-parse", "HEAD"]).await?;
     let start = start.trim();
     // A rev's check passes from the start: it asks that nothing broke.
-    if task.spec.rev.is_none() && run_check(check, &work, limits.check).await?.0 {
+    if task.commit.is_none() && run_check(check, &work, limits.check).await?.0 {
         clean(&work)?;
         return Ok(Run::Broken);
     }
@@ -125,6 +120,7 @@ pub async fn run(
         let restore = ["restore", &source, "--staged", "--worktree"];
         git(&work, &with_paths(&restore, task)).await?;
     }
+    let changed = !git_ok(&work, &["diff", "--cached", "--quiet", start]).await?;
 
     let (passed, output) = run_check(check, &work, limits.check).await?;
     fs::write(dir.join("check.txt"), output)?;
@@ -132,7 +128,7 @@ pub async fn run(
 
     Ok(Run::Done(Outcome {
         session: id,
-        pass: passed && !diff.is_empty(),
+        pass: passed && changed,
         stop: turn.stop,
         tests_changed,
         tool_calls: turn.tool_calls,
@@ -252,56 +248,15 @@ async fn run_check(check: &[String], work: &Path, limit: Duration) -> Result<(bo
     Ok((status.is_some_and(|s| s.success()), text))
 }
 
-/// Runs git in `work`; returns stdout, or fails when git does.
-async fn git(work: &Path, args: &[&str]) -> Result<String> {
-    let output = git_command(work, args)
-        .output()
-        .await
-        .context("could not run git")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git {}: {stderr}", args.join(" "));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Whether git exits 0, for the commands that answer with their exit code.
-async fn git_ok(work: &Path, args: &[&str]) -> Result<bool> {
-    let output = git_command(work, args)
-        .output()
-        .await
-        .context("could not run git")?;
-    Ok(output.status.success())
-}
-
-/// git in `work` with a fixed identity and without the user's git config.
-fn git_command(work: &Path, args: &[&str]) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NO_CONFIG)
-        .args([
-            "-c",
-            "user.name=axon-eval",
-            "-c",
-            "user.email=axon-eval@localhost",
-        ])
-        .args(args)
-        .current_dir(work)
-        .stdin(Stdio::null());
-    command
-}
-
-/// Puts the files of `repo` at `rev` in `work`, without its history.
-async fn checkout(repo: &Path, rev: &str, dir: &Path, work: &Path) -> Result<()> {
+/// Puts the files of `repo` at `commit` in `dir/work`, without its history.
+/// The clone goes to a relative path: git may not take Windows' `\\?\` ones.
+async fn checkout(repo: &Path, commit: &str, dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
-    let (repo, to) = (repo.to_string_lossy(), work.to_string_lossy());
-    git(
-        dir,
-        &["clone", "-q", "--shared", "--no-checkout", &repo, &to],
-    )
-    .await?;
-    git(work, &["checkout", "-q", "--detach", rev]).await?;
+    let repo = repo.to_string_lossy();
+    let clone = ["clone", "-q", "--shared", "--no-checkout", &repo, "work"];
+    git(dir, &clone).await?;
+    let work = dir.join("work");
+    git(&work, &["checkout", "-q", "--detach", commit]).await?;
     fs::remove_dir_all(work.join(".git"))?;
     Ok(())
 }
@@ -458,6 +413,7 @@ pub(crate) mod tests {
         Task {
             name: name.into(),
             repo,
+            commit: None,
             spec,
         }
     }
@@ -574,18 +530,22 @@ pub(crate) mod tests {
         assert!(matches!(result.unwrap(), Run::Broken));
     }
 
-    /// A rev task: `notes.txt` says `broken` at HEAD of a repo in `root/src`,
-    /// which has uncommitted work on top; the check always passes.
+    /// A rev task starting from the first commit of a repo in `root/src`,
+    /// where `notes.txt` says `broken`; a later commit adds `later.txt`, and
+    /// there is uncommitted work on top. The check always passes.
     async fn rev_task(root: &Path) -> Task {
         let mut task = task(root, "src");
-        task.spec.rev = Some("HEAD".into());
         task.spec.check = vec!["git".into(), "--version".into()];
-        git(&task.repo, &["init", "-q"]).await.unwrap();
-        git(&task.repo, &["add", "-A"]).await.unwrap();
-        git(&task.repo, &["commit", "-q", "-m", "one"])
-            .await
-            .unwrap();
-        fs::write(task.repo.join("uncommitted.txt"), "").unwrap();
+        let repo = &task.repo;
+        git(repo, &["init", "-q"]).await.unwrap();
+        git(repo, &["add", "-A"]).await.unwrap();
+        git(repo, &["commit", "-q", "-m", "one"]).await.unwrap();
+        let first = git(repo, &["rev-parse", "HEAD"]).await.unwrap();
+        fs::write(repo.join("later.txt"), "").unwrap();
+        git(repo, &["add", "-A"]).await.unwrap();
+        git(repo, &["commit", "-q", "-m", "two"]).await.unwrap();
+        fs::write(repo.join("uncommitted.txt"), "").unwrap();
+        task.commit = Some(first.trim().into());
         task
     }
 
@@ -599,6 +559,7 @@ pub(crate) mod tests {
 
         assert!(outcome.pass);
         assert!(!dir.join("work/uncommitted.txt").exists());
+        assert!(!dir.join("work/later.txt").exists());
         let log = git(&dir.join("work"), &["log", "--format=%s"])
             .await
             .unwrap();
@@ -614,6 +575,18 @@ pub(crate) mod tests {
         let outcome = run(&Stub::Die, &task, &root.path().join("run"), QUICK).await;
 
         assert!(!done(outcome.unwrap()).pass);
+    }
+
+    #[tokio::test]
+    async fn a_rev_run_that_only_changes_the_tests_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let task = rev_task(root.path()).await;
+
+        let outcome = run(&Stub::ChangeTests, &task, &root.path().join("run"), QUICK).await;
+
+        let outcome = done(outcome.unwrap());
+        assert!(outcome.tests_changed);
+        assert!(!outcome.pass);
     }
 
     #[tokio::test]
@@ -649,6 +622,7 @@ pub(crate) mod tests {
         let pid = fs::read_to_string(root.path().join("child.pid")).unwrap();
         let alive = std::process::Command::new("kill")
             .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
             .status()
             .unwrap();
         assert!(!alive.success(), "the check's child is still running");
