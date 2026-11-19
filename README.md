@@ -44,7 +44,7 @@ To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXO
 
 To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0).
 
-Each model reply may take at most `AXON_MAX_TOKENS` tokens, reasoning included (default 16384); a reply cut off there ends the turn.
+Each model reply may take at most `AXON_MAX_TOKENS` tokens, reasoning included (default 16384); a reply cut off there ends the turn. `AXON_REASONING_EFFORT` (`none`, `low`, `medium` or `high`) is sent with each request when set; `none` turns thinking off where the server supports it (LM Studio does for qwen); a server may reject a value it doesn't support.
 
 A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the input and the history as one `[pasted N chars]` token; the model gets it in full.
 

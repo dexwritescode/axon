@@ -23,6 +23,7 @@ pub(crate) fn config(base_url: String) -> ModelConfig {
         model: "test-model".into(),
         request_pause: Duration::ZERO,
         max_tokens: 4096,
+        reasoning_effort: None,
     }
 }
 

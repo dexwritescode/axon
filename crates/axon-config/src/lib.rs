@@ -80,6 +80,10 @@ fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigE
             format!("not a whole number: {max_tokens}"),
         )
     })?;
+    let reasoning_effort = lookup("AXON_REASONING_EFFORT")
+        .map(|effort| effort.parse())
+        .transpose()
+        .map_err(|e| invalid("AXON_REASONING_EFFORT", format!("{e}")))?;
     Ok(ModelConfig {
         backend,
         base_url: var("OPENAI_BASE_URL", "http://localhost:1234/v1"),
@@ -87,6 +91,7 @@ fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigE
         model: var("AXON_MODEL", "qwen/qwen3.6-35b-a3b"),
         request_pause: Duration::from_secs(pause),
         max_tokens,
+        reasoning_effort,
     })
 }
 
@@ -107,6 +112,7 @@ fn paste_token_chars(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axon_core::ReasoningEffort;
 
     #[test]
     fn sessions_are_saved_in_the_home_folder_unless_the_env_var_says_where() {
@@ -136,6 +142,7 @@ mod tests {
         assert_eq!(config.model, "qwen/qwen3.6-35b-a3b");
         assert_eq!(config.request_pause, Duration::ZERO);
         assert_eq!(config.max_tokens, 16384);
+        assert_eq!(config.reasoning_effort, None);
     }
 
     #[test]
@@ -144,6 +151,7 @@ mod tests {
             "AXON_REQUEST_PAUSE_SECS" => Some("30".into()),
             "AXON_MAX_TOKENS" => Some("2048".into()),
             "AXON_BACKEND" => Some("ollama".into()),
+            "AXON_REASONING_EFFORT" => Some("none".into()),
             _ => Some(format!("{name}-value")),
         })
         .unwrap();
@@ -154,6 +162,7 @@ mod tests {
         assert_eq!(config.request_pause, Duration::from_secs(30));
         assert_eq!(config.max_tokens, 2048);
         assert_eq!(config.backend, Backend::Ollama);
+        assert_eq!(config.reasoning_effort, Some(ReasoningEffort::None));
     }
 
     #[test]
@@ -163,6 +172,17 @@ mod tests {
         let message = err.unwrap_err().to_string();
         assert!(
             message.contains("AXON_BACKEND") && message.contains("lmstudio"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_reasoning_effort_is_an_error() {
+        let err = model(|name| (name == "AXON_REASONING_EFFORT").then(|| "off".into()));
+
+        let message = err.unwrap_err().to_string();
+        assert!(
+            message.contains("AXON_REASONING_EFFORT") && message.contains("none, low"),
             "{message}"
         );
     }
@@ -206,6 +226,7 @@ mod tests {
 
         assert_eq!(config.model.model, "qwen/qwen3.6-35b-a3b");
         assert_eq!(config.model.max_tokens, 16384);
+        assert_eq!(config.model.reasoning_effort, None);
         assert_eq!(config.sessions, PathBuf::from("/home/u/.axon/sessions"));
         assert_eq!(config.paste_token_chars, None);
     }

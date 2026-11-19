@@ -34,6 +34,7 @@ async fn live_backend_reports_its_context_and_answers() {
         model,
         request_pause: Duration::ZERO,
         max_tokens: 4096,
+        reasoning_effort: None,
     };
     let client = model::ModelClient::new(&config);
 
