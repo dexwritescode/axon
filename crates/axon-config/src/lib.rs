@@ -1,9 +1,40 @@
 //! Axon's configuration, read from env vars. The only place config is read.
 
+use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use axon_core::{Backend, ModelConfig};
+
+/// Everything Axon's env vars configure.
+#[derive(Debug)]
+pub struct Config {
+    pub model: ModelConfig,
+    /// Where sessions are saved.
+    pub sessions: PathBuf,
+    /// How long a paste is before the TUI shows it as a token; None leaves
+    /// the TUI's default.
+    pub paste_token_chars: Option<usize>,
+}
+
+impl Config {
+    /// Reads this process's env vars. An empty var counts as unset.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::read(|name| env::var(name).ok(), env::home_dir())
+    }
+
+    fn read(
+        lookup: impl Fn(&str) -> Option<String>,
+        home: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        let lookup = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        Ok(Self {
+            model: model(lookup)?,
+            sessions: sessions_dir(lookup, home)?,
+            paste_token_chars: paste_token_chars(lookup)?,
+        })
+    }
+}
 
 /// Why the configuration could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -11,12 +42,13 @@ pub enum ConfigError {
     /// The env var `var` holds a value that can't be used.
     #[error("{var}: {message}")]
     Invalid { var: &'static str, message: String },
+    /// Neither `AXON_SESSIONS_DIR` nor a home folder says where sessions go.
     #[error("no home folder to save sessions in; set AXON_SESSIONS_DIR")]
     NoHome,
 }
 
 /// `AXON_SESSIONS_DIR`, or `.axon/sessions` in the home folder.
-pub fn sessions_dir(
+fn sessions_dir(
     lookup: impl Fn(&str) -> Option<String>,
     home: Option<PathBuf>,
 ) -> Result<PathBuf, ConfigError> {
@@ -28,7 +60,7 @@ pub fn sessions_dir(
 }
 
 /// Defaults to LM Studio's local server; env vars override each field.
-pub fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigError> {
+fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigError> {
     let var = |name, default: &str| lookup(name).unwrap_or_else(|| default.into());
     let invalid = |var, message| ConfigError::Invalid { var, message };
     let pause = var("AXON_REQUEST_PAUSE_SECS", "0");
@@ -58,9 +90,8 @@ pub fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, Con
     })
 }
 
-/// `AXON_PASTE_TOKEN_CHARS`: how long a paste is before the TUI shows it as
-/// a token; None leaves the TUI's default.
-pub fn paste_token_chars(
+/// `AXON_PASTE_TOKEN_CHARS`, when set.
+fn paste_token_chars(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<usize>, ConfigError> {
     lookup("AXON_PASTE_TOKEN_CHARS")
@@ -89,10 +120,10 @@ mod tests {
             sessions_dir(set, home).unwrap(),
             PathBuf::from("/elsewhere")
         );
-        assert!(matches!(
-            sessions_dir(|_| None, None),
-            Err(ConfigError::NoHome)
-        ));
+        assert_eq!(
+            sessions_dir(|_| None, None).unwrap_err().to_string(),
+            "no home folder to save sessions in; set AXON_SESSIONS_DIR"
+        );
     }
 
     #[test]
@@ -166,5 +197,16 @@ mod tests {
             paste_token_chars(bad).unwrap_err().to_string(),
             "AXON_PASTE_TOKEN_CHARS: not a whole number: lots"
         );
+    }
+
+    #[test]
+    fn an_empty_var_counts_as_unset() {
+        let empty = |_: &str| Some(String::new());
+        let config = Config::read(empty, Some(PathBuf::from("/home/u"))).unwrap();
+
+        assert_eq!(config.model.model, "qwen/qwen3.6-35b-a3b");
+        assert_eq!(config.model.max_tokens, 16384);
+        assert_eq!(config.sessions, PathBuf::from("/home/u/.axon/sessions"));
+        assert_eq!(config.paste_token_chars, None);
     }
 }

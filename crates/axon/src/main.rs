@@ -16,11 +16,10 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match cli(&args)? {
         Cli::Tui(resume) => {
-            let lookup = |name: &str| env::var(name).ok();
-            let config = axon_config::model(lookup)?;
-            let sessions = axon_config::sessions_dir(lookup, env::home_dir())?;
-            let factory = CoreFactory::new(config, sessions);
-            axon_tui::run(&factory, tui_settings(lookup)?, resume).await?
+            let config = axon_config::Config::from_env()?;
+            let settings = tui_settings(config.paste_token_chars);
+            let factory = CoreFactory::new(config.model, config.sessions);
+            axon_tui::run(&factory, settings, resume).await?
         }
         Cli::Acp => axon_acp::serve().await?,
     }
@@ -40,12 +39,12 @@ fn cli(args: &[String]) -> Result<Cli> {
 }
 
 /// The TUI's defaults, with what the config sets.
-fn tui_settings(lookup: impl Fn(&str) -> Option<String>) -> Result<axon_tui::Settings> {
+fn tui_settings(paste_token_chars: Option<usize>) -> axon_tui::Settings {
     let mut settings = axon_tui::Settings::default();
-    if let Some(chars) = axon_config::paste_token_chars(lookup)? {
+    if let Some(chars) = paste_token_chars {
         settings.paste_token_chars = chars;
     }
-    Ok(settings)
+    settings
 }
 
 #[cfg(test)]
@@ -72,8 +71,7 @@ mod tests {
 
     #[test]
     fn tui_settings_keep_the_default_unless_the_config_sets_it() {
-        assert_eq!(tui_settings(|_| None).unwrap().paste_token_chars, 1000);
-        let set = |name: &str| (name == "AXON_PASTE_TOKEN_CHARS").then(|| "50".into());
-        assert_eq!(tui_settings(set).unwrap().paste_token_chars, 50);
+        assert_eq!(tui_settings(None).paste_token_chars, 1000);
+        assert_eq!(tui_settings(Some(50)).paste_token_chars, 50);
     }
 }
