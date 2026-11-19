@@ -5,7 +5,8 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use async_openai::types::chat::ChatCompletionRequestMessage;
@@ -215,6 +216,12 @@ impl Store {
     }
 }
 
+/// How long a busy lock is retried before the session counts as open
+/// elsewhere: a process being spawned holds the file, and so its lock,
+/// until it execs, even after the axon that took it let go.
+const LOCK_WAIT: Duration = Duration::from_millis(200);
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
 /// Open a session file to read and append, locked; an error if another
 /// axon has it open.
 fn lock(path: &Path) -> Result<File> {
@@ -224,10 +231,18 @@ fn lock(path: &Path) -> Result<File> {
         .create(true)
         .open(path)
         .with_context(|| path.display().to_string())?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => bail!("the session is open in another axon"),
-        Err(TryLockError::Error(e)) => Err(e).with_context(|| path.display().to_string()),
+    let began = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if began.elapsed() < LOCK_WAIT => {
+                thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => bail!("the session is open in another axon"),
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| path.display().to_string());
+            }
+        }
     }
 }
 
@@ -930,5 +945,19 @@ mod tests {
         assert!(err.contains("open in another axon"), "{err}");
         drop(store);
         assert!(open_latest(root.path(), "/work/app").is_some());
+    }
+
+    #[test]
+    fn a_lock_let_go_of_soon_after_is_waited_for() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("s.jsonl");
+        let held = lock(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+
+        assert!(lock(&path).is_ok());
+        release.join().unwrap();
     }
 }
