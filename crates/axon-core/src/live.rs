@@ -7,7 +7,7 @@ use futures::StreamExt;
 
 use crate::backend::Backend;
 use crate::context;
-use crate::model::{self, Delta};
+use crate::model::{self, Delta, RequestPause};
 
 #[tokio::test]
 #[ignore = "needs a running server; see scripts/backend-test.sh"]
@@ -32,7 +32,7 @@ async fn live_backend_reports_its_context_and_answers() {
         base_url,
         api_key: "none".into(),
         model,
-        request_pause: Duration::ZERO,
+        request_pause: RequestPause::Fixed(Duration::ZERO),
         max_tokens: 4096,
         reasoning_effort: None,
     };

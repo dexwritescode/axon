@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_openai::types::chat::{
@@ -18,7 +18,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{Delta, ModelClient, ToolCall, ToolCalls};
+use crate::model::{Delta, ModelClient, RequestPause, ToolCall, ToolCalls};
 use crate::prompt;
 use crate::tools::{self, Action, Printed, Seen};
 
@@ -42,7 +42,7 @@ pub(crate) struct Agent {
     /// Model requests per prompt before the turn stops.
     pub(crate) max_requests: usize,
     /// Wait between a turn's model requests.
-    pub(crate) request_pause: Duration,
+    pub(crate) request_pause: RequestPause,
     /// Each file's content hash as the model last read or wrote it.
     pub(crate) seen: Mutex<HashMap<PathBuf, u64>>,
 }
@@ -71,8 +71,13 @@ impl Agent {
         // Pushed only once the next request goes, so a turn stopping first
         // doesn't leave it for the next prompt to follow.
         let mut nudge = false;
-        for request in 0..self.max_requests {
-            if request > 0 && !self.pause(events, cancel).await? {
+        let mut took = None;
+        for _ in 0..self.max_requests {
+            if let Some(took) = took
+                && !self
+                    .pause(self.request_pause.after(took), events, cancel)
+                    .await?
+            {
                 return Ok(StopReason::Cancelled);
             }
             if nudge {
@@ -81,7 +86,9 @@ impl Agent {
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
                 .collect();
+            let began = Instant::now();
             let reply = self.stream_reply(messages, events, cancel).await?;
+            took = Some(began.elapsed());
             if reply.cancelled || reply.truncated {
                 // Even when empty, so the next prompt doesn't follow a user message.
                 history.push(assistant_message(reply.text, &[])?);
@@ -144,21 +151,23 @@ impl Agent {
         files.insert(seen.target, seen.hash);
     }
 
-    /// Wait `request_pause`, saying so; false if cancelled meanwhile.
+    /// Wait `pause`, saying so; false if cancelled meanwhile.
     async fn pause(
         &self,
+        pause: Duration,
         events: &mpsc::Sender<Event>,
         cancel: &CancellationToken,
     ) -> Result<bool> {
-        if self.request_pause.is_zero() {
+        if pause.is_zero() {
             return Ok(true);
         }
-        let secs = self.request_pause.as_secs();
+        // Rounded up, so the wait is never shown as over before it is.
+        let secs = pause.as_secs_f64().ceil() as u64;
         events.send(Event::Paused { secs }).await?;
         Ok(tokio::select! {
             biased;
             _ = cancel.cancelled() => false,
-            _ = tokio::time::sleep(self.request_pause) => true,
+            _ = tokio::time::sleep(pause) => true,
         })
     }
 
@@ -599,11 +608,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ratio_pause_lasts_in_proportion_to_the_request_before() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(Agent {
+            request_pause: RequestPause::Ratio {
+                ratio: 2.0,
+                max: None,
+            },
+            ..agent(&server, dir.path())
+        })
+        .await;
+        let slow = tool_calls(&[("c", "list_dir", "{}")]).set_delay(Duration::from_millis(600));
+        respond(&server, slow).await;
+        respond(&server, reply(&["done"])).await;
+
+        let events = prompt(&mut handle, "list").await;
+
+        assert!(events.contains(&Event::Paused { secs: 2 }), "{events:?}");
+    }
+
+    #[tokio::test]
     async fn requests_after_the_first_wait_for_the_pause() {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let mut handle = spawn_started(Agent {
-            request_pause: Duration::from_millis(300),
+            request_pause: RequestPause::Fixed(Duration::from_millis(300)),
             ..agent(&server, dir.path())
         })
         .await;
@@ -615,7 +645,7 @@ mod tests {
 
         assert!(started.elapsed() >= Duration::from_millis(300));
         let pauses = events.iter().filter(|e| matches!(e, Event::Paused { .. }));
-        assert_eq!(pauses.collect::<Vec<_>>(), [&Event::Paused { secs: 0 }]);
+        assert_eq!(pauses.collect::<Vec<_>>(), [&Event::Paused { secs: 1 }]);
         assert_eq!(events.last(), Some(&end(StopReason::EndTurn)));
     }
 
@@ -778,7 +808,7 @@ mod tests {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let mut handle = spawn_started(Agent {
-            request_pause: Duration::from_secs(60),
+            request_pause: RequestPause::Fixed(Duration::from_secs(60)),
             ..agent(&server, dir.path())
         })
         .await;
@@ -835,7 +865,7 @@ mod tests {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
         let mut handle = spawn_started(Agent {
-            request_pause: Duration::from_secs(60),
+            request_pause: RequestPause::Fixed(Duration::from_secs(60)),
             ..agent(&server, dir.path())
         })
         .await;

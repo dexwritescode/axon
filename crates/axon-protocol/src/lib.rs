@@ -40,7 +40,8 @@ pub enum Event {
     ApprovalRequested { id: u64, change: Change },
     /// The tool call `id` has finished.
     ToolCallFinished { id: u64, result: ToolResult },
-    /// The turn waits `secs` seconds before its next model request.
+    /// The turn waits up to `secs` seconds (rounded up) before its next
+    /// model request.
     Paused { secs: u64 },
     /// Something went wrong; the session stays usable.
     Error { message: String },

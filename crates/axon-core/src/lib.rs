@@ -25,7 +25,7 @@ use store::Store;
 use turn::Agent;
 
 pub use backend::{Backend, ReasoningEffort, UnknownBackend, UnknownReasoningEffort};
-pub use model::ModelConfig;
+pub use model::{ModelConfig, RequestPause};
 
 /// Model requests per prompt before a turn stops.
 const MAX_TURN_REQUESTS: usize = 25;

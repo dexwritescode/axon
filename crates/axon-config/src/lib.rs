@@ -4,7 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axon_core::{Backend, ModelConfig};
+use axon_core::{Backend, ModelConfig, RequestPause};
 
 /// Everything Axon's env vars configure.
 #[derive(Debug)]
@@ -64,12 +64,29 @@ fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigE
     let var = |name, default: &str| lookup(name).unwrap_or_else(|| default.into());
     let invalid = |var, message| ConfigError::Invalid { var, message };
     let pause = var("AXON_REQUEST_PAUSE_SECS", "0");
-    let pause = pause.parse().map_err(|_| {
+    let pause = Duration::from_secs(pause.parse().map_err(|_| {
         invalid(
             "AXON_REQUEST_PAUSE_SECS",
             format!("not a whole number of seconds: {pause}"),
         )
-    })?;
+    })?);
+    // With a ratio, the seconds cap the pause; 0 leaves it uncapped.
+    let request_pause = match lookup("AXON_REQUEST_PAUSE_RATIO") {
+        None => RequestPause::Fixed(pause),
+        Some(ratio) => RequestPause::Ratio {
+            ratio: ratio
+                .parse()
+                .ok()
+                .filter(|r: &f64| r.is_finite() && *r >= 0.0)
+                .ok_or_else(|| {
+                    invalid(
+                        "AXON_REQUEST_PAUSE_RATIO",
+                        format!("not a number from 0 up: {ratio}"),
+                    )
+                })?,
+            max: (!pause.is_zero()).then_some(pause),
+        },
+    };
     let backend: Backend = var("AXON_BACKEND", "lmstudio")
         .parse()
         .map_err(|e| invalid("AXON_BACKEND", format!("{e}")))?;
@@ -89,7 +106,7 @@ fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigE
         base_url: var("OPENAI_BASE_URL", "http://localhost:1234/v1"),
         api_key: var("OPENAI_API_KEY", "lm-studio"),
         model: var("AXON_MODEL", "qwen/qwen3.6-35b-a3b"),
-        request_pause: Duration::from_secs(pause),
+        request_pause,
         max_tokens,
         reasoning_effort,
     })
@@ -140,7 +157,7 @@ mod tests {
         assert_eq!(config.base_url, "http://localhost:1234/v1");
         assert_eq!(config.api_key, "lm-studio");
         assert_eq!(config.model, "qwen/qwen3.6-35b-a3b");
-        assert_eq!(config.request_pause, Duration::ZERO);
+        assert_eq!(config.request_pause, RequestPause::Fixed(Duration::ZERO));
         assert_eq!(config.max_tokens, 16384);
         assert_eq!(config.reasoning_effort, None);
     }
@@ -149,6 +166,7 @@ mod tests {
     fn env_vars_override_each_field() {
         let config = model(|name| match name {
             "AXON_REQUEST_PAUSE_SECS" => Some("30".into()),
+            "AXON_REQUEST_PAUSE_RATIO" => Some("0.5".into()),
             "AXON_MAX_TOKENS" => Some("2048".into()),
             "AXON_BACKEND" => Some("ollama".into()),
             "AXON_REASONING_EFFORT" => Some("none".into()),
@@ -159,7 +177,13 @@ mod tests {
         assert_eq!(config.base_url, "OPENAI_BASE_URL-value");
         assert_eq!(config.api_key, "OPENAI_API_KEY-value");
         assert_eq!(config.model, "AXON_MODEL-value");
-        assert_eq!(config.request_pause, Duration::from_secs(30));
+        assert_eq!(
+            config.request_pause,
+            RequestPause::Ratio {
+                ratio: 0.5,
+                max: Some(Duration::from_secs(30))
+            }
+        );
         assert_eq!(config.max_tokens, 2048);
         assert_eq!(config.backend, Backend::Ollama);
         assert_eq!(config.reasoning_effort, Some(ReasoningEffort::None));
@@ -195,6 +219,27 @@ mod tests {
             err.unwrap_err().to_string(),
             "AXON_MAX_TOKENS: not a whole number: lots"
         );
+    }
+
+    #[test]
+    fn a_pause_ratio_without_seconds_has_no_cap_and_a_bad_one_is_an_error() {
+        let ratio = |value: &'static str| {
+            model(move |name| (name == "AXON_REQUEST_PAUSE_RATIO").then(|| value.into()))
+        };
+
+        assert_eq!(
+            ratio("2").unwrap().request_pause,
+            RequestPause::Ratio {
+                ratio: 2.0,
+                max: None
+            }
+        );
+        for bad in ["-1", "lots", "inf"] {
+            assert_eq!(
+                ratio(bad).unwrap_err().to_string(),
+                format!("AXON_REQUEST_PAUSE_RATIO: not a number from 0 up: {bad}")
+            );
+        }
     }
 
     #[test]
