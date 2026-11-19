@@ -24,7 +24,7 @@ use model::ModelClient;
 use store::Store;
 use turn::Agent;
 
-pub use backend::{Backend, UnknownBackend};
+pub use backend::{Backend, ReasoningEffort, UnknownBackend, UnknownReasoningEffort};
 pub use model::ModelConfig;
 
 /// Model requests per prompt before a turn stops.

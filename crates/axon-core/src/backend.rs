@@ -1,5 +1,5 @@
-//! Which kind of server Axon talks to; each has its own quirks on top of the
-//! OpenAI API.
+//! Which kind of server Axon talks to, each with its own quirks on top of the
+//! OpenAI API, and how hard a reasoning model on it should think.
 
 use std::str::FromStr;
 
@@ -39,6 +39,39 @@ impl FromStr for Backend {
     }
 }
 
+/// How hard a reasoning model thinks before it answers; `None` asks it not to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+/// A reasoning effort that isn't one of `ReasoningEffort::NAMES`.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown reasoning effort {0:?}; expected one of {names}", names = ReasoningEffort::NAMES.join(", "))]
+pub struct UnknownReasoningEffort(String);
+
+impl ReasoningEffort {
+    /// The names `from_str` accepts.
+    pub const NAMES: [&str; 4] = ["none", "low", "medium", "high"];
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = UnknownReasoningEffort;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "none" => Ok(Self::None),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(UnknownReasoningEffort(other.into())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +90,18 @@ mod tests {
         assert_eq!(
             err,
             r#"unknown backend "lm-studio"; expected one of lmstudio, ollama, llamacpp, vllm, openai"#
+        );
+    }
+
+    #[test]
+    fn every_reasoning_effort_parses_and_an_unknown_one_lists_them() {
+        for name in ReasoningEffort::NAMES {
+            assert!(name.parse::<ReasoningEffort>().is_ok(), "{name}");
+        }
+        let err = "off".parse::<ReasoningEffort>().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            r#"unknown reasoning effort "off"; expected one of none, low, medium, high"#
         );
     }
 }

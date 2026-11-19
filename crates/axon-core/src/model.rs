@@ -11,13 +11,13 @@ use async_openai::{
     error::OpenAIError,
     types::chat::{
         ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage, ChatCompletionTools,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequestArgs, ReasoningEffort as Effort,
     },
 };
 use futures::{Stream, StreamExt, stream};
 use serde::Deserialize;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, ReasoningEffort};
 
 /// Where to find the model and which one to use.
 pub struct ModelConfig {
@@ -29,6 +29,8 @@ pub struct ModelConfig {
     pub request_pause: Duration,
     /// Most tokens one model reply may take, reasoning included.
     pub max_tokens: u32,
+    /// Sent with each request when set; otherwise the server decides.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -40,6 +42,7 @@ impl fmt::Debug for ModelConfig {
             .field("model", &self.model)
             .field("request_pause", &self.request_pause)
             .field("max_tokens", &self.max_tokens)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish()
     }
 }
@@ -101,6 +104,7 @@ pub(crate) struct ModelClient {
     model: String,
     backend: Backend,
     max_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ModelClient {
@@ -113,6 +117,7 @@ impl ModelClient {
             model: config.model.clone(),
             backend: config.backend,
             max_tokens: config.max_tokens,
+            reasoning_effort: config.reasoning_effort,
         }
     }
 
@@ -133,6 +138,14 @@ impl ModelClient {
             Backend::Ollama => request.max_tokens(self.max_tokens),
             _ => request.max_completion_tokens(self.max_tokens),
         };
+        if let Some(effort) = self.reasoning_effort {
+            request.reasoning_effort(match effort {
+                ReasoningEffort::None => Effort::None,
+                ReasoningEffort::Low => Effort::Low,
+                ReasoningEffort::Medium => Effort::Medium,
+                ReasoningEffort::High => Effort::High,
+            });
+        }
         let request = request.build()?;
         let stream = self
             .inner
@@ -294,6 +307,27 @@ mod tests {
         let client = ModelClient::new(&config(api_url(&server)));
 
         assert_eq!(collect(&client).await.unwrap().0, ["ok"]);
+    }
+
+    #[tokio::test]
+    async fn requests_send_the_reasoning_effort_only_when_set() {
+        let server = MockServer::start().await;
+        let client = ModelClient::new(&config(api_url(&server)));
+        respond(&server, reply(&["ok"])).await;
+        collect(&client).await.unwrap();
+        let client = ModelClient::new(&ModelConfig {
+            reasoning_effort: Some(ReasoningEffort::None),
+            ..config(api_url(&server))
+        });
+        respond(&server, reply(&["ok"])).await;
+        collect(&client).await.unwrap();
+
+        let sent = server.received_requests().await.unwrap();
+        let effort = |n: usize| {
+            sent[n].body_json::<serde_json::Value>().unwrap()["reasoning_effort"].clone()
+        };
+        assert_eq!(effort(0), serde_json::Value::Null);
+        assert_eq!(effort(1), "none");
     }
 
     #[tokio::test]
