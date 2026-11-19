@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 # internal crates
 axon-protocol = { path = "crates/axon-protocol" }
 axon-core = { path = "crates/axon-core" }
+axon-config = { path = "crates/axon-config" }
 axon-acp = { path = "crates/axon-acp" }
 axon-tui = { path = "crates/axon-tui" }
 
