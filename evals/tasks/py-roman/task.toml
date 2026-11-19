@@ -1,0 +1,3 @@
+prompt = "The tests fail (run `uv run --no-project python -m unittest`). Fix the bugs in the code, not the tests."
+check = ["uv", "run", "--no-project", "python", "-m", "unittest", "--quiet"]
+tests = ["test_roman.py"]

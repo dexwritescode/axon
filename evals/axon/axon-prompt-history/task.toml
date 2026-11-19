@@ -1,0 +1,5 @@
+rev = "0d4fe4d^"
+prompt = """
+In the TUI, Up and Down should recall the prompts sent earlier, like a shell's history: Up goes to older prompts, Down back to newer ones and finally to what was being typed before. Add tests; `cargo test --workspace` must pass.
+"""
+check = ["cargo", "test", "--workspace", "--quiet"]

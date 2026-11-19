@@ -1,0 +1,5 @@
+rev = "88664c0^"
+prompt = """
+Two axons can open the same saved session (say `axon --resume <id>` in two terminals) and both write to its file. Lock a session's file while an axon has it open, so a second axon trying to open it gets an error instead. It must work on Windows, macOS and Linux. Add tests; `cargo test --workspace` must pass.
+"""
+check = ["cargo", "test", "--workspace", "--quiet"]
