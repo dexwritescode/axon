@@ -42,7 +42,7 @@ Each session is saved when a turn ends, in `~/.axon/sessions` (`%USERPROFILE%\.a
 
 To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
 
-To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0).
+To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0). Set `AXON_REQUEST_PAUSE_RATIO` too and the pause follows the request before it instead: that many times as long as it took, at most `AXON_REQUEST_PAUSE_SECS` (no cap when 0). With `0.5` and `30`, a 10 s request is followed by 5 s, a 90 s one by 30 s.
 
 Each model reply may take at most `AXON_MAX_TOKENS` tokens, reasoning included (default 16384); a reply cut off there ends the turn. `AXON_REASONING_EFFORT` (`none`, `low`, `medium` or `high`) is sent with each request when set; `none` turns thinking off where the server supports it (LM Studio does for qwen); a server may reject a value it doesn't support.
 

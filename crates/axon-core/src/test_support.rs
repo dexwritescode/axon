@@ -11,7 +11,7 @@ use axon_protocol::{Command, Event, SessionHandle, StopReason};
 use tokio::sync::mpsc;
 
 use crate::backend::Backend;
-use crate::model::{ModelClient, ModelConfig};
+use crate::model::{ModelClient, ModelConfig, RequestPause};
 use crate::store::{Saved, Store};
 use crate::turn::Agent;
 
@@ -21,7 +21,7 @@ pub(crate) fn config(base_url: String) -> ModelConfig {
         base_url,
         api_key: "test".into(),
         model: "test-model".into(),
-        request_pause: Duration::ZERO,
+        request_pause: RequestPause::Fixed(Duration::ZERO),
         max_tokens: 4096,
         reasoning_effort: None,
     }
@@ -103,7 +103,7 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
         client: ModelClient::new(&config(api_url(server))),
         cwd: cwd.canonicalize().unwrap(),
         max_requests: 25,
-        request_pause: Duration::ZERO,
+        request_pause: RequestPause::Fixed(Duration::ZERO),
         seen: Default::default(),
     }
 }

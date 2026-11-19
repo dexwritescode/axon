@@ -19,6 +19,31 @@ use serde::Deserialize;
 
 use crate::backend::{Backend, ReasoningEffort};
 
+/// How long to wait before each of a turn's model requests after the first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RequestPause {
+    /// The same wait every time.
+    Fixed(Duration),
+    /// `ratio` times as long as the request before took, so a long request
+    /// gets a long rest; at most `max` when set.
+    Ratio { ratio: f64, max: Option<Duration> },
+}
+
+impl RequestPause {
+    /// The wait after a request that took `took`.
+    pub(crate) fn after(self, took: Duration) -> Duration {
+        match self {
+            Self::Fixed(pause) => pause,
+            Self::Ratio { ratio, max } => {
+                // Saturates instead of panicking when the product overflows.
+                let pause = Duration::try_from_secs_f64(took.as_secs_f64() * ratio)
+                    .unwrap_or(Duration::MAX);
+                max.map_or(pause, |max| pause.min(max))
+            }
+        }
+    }
+}
+
 /// Where to find the model and which one to use.
 pub struct ModelConfig {
     pub backend: Backend,
@@ -26,7 +51,7 @@ pub struct ModelConfig {
     pub api_key: String,
     pub model: String,
     /// Wait between a turn's model requests, to let the machine cool.
-    pub request_pause: Duration,
+    pub request_pause: RequestPause,
     /// Most tokens one model reply may take, reasoning included.
     pub max_tokens: u32,
     /// Sent with each request when set; otherwise the server decides.
@@ -269,6 +294,20 @@ mod tests {
             name: name.into(),
             args: args.into(),
         }
+    }
+
+    #[test]
+    fn a_ratio_pause_follows_the_request_time_up_to_its_max() {
+        let secs = Duration::from_secs;
+        let ratio = |max| RequestPause::Ratio { ratio: 0.5, max };
+
+        assert_eq!(RequestPause::Fixed(secs(30)).after(secs(90)), secs(30));
+        assert_eq!(ratio(None).after(secs(10)), secs(5));
+        assert_eq!(ratio(None).after(secs(90)), secs(45));
+        assert_eq!(ratio(Some(secs(30))).after(secs(90)), secs(30));
+        let huge = |max| RequestPause::Ratio { ratio: 1e20, max };
+        assert_eq!(huge(None).after(secs(90)), Duration::MAX);
+        assert_eq!(huge(Some(secs(30))).after(secs(90)), secs(30));
     }
 
     #[tokio::test]
