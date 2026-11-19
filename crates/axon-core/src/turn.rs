@@ -10,7 +10,8 @@ use anyhow::Result;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs, FunctionCall,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessage, FunctionCall,
 };
 use axon_protocol::{Change, Event, Exit, StopReason, ToolResult};
 use futures::StreamExt;
@@ -24,6 +25,8 @@ use crate::tools::{self, Action, Printed, Seen};
 const CANCELLED: &str = "cancelled by user";
 const REJECTED: &str = "the user rejected this tool call";
 const SKIPPED: &str = "not run: the user rejected an earlier tool call";
+const EMPTY: &str = "Your last reply was empty: no text and no tool call. \
+    If you meant to call a tool, call it now; otherwise give your answer.";
 
 /// The user's answer to an `ApprovalRequested` event.
 pub(crate) struct Approval {
@@ -52,6 +55,8 @@ impl Agent {
     /// tool calls not yet run are answered with "cancelled by user".
     /// File changes and commands wait for an answer on `approvals`; a
     /// rejection ends the turn, so the user can say what they want instead.
+    /// A reply with neither text nor tool calls is answered once, telling the
+    /// model so, before the next request; a second one in a row ends the turn.
     /// Each tool call takes the next id after `last_call`, which the session
     /// keeps across turns so an old answer can't match a new call.
     pub(crate) async fn turn(
@@ -63,9 +68,15 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
         let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
+        // Pushed only once the next request goes, so a turn stopping first
+        // doesn't leave it for the next prompt to follow.
+        let mut nudge = false;
         for request in 0..self.max_requests {
             if request > 0 && !self.pause(events, cancel).await? {
                 return Ok(StopReason::Cancelled);
+            }
+            if nudge {
+                history.push(ChatCompletionRequestUserMessage::from(EMPTY).into());
             }
             let messages = std::iter::once(system.clone().into())
                 .chain(history.iter().cloned())
@@ -81,7 +92,15 @@ impl Agent {
                 };
                 return Ok(stop);
             }
+            // Reasoning alone isn't an answer: often a tool call the server
+            // left in it.
+            let empty = reply.calls.is_empty() && reply.text.trim().is_empty();
             history.push(assistant_message(reply.text, &reply.calls)?);
+            if empty && !nudge {
+                nudge = true;
+                continue;
+            }
+            nudge = false;
             if reply.calls.is_empty() {
                 return Ok(StopReason::EndTurn);
             }
@@ -626,7 +645,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         respond(
             &server,
-            sse(&[chunk(json!({"reasoning_content": "Let me list."}), None)]),
+            sse(&[
+                chunk(json!({"reasoning_content": "Let me list."}), None),
+                chunk(json!({"content": "Listed."}), None),
+            ]),
         )
         .await;
         let sessions = TempDir::new().unwrap();
@@ -669,6 +691,121 @@ mod tests {
         assert_eq!(
             streaming,
             [("list_dir".to_string(), 1), ("list_dir".to_string(), 2)]
+        );
+    }
+
+    /// The roles and contents of the messages in the `n`th request.
+    async fn sent(server: &MockServer, n: usize) -> Vec<(String, String)> {
+        sent_messages(server).await[n]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let content = m["content"].as_str().unwrap_or_default();
+                (m["role"].as_str().unwrap().into(), content.into())
+            })
+            .collect()
+    }
+
+    fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_answered_once_instead_of_ending_the_turn() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let thinking = [chunk(json!({"reasoning_content": "<tool_call>"}), None)];
+        respond(&server, sse(&thinking)).await;
+        respond(&server, reply(&["Done."])).await;
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        let events = prompt(&mut handle, "go").await;
+
+        assert_eq!(events.last(), Some(&end(StopReason::EndTurn)));
+        assert_eq!(
+            sent(&server, 1).await,
+            msgs(&[("user", "go"), ("assistant", ""), ("user", EMPTY)])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_empty_reply_in_a_row_ends_the_turn() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        respond(&server, reply(&["  "])).await;
+        respond(&server, reply(&[])).await;
+        respond(&server, reply(&["ok"])).await;
+        let mut handle = spawn_started(agent(&server, dir.path())).await;
+
+        let events = prompt(&mut handle, "go").await;
+        prompt(&mut handle, "again").await;
+
+        assert_eq!(events.last(), Some(&end(StopReason::EndTurn)));
+        assert_eq!(
+            sent(&server, 2).await,
+            msgs(&[
+                ("user", "go"),
+                ("assistant", "  "),
+                ("user", EMPTY),
+                ("assistant", ""),
+                ("user", "again"),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_out_of_requests_after_an_empty_reply_leaves_no_answer_to_it() {
+        let (server, _dir, mut handle) = session_with_notes(1).await;
+        respond(&server, reply(&[])).await;
+        respond(&server, reply(&["ok"])).await;
+
+        let events = prompt(&mut handle, "go").await;
+        prompt(&mut handle, "again").await;
+
+        assert_eq!(events.last(), Some(&end(StopReason::MaxTurnRequests)));
+        assert_eq!(
+            sent(&server, 1).await,
+            msgs(&[("user", "go"), ("assistant", ""), ("user", "again")])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_cancelled_in_the_pause_after_an_empty_reply_leaves_no_answer_to_it() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(Agent {
+            request_pause: Duration::from_secs(60),
+            ..agent(&server, dir.path())
+        })
+        .await;
+        respond(&server, reply(&[])).await;
+        handle
+            .commands
+            .send(Command::Prompt { text: "go".into() })
+            .await
+            .unwrap();
+        while let Some(event) = handle.events.recv().await {
+            if event == (Event::Paused { secs: 60 }) {
+                break;
+            }
+        }
+        handle.commands.send(Command::Cancel).await.unwrap();
+        while let Some(event) = handle.events.recv().await {
+            if matches!(event, Event::TurnEnded { .. }) {
+                break;
+            }
+        }
+        respond(&server, reply(&["ok"])).await;
+
+        prompt(&mut handle, "again").await;
+
+        assert_eq!(
+            sent(&server, 1).await,
+            msgs(&[("user", "go"), ("assistant", ""), ("user", "again")])
         );
     }
 
