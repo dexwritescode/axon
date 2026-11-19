@@ -1,0 +1,3 @@
+prompt = "The tests fail (run `cargo test`). Fix the bugs in the code, not the tests."
+check = ["cargo", "test", "--quiet"]
+tests = ["tests"]

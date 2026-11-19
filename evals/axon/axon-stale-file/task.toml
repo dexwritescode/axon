@@ -1,0 +1,5 @@
+rev = "71ea27b^"
+prompt = """
+Refuse to change a file the model hasn't read or that changed since. The session keeps a hash of each file as the model last read or wrote it. write_file and edit_file on an existing file fail before asking for approval when it was never read or no longer matches (say after cargo fmt), and applying fails if the file changed while waiting for approval. Add tests; `cargo test --workspace` must pass.
+"""
+check = ["cargo", "test", "--workspace", "--quiet"]

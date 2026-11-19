@@ -1,0 +1,5 @@
+rev = "4ef1e9c^"
+prompt = """
+Cap each model reply at AXON_MAX_TOKENS tokens. Requests send max_completion_tokens (default 16384). A reply cut off there ends the turn with a new StopReason::MaxTokens, keeping its text and dropping its incomplete tool calls; the TUI explains the stop. Add tests; `cargo test --workspace` must pass.
+"""
+check = ["cargo", "test", "--workspace", "--quiet"]
