@@ -197,6 +197,7 @@ version = "0.2.1-dev"
 dependencies = [
  "anyhow",
  "axon-acp",
+ "axon-config",
  "axon-core",
  "axon-protocol",
  "axon-tui",
@@ -208,6 +209,14 @@ name = "axon-acp"
 version = "0.2.1-dev"
 dependencies = [
  "agent-client-protocol",
+]
+
+[[package]]
+name = "axon-config"
+version = "0.2.1-dev"
+dependencies = [
+ "axon-core",
+ "thiserror",
 ]
 
 [[package]]

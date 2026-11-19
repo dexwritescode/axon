@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axon-config.workspace = true
 axon-core.workspace = true
 axon-acp.workspace = true
 axon-protocol.workspace = true
