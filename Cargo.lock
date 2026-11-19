@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "axon"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "anyhow",
  "axon-acp",
@@ -206,14 +206,14 @@ dependencies = [
 
 [[package]]
 name = "axon-acp"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "agent-client-protocol",
 ]
 
 [[package]]
 name = "axon-config"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "axon-core",
  "thiserror",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "axon-core"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "axon-eval"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "anyhow",
  "axon-config",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "axon-protocol"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "serde",
  "serde_json",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "axon-tui"
-version = "0.3.1-dev"
+version = "0.4.1-dev"
 dependencies = [
  "axon-protocol",
  "chrono",
