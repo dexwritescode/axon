@@ -9,7 +9,7 @@ use async_openai::types::chat::ChatCompletionTools;
 use axon_protocol::McpServer;
 use futures::future::join_all;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, Tool};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
@@ -24,6 +24,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A connected server.
 pub(crate) type Client = RunningService<RoleClient, ()>;
+
+/// A started server with the tools it lists, or why it couldn't start.
+type Listed = Result<(Client, Vec<Tool>), String>;
 
 /// The MCP tools a session offers and the servers that run them.
 /// Dropping it stops the servers.
@@ -55,47 +58,52 @@ pub(crate) async fn start(
     taken: Vec<String>,
     allow: Vec<String>,
 ) -> Started {
-    let clients = join_all(servers.into_iter().map(|server| {
+    let listed = join_all(servers.into_iter().map(|server| {
         let cwd = &cwd;
         async move {
             let name = server.name.clone();
-            let client = tokio::time::timeout(START_TIMEOUT, connect(server, cwd))
-                .await
-                .unwrap_or_else(|_| Err(timed_out(START_TIMEOUT)));
-            (name, client)
+            let listed = match tokio::time::timeout(START_TIMEOUT, connect(server, cwd)).await {
+                Ok(Ok(client)) => list(client).await,
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(timed_out(START_TIMEOUT)),
+            };
+            (name, listed)
         }
     }))
     .await;
-    offer(clients, taken, allow).await
+    offer(listed, taken, allow)
 }
 
 /// Start `server` as a child process and initialise it.
 async fn connect(server: McpServer, cwd: &Path) -> Result<Client, String> {
     let mut command = tokio::process::Command::new(&server.command);
-    command.args(&server.args).envs(server.env).current_dir(cwd);
+    command
+        .args(&server.args)
+        .envs(server.env)
+        .current_dir(cwd)
+        // Also when Axon exits without stopping the session first.
+        .kill_on_drop(true);
     let transport = TokioChildProcess::new(command)
         .map_err(|e| format!("{}: {e}", server.command.display()))?;
     ().serve(transport).await.map_err(|e| e.to_string())
 }
 
-/// List the tools of each `(name, client)` and offer them; see `start`.
-pub(crate) async fn offer(
-    clients: Vec<(String, Result<Client, String>)>,
-    taken: Vec<String>,
-    allow: Vec<String>,
-) -> Started {
+/// `client` with the tools its server lists.
+async fn list(client: Client) -> Listed {
+    match tokio::time::timeout(START_TIMEOUT, client.list_all_tools()).await {
+        Ok(Ok(tools)) => Ok((client, tools)),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(timed_out(START_TIMEOUT)),
+    }
+}
+
+/// Offer the tools of each server `(name, listed)`, in order; see `start`.
+/// With no servers, `allow` isn't checked: a profile's allow list is
+/// meant for the sessions that get servers.
+fn offer(servers: Vec<(String, Listed)>, taken: Vec<String>, allow: Vec<String>) -> Started {
     let mut started = Started::default();
-    for (name, client) in clients {
-        let listed = match client {
-            Ok(client) => {
-                match tokio::time::timeout(START_TIMEOUT, client.list_all_tools()).await {
-                    Ok(Ok(tools)) => Ok((client, tools)),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(timed_out(START_TIMEOUT)),
-                }
-            }
-            Err(e) => Err(e),
-        };
+    let check_allow = !servers.is_empty();
+    for (name, listed) in servers {
         let (client, tools) = match listed {
             Ok(listed) => listed,
             Err(e) => {
@@ -121,7 +129,7 @@ pub(crate) async fn offer(
         }
         started.mcp.servers.push(client);
     }
-    for name in &allow {
+    for name in allow.iter().filter(|_| check_allow) {
         if !started.mcp.tools.contains_key(name) {
             started
                 .errors
@@ -205,7 +213,7 @@ mod tests {
     use rmcp::ServerHandler;
     use rmcp::model::{
         CallToolResponse, ErrorData, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        ServerConfig, Tool,
+        ServerConfig,
     };
     use rmcp::service::{RequestContext, RoleServer};
     use serde_json::json;
@@ -279,10 +287,10 @@ mod tests {
         ().serve(client).await.unwrap()
     }
 
-    /// A session with the tools of `clients`, of which `allow` run without asking.
+    /// A session with the tools of `servers`, of which `allow` run without asking.
     async fn session(
         server: &MockServer,
-        clients: Vec<(String, Result<Client, String>)>,
+        servers: Vec<(String, Listed)>,
         allow: &[&str],
     ) -> SessionHandle {
         let agent = agent(server, Path::new("."));
@@ -292,11 +300,12 @@ mod tests {
             .map(|tool| tools::name(tool).to_string())
             .collect();
         let allow = allow.iter().map(|name| name.to_string()).collect();
-        spawn_mcp(agent, offer(clients, taken, allow)).await
+        spawn_mcp(agent, async move { offer(servers, taken, allow) }).await
     }
 
     async fn with_tools(server: &MockServer, allow: &[&str]) -> SessionHandle {
-        session(server, vec![("test".into(), Ok(connected().await))], allow).await
+        let listed = list(connected().await).await;
+        session(server, vec![("test".into(), listed)], allow).await
     }
 
     fn error(message: &str) -> Event {
@@ -507,6 +516,21 @@ mod tests {
             error("allow names get_time, but no MCP tool has that name")
         );
         assert_eq!(events.last(), Some(&end(StopReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn without_servers_the_allow_list_is_not_checked() {
+        let server = MockServer::start().await;
+        respond(&server, reply(&["Hi"])).await;
+        let mut handle = session(&server, vec![], &["get_time"]).await;
+
+        assert_eq!(
+            prompt(&mut handle, "hi").await,
+            [
+                Event::TextDelta { text: "Hi".into() },
+                end(StopReason::EndTurn)
+            ]
+        );
     }
 
     #[test]

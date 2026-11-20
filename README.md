@@ -56,7 +56,7 @@ tools = ["read_file", "grep"]   # built-in tools to offer; [] offers none; leave
 allow = ["get_time"]            # MCP tools that run without asking
 ```
 
-Every field is optional: `system_prompt` replaces Axon's own, `tools` limits which built-in tools the model gets (`read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`), and `allow` names the MCP tools (see ACP below) that run without asking; every other MCP tool asks first. A profile that can't be read or parsed, or names an unknown field or built-in tool, stops Axon with an error. MCP tool names are known only once their servers start, so an `allow` entry that matches none is reported as an error at session start instead.
+Every field is optional: `system_prompt` replaces Axon's own, `tools` limits which built-in tools the model gets (`read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`), and `allow` names the MCP tools (see ACP below) that run without asking; every other MCP tool asks first. A profile that can't be read or parsed, or names an unknown field or built-in tool, stops Axon with an error. MCP tool names are known only once their servers start, so an `allow` entry that matches none is reported as an error at the start of a session that has MCP servers instead.
 
 A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the input and the history as one `[pasted N chars]` token; the model gets it in full.
 
