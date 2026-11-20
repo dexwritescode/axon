@@ -1,4 +1,5 @@
-//! Axon's configuration, read from env vars. The only place config is read.
+//! Axon's configuration, read from env vars and the profile file
+//! `AXON_PROFILE` names. The only place config is read.
 
 use std::env;
 use std::fs;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use axon_core::{AgentConfig, Backend, ModelConfig, RequestPause};
 use serde::Deserialize;
 
-/// Everything Axon's env vars configure.
+/// Everything Axon's env vars and profile configure.
 #[derive(Debug)]
 pub struct Config {
     pub model: ModelConfig,
@@ -145,12 +146,12 @@ fn agent(lookup: impl Fn(&str) -> Option<String>) -> Result<AgentConfig, ConfigE
 
 /// Parse a profile, checking that it names only built-in tools.
 fn profile(text: &str) -> Result<AgentConfig, String> {
-    let profile: Profile = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    let profile: Profile = toml::from_str(text).map_err(|e| e.to_string())?;
     if let Some(tools) = &profile.tools {
         let known = axon_core::tool_names();
         if let Some(unknown) = tools.iter().find(|tool| !known.contains(tool)) {
             return Err(format!(
-                "unknown tool {unknown}; the tools are {}",
+                "unknown tool: {unknown}; the tools are {}",
                 known.join(", ")
             ));
         }
@@ -338,12 +339,12 @@ mod tests {
 
         let tool = profile("tools = ['rm']").unwrap_err();
         assert!(
-            tool.starts_with("unknown tool rm; the tools are read_file,"),
+            tool.starts_with("unknown tool: rm; the tools are read_file,"),
             "{tool}"
         );
 
         let syntax = profile("tools = [").unwrap_err();
-        assert!(!syntax.is_empty());
+        assert!(syntax.contains("line 1"), "{syntax}");
     }
 
     #[test]
@@ -360,7 +361,7 @@ mod tests {
         fs::write(&file, "tools = ['rm']").unwrap();
         let message = agent(set).unwrap_err().to_string();
         assert!(
-            message.starts_with(&format!("profile {path}: unknown tool rm")),
+            message.starts_with(&format!("profile {path}: unknown tool: rm")),
             "{message}"
         );
     }

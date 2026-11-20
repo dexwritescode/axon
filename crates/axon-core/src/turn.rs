@@ -607,31 +607,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_the_model_was_not_offered_is_refused() {
+    async fn a_tool_the_model_was_not_offered_is_refused_without_asking() {
         let server = MockServer::start().await;
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("notes.txt"), "secret\n").unwrap();
         let mut handle = spawn_started(Agent {
             tools: tools::enabled(Some(&["grep".into()])),
             ..agent(&server, dir.path())
         })
         .await;
-        let args = r#"{"path":"notes.txt"}"#;
-        respond(&server, tool_calls(&[("c1", "read_file", args)])).await;
+        let args = r#"{"command":"touch ran"}"#;
+        respond(&server, tool_calls(&[("c1", "run_command", args)])).await;
         respond(&server, reply(&["Sorry."])).await;
 
-        let events = prompt(&mut handle, "read").await;
+        let events = prompt_answering(&mut handle, "run", Some(true)).await;
 
         assert_eq!(
             events[1],
             Event::ToolCallFinished {
                 id: 1,
-                result: ToolResult::Failed("unknown tool: read_file".into()),
+                result: ToolResult::Failed("unknown tool: run_command".into()),
             }
         );
+        assert!(!dir.path().join("ran").exists());
         assert_eq!(
             sent_messages(&server).await[1][2]["content"],
-            "error: unknown tool: read_file"
+            "error: unknown tool: run_command"
         );
     }
 

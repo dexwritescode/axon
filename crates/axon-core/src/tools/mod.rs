@@ -137,14 +137,6 @@ pub(crate) fn enabled(names: Option<&[String]>) -> Vec<ChatCompletionTools> {
     tools
 }
 
-/// The name of every tool.
-pub(crate) fn names() -> Vec<String> {
-    schemas()
-        .iter()
-        .map(|tool| name(tool).to_string())
-        .collect()
-}
-
 /// The name a schema gives its tool.
 pub(crate) fn name(tool: &ChatCompletionTools) -> &str {
     match tool {

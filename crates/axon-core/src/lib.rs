@@ -44,7 +44,10 @@ pub struct AgentConfig {
 
 /// The names of the built-in tools.
 pub fn tool_names() -> Vec<String> {
-    tools::names()
+    tools::schemas()
+        .iter()
+        .map(|tool| tools::name(tool).to_string())
+        .collect()
 }
 
 /// Starts core sessions that all talk to the same model.

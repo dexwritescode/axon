@@ -55,7 +55,7 @@ You are BUDDY, a voice assistant. Answer in one or two short sentences.
 tools = ["read_file", "grep"]   # built-in tools to offer; [] offers none; leave it out for all
 ```
 
-Both fields are optional: `system_prompt` replaces Axon's own, and `tools` limits which built-in tools the model gets. An unknown field or tool name stops Axon with an error.
+Both fields are optional: `system_prompt` replaces Axon's own, and `tools` limits which built-in tools the model gets: `read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`. A profile that can't be read or parsed, or names an unknown field or tool, stops Axon with an error.
 
 A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the input and the history as one `[pasted N chars]` token; the model gets it in full.
 
