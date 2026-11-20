@@ -1,15 +1,19 @@
 //! Axon's configuration, read from env vars. The only place config is read.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axon_core::{Backend, ModelConfig, RequestPause};
+use axon_core::{AgentConfig, Backend, ModelConfig, RequestPause};
+use serde::Deserialize;
 
 /// Everything Axon's env vars configure.
 #[derive(Debug)]
 pub struct Config {
     pub model: ModelConfig,
+    /// What the profile in `AXON_PROFILE` sets; the default without one.
+    pub agent: AgentConfig,
     /// Where sessions are saved.
     pub sessions: PathBuf,
     /// How long a paste is before the TUI shows it as a token; None leaves
@@ -30,6 +34,7 @@ impl Config {
         let lookup = |name: &str| lookup(name).filter(|value| !value.is_empty());
         Ok(Self {
             model: model(lookup)?,
+            agent: agent(lookup)?,
             sessions: sessions_dir(lookup, home)?,
             paste_token_chars: paste_token_chars(lookup)?,
         })
@@ -42,6 +47,9 @@ pub enum ConfigError {
     /// The env var `var` holds a value that can't be used.
     #[error("{var}: {message}")]
     Invalid { var: &'static str, message: String },
+    /// The profile file at `path` can't be read or used.
+    #[error("profile {path}: {message}")]
+    Profile { path: PathBuf, message: String },
     /// Neither `AXON_SESSIONS_DIR` nor a home folder says where sessions go.
     #[error("no home folder to save sessions in; set AXON_SESSIONS_DIR")]
     NoHome,
@@ -109,6 +117,47 @@ fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigE
         request_pause,
         max_tokens,
         reasoning_effort,
+    })
+}
+
+/// What a profile file holds. Unknown fields are errors, so a typo isn't
+/// silently ignored.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    system_prompt: Option<String>,
+    tools: Option<Vec<String>>,
+}
+
+/// The profile file `AXON_PROFILE` names, or the default without one.
+fn agent(lookup: impl Fn(&str) -> Option<String>) -> Result<AgentConfig, ConfigError> {
+    let Some(path) = lookup("AXON_PROFILE") else {
+        return Ok(AgentConfig::default());
+    };
+    let path = PathBuf::from(path);
+    let error = |message| ConfigError::Profile {
+        path: path.clone(),
+        message,
+    };
+    let text = fs::read_to_string(&path).map_err(|e| error(e.to_string()))?;
+    profile(&text).map_err(error)
+}
+
+/// Parse a profile, checking that it names only built-in tools.
+fn profile(text: &str) -> Result<AgentConfig, String> {
+    let profile: Profile = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    if let Some(tools) = &profile.tools {
+        let known = axon_core::tool_names();
+        if let Some(unknown) = tools.iter().find(|tool| !known.contains(tool)) {
+            return Err(format!(
+                "unknown tool {unknown}; the tools are {}",
+                known.join(", ")
+            ));
+        }
+    }
+    Ok(AgentConfig {
+        system_prompt: profile.system_prompt,
+        tools: profile.tools,
     })
 }
 
@@ -265,6 +314,69 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_sets_the_system_prompt_and_tools() {
+        let text = "system_prompt = \"\"\"\nYou are BUDDY.\nBe brief.\"\"\"\ntools = [\"read_file\", \"grep\"]";
+        let config = profile(text).unwrap();
+
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some("You are BUDDY.\nBe brief.")
+        );
+        assert_eq!(config.tools, Some(vec!["read_file".into(), "grep".into()]));
+    }
+
+    #[test]
+    fn a_profile_may_leave_fields_out_or_turn_every_tool_off() {
+        assert_eq!(profile("").unwrap(), AgentConfig::default());
+        assert_eq!(profile("tools = []").unwrap().tools, Some(vec![]));
+    }
+
+    #[test]
+    fn an_unknown_field_or_tool_in_a_profile_is_an_error() {
+        let typo = profile("sytem_prompt = 'hi'").unwrap_err();
+        assert!(typo.contains("sytem_prompt"), "{typo}");
+
+        let tool = profile("tools = ['rm']").unwrap_err();
+        assert!(
+            tool.starts_with("unknown tool rm; the tools are read_file,"),
+            "{tool}"
+        );
+
+        let syntax = profile("tools = [").unwrap_err();
+        assert!(!syntax.is_empty());
+    }
+
+    #[test]
+    fn the_profile_is_read_from_the_file_axon_profile_names() {
+        assert_eq!(agent(|_| None).unwrap(), AgentConfig::default());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("buddy.toml");
+        fs::write(&file, "tools = []").unwrap();
+        let path = file.to_str().unwrap().to_string();
+        let set = |name: &str| (name == "AXON_PROFILE").then(|| path.clone());
+        assert_eq!(agent(set).unwrap().tools, Some(vec![]));
+
+        fs::write(&file, "tools = ['rm']").unwrap();
+        let message = agent(set).unwrap_err().to_string();
+        assert!(
+            message.starts_with(&format!("profile {path}: unknown tool rm")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_missing_profile_file_is_an_error() {
+        let missing = |name: &str| (name == "AXON_PROFILE").then(|| "/no/such/profile.toml".into());
+
+        let message = agent(missing).unwrap_err().to_string();
+        assert!(
+            message.starts_with("profile /no/such/profile.toml: "),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn an_empty_var_counts_as_unset() {
         let empty = |_: &str| Some(String::new());
         let config = Config::read(empty, Some(PathBuf::from("/home/u"))).unwrap();
@@ -274,5 +386,6 @@ mod tests {
         assert_eq!(config.model.reasoning_effort, None);
         assert_eq!(config.sessions, PathBuf::from("/home/u/.axon/sessions"));
         assert_eq!(config.paste_token_chars, None);
+        assert_eq!(config.agent, AgentConfig::default());
     }
 }

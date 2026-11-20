@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     let out = cli.out.canonicalize()?;
     share_build(&out)?;
     let model = config.model.model.clone();
-    let factory = CoreFactory::new(config.model, out.join("sessions"));
+    let factory = CoreFactory::new(config.model, config.agent, out.join("sessions"));
     let scores = tokio::select! {
         scores = suite::suite(&factory, &tasks, cli.runs, &model, &out, run::LIMITS) => scores,
         _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
