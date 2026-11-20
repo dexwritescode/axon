@@ -1,4 +1,5 @@
 use std::env;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use axon_core::CoreFactory;
@@ -21,7 +22,11 @@ async fn main() -> Result<()> {
             let factory = CoreFactory::new(config.model, config.agent, config.sessions);
             axon_tui::run(&factory, settings, resume).await?
         }
-        Cli::Acp => axon_acp::serve().await?,
+        Cli::Acp => {
+            let config = axon_config::Config::from_env()?;
+            let factory = CoreFactory::new(config.model, config.agent, config.sessions);
+            axon_acp::serve(Arc::new(factory)).await?
+        }
     }
     Ok(())
 }

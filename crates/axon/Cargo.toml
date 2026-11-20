@@ -12,3 +12,9 @@ axon-protocol.workspace = true
 axon-tui.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+agent-client-protocol = { workspace = true, features = ["process"] }
+serde_json.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true

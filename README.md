@@ -61,6 +61,16 @@ A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the i
 
 At session start Axon asks the backend for the model's loaded context size (all but `openai` report it) and shows it after each turn, e.g. `✓ Finished at 14:32 · 2m 5s · 262k context`. Ollama and LM Studio report it only while the model is loaded.
 
+## ACP (Zed and other clients)
+
+`axon acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com/) over stdio, with the same env vars and `AXON_PROFILE` as the TUI. In Zed's settings:
+
+```json
+"agent_servers": { "Axon": { "command": "axon", "args": ["acp"] } }
+```
+
+It supports `session/new`, `session/prompt` (text only), `session/cancel`, streamed replies, reasoning and tool calls, and asks for approval of writes (with a diff) and commands through `session/request_permission`. One prompt runs at a time per session; another sent meanwhile is an error. MCP servers sent with `session/new` are ignored for now.
+
 ## Test against real servers (macOS)
 
 `scripts/backend-test.sh NAME` installs a backend with Homebrew or `lms`, starts it, loads a small Qwen3 0.6B model, runs the ignored live test (context discovery and a reply), then stops what it started. NAME is `ollama`, `llamacpp` or `lmstudio`. Downloads stay cached; `scripts/backends/NAME.sh purge` removes them. These scripts are macOS-only dev tooling.
