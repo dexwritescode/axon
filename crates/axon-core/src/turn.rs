@@ -11,7 +11,7 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessage, FunctionCall,
+    ChatCompletionRequestUserMessage, ChatCompletionTools, FunctionCall,
 };
 use axon_protocol::{Change, Event, Exit, StopReason, ToolResult};
 use futures::StreamExt;
@@ -19,7 +19,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{Delta, ModelClient, RequestPause, ToolCall, ToolCalls};
-use crate::prompt;
 use crate::tools::{self, Action, Printed, Seen};
 
 const CANCELLED: &str = "cancelled by user";
@@ -39,6 +38,10 @@ pub(crate) struct Agent {
     pub(crate) client: ModelClient,
     /// Canonical; tools can't reach outside it.
     pub(crate) cwd: PathBuf,
+    /// Sent before the history on every request.
+    pub(crate) system: String,
+    /// The tools offered to the model; it can't run any other.
+    pub(crate) tools: Vec<ChatCompletionTools>,
     /// Model requests per prompt before the turn stops.
     pub(crate) max_requests: usize,
     /// Wait between a turn's model requests.
@@ -67,7 +70,7 @@ impl Agent {
         last_call: &mut u64,
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
-        let system = ChatCompletionRequestSystemMessage::from(prompt::system(&self.cwd));
+        let system = ChatCompletionRequestSystemMessage::from(self.system.clone());
         // Pushed only once the next request goes, so a turn stopping first
         // doesn't leave it for the next prompt to follow.
         let mut nudge = false;
@@ -186,7 +189,7 @@ impl Agent {
                 reply.cancelled = true;
                 return Ok(reply);
             }
-            stream = self.client.stream_chat(messages, tools::schemas()) => stream?,
+            stream = self.client.stream_chat(messages, self.tools.clone()) => stream?,
         };
         let mut stream = pin!(stream);
         let mut calls = ToolCalls::default();
@@ -225,6 +228,11 @@ impl Agent {
         Ok(reply)
     }
 
+    /// Whether the model was offered the tool `name`.
+    fn offers(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tools::name(tool) == name)
+    }
+
     /// Run tool call `id`, reporting it to the frontend and asking before
     /// any file change or command; returns how it ended for the model.
     async fn run_tool(
@@ -241,8 +249,12 @@ impl Agent {
                 args: call.args.clone(),
             })
             .await?;
-        let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
-        let action = tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?;
+        let action = if self.offers(&call.name) {
+            let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
+            tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?
+        } else {
+            Err(format!("unknown tool: {}", call.name))
+        };
         let outcome = match action {
             Ok(Action::Output(output)) => Outcome::output(output),
             Ok(Action::Read { output, seen }) => {
@@ -591,6 +603,35 @@ mod tests {
         assert_eq!(
             sent_messages(&server).await[1][2]["content"],
             format!("error: {output}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_the_model_was_not_offered_is_refused_without_asking() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let mut handle = spawn_started(Agent {
+            tools: tools::enabled(Some(&["grep".into()])),
+            ..agent(&server, dir.path())
+        })
+        .await;
+        let args = r#"{"command":"touch ran"}"#;
+        respond(&server, tool_calls(&[("c1", "run_command", args)])).await;
+        respond(&server, reply(&["Sorry."])).await;
+
+        let events = prompt_answering(&mut handle, "run", Some(true)).await;
+
+        assert_eq!(
+            events[1],
+            Event::ToolCallFinished {
+                id: 1,
+                result: ToolResult::Failed("unknown tool: run_command".into()),
+            }
+        );
+        assert!(!dir.path().join("ran").exists());
+        assert_eq!(
+            sent_messages(&server).await[1][2]["content"],
+            "error: unknown tool: run_command"
         );
     }
 

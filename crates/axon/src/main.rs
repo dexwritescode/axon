@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
         Cli::Tui(resume) => {
             let config = axon_config::Config::from_env()?;
             let settings = tui_settings(config.paste_token_chars);
-            let factory = CoreFactory::new(config.model, config.sessions);
+            let factory = CoreFactory::new(config.model, config.agent, config.sessions);
             axon_tui::run(&factory, settings, resume).await?
         }
         Cli::Acp => axon_acp::serve().await?,

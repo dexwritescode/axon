@@ -46,6 +46,17 @@ To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE
 
 Each model reply may take at most `AXON_MAX_TOKENS` tokens, reasoning included (default 16384); a reply cut off there ends the turn. `AXON_REASONING_EFFORT` (`none`, `low`, `medium` or `high`) is sent with each request when set; `none` turns thinking off where the server supports it (LM Studio does for qwen); a server may reject a value it doesn't support.
 
+`AXON_PROFILE` names a TOML file that changes the agent, for example:
+
+```toml
+system_prompt = """
+You are BUDDY, a voice assistant. Answer in one or two short sentences.
+"""
+tools = ["read_file", "grep"]   # built-in tools to offer; [] offers none; leave it out for all
+```
+
+Both fields are optional: `system_prompt` replaces Axon's own, and `tools` limits which built-in tools the model gets: `read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`. A profile that can't be read or parsed, or names an unknown field or tool, stops Axon with an error.
+
 A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the input and the history as one `[pasted N chars]` token; the model gets it in full.
 
 At session start Axon asks the backend for the model's loaded context size (all but `openai` report it) and shows it after each turn, e.g. `✓ Finished at 14:32 · 2m 5s · 262k context`. Ollama and LM Studio report it only while the model is loaded.

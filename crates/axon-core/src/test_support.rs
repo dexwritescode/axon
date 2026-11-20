@@ -99,9 +99,12 @@ pub(crate) fn tool_calls(calls: &[(&str, &str, &str)]) -> ResponseTemplate {
 
 /// An agent talking to `server`, working in `cwd`.
 pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
+    let cwd = cwd.canonicalize().unwrap();
     Agent {
         client: ModelClient::new(&config(api_url(server))),
-        cwd: cwd.canonicalize().unwrap(),
+        system: crate::prompt::system(&cwd),
+        tools: crate::tools::schemas(),
+        cwd,
         max_requests: 25,
         request_pause: RequestPause::Fixed(Duration::ZERO),
         seen: Default::default(),

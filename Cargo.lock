@@ -216,7 +216,10 @@ name = "axon-config"
 version = "0.5.2-dev"
 dependencies = [
  "axon-core",
+ "serde",
+ "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

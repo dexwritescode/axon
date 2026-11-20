@@ -154,11 +154,11 @@ impl ModelClient {
         tools: Vec<ChatCompletionTools>,
     ) -> Result<impl Stream<Item = Result<Delta>> + use<>> {
         let mut request = CreateChatCompletionRequestArgs::default();
-        request
-            .model(&self.model)
-            .messages(messages)
-            .tools(tools)
-            .stream(true);
+        request.model(&self.model).messages(messages).stream(true);
+        // Some servers reject an empty list; with no tools, send none.
+        if !tools.is_empty() {
+            request.tools(tools);
+        }
         match self.backend {
             Backend::Ollama => request.max_tokens(self.max_tokens),
             _ => request.max_completion_tokens(self.max_tokens),

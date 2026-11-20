@@ -33,16 +33,38 @@ const MAX_TURN_REQUESTS: usize = 25;
 /// How long context discovery waits for the server before the session starts without it.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What a profile changes about the agent; the default keeps Axon's own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentConfig {
+    /// Replaces Axon's system prompt.
+    pub system_prompt: Option<String>,
+    /// The built-in tools offered to the model, by name; None offers all.
+    pub tools: Option<Vec<String>>,
+}
+
+/// The names of the built-in tools.
+pub fn tool_names() -> Vec<String> {
+    tools::schemas()
+        .iter()
+        .map(|tool| tools::name(tool).to_string())
+        .collect()
+}
+
 /// Starts core sessions that all talk to the same model.
 pub struct CoreFactory {
     config: ModelConfig,
+    agent: AgentConfig,
     /// Sessions are saved under here, a folder per working directory.
     sessions: PathBuf,
 }
 
 impl CoreFactory {
-    pub fn new(config: ModelConfig, sessions: PathBuf) -> Self {
-        Self { config, sessions }
+    pub fn new(config: ModelConfig, agent: AgentConfig, sessions: PathBuf) -> Self {
+        Self {
+            config,
+            agent,
+            sessions,
+        }
     }
 }
 
@@ -64,9 +86,16 @@ impl SessionFactory for CoreFactory {
         let base_url = self.config.base_url.clone();
         let api_key = self.config.api_key.clone();
         let model = self.config.model.clone();
+        let system = self
+            .agent
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| prompt::system(&cwd));
         Ok(session::spawn(
             Agent {
                 client: ModelClient::new(&self.config),
+                system,
+                tools: tools::enabled(self.agent.tools.as_deref()),
                 cwd,
                 max_requests: MAX_TURN_REQUESTS,
                 request_pause: self.config.request_pause,
@@ -90,8 +119,26 @@ mod tests {
 
     /// A factory saving sessions in a temporary folder, which it returns too.
     fn factory(base_url: String) -> (CoreFactory, tempfile::TempDir) {
+        factory_with(base_url, AgentConfig::default())
+    }
+
+    /// Like `factory`, with what a profile set.
+    fn factory_with(base_url: String, agent: AgentConfig) -> (CoreFactory, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
-        (CoreFactory::new(config(base_url), root.path().into()), root)
+        (
+            CoreFactory::new(config(base_url), agent, root.path().into()),
+            root,
+        )
+    }
+
+    /// The body of the first chat request `server` received, after context discovery.
+    async fn first_request(server: &MockServer) -> serde_json::Value {
+        let requests = server.received_requests().await.unwrap();
+        let chat = requests
+            .iter()
+            .find(|request| request.url.path() == "/v1/chat/completions")
+            .expect("no chat request");
+        chat.body_json().unwrap()
     }
 
     #[test]
@@ -135,6 +182,51 @@ mod tests {
             prompt(&mut handle, "hi").await,
             [delta("Hello"), end(StopReason::EndTurn)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_profile_sets_the_system_prompt_and_tools_the_model_gets() {
+        let server = MockServer::start().await;
+        respond(&server, reply(&["Hi"])).await;
+        let agent = AgentConfig {
+            system_prompt: Some("You are BUDDY.".into()),
+            tools: Some(vec!["grep".into(), "read_file".into()]),
+        };
+        let (factory, _root) = factory_with(api_url(&server), agent);
+        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
+        handle.events.recv().await;
+
+        prompt(&mut handle, "hi").await;
+
+        let body = first_request(&server).await;
+        assert_eq!(body["messages"][0]["content"], "You are BUDDY.");
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["read_file", "grep"]);
+    }
+
+    #[tokio::test]
+    async fn with_every_tool_off_the_request_sends_no_tools() {
+        let server = MockServer::start().await;
+        respond(&server, reply(&["Hi"])).await;
+        let agent = AgentConfig {
+            tools: Some(vec![]),
+            ..AgentConfig::default()
+        };
+        let (factory, _root) = factory_with(api_url(&server), agent);
+        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
+        handle.events.recv().await;
+
+        prompt(&mut handle, "hi").await;
+
+        let body = first_request(&server).await;
+        assert!(body.get("tools").is_none(), "{body}");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.starts_with("You are Axon"), "{system}");
     }
 
     #[tokio::test]

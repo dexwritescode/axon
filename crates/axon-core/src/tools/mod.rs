@@ -127,6 +127,24 @@ pub(crate) fn schemas() -> Vec<ChatCompletionTools> {
     ]
 }
 
+/// The schemas of the tools in `names`, in the usual order; all of them
+/// when `names` is None.
+pub(crate) fn enabled(names: Option<&[String]>) -> Vec<ChatCompletionTools> {
+    let mut tools = schemas();
+    if let Some(names) = names {
+        tools.retain(|tool| names.iter().any(|name| name == self::name(tool)));
+    }
+    tools
+}
+
+/// The name a schema gives its tool.
+pub(crate) fn name(tool: &ChatCompletionTools) -> &str {
+    match tool {
+        ChatCompletionTools::Function(tool) => &tool.function.name,
+        ChatCompletionTools::Custom(tool) => &tool.custom.name,
+    }
+}
+
 fn schema(name: &str, description: &str, parameters: Value) -> ChatCompletionTools {
     ChatCompletionTools::Function(ChatCompletionTool {
         function: FunctionObject {
@@ -269,6 +287,20 @@ mod tests {
                 Err("path is required".into())
             );
         }
+    }
+
+    #[test]
+    fn enabled_keeps_the_named_tools_in_order() {
+        let names = |tools: Vec<ChatCompletionTools>| -> Vec<String> {
+            tools.iter().map(|tool| name(tool).to_string()).collect()
+        };
+
+        assert_eq!(names(enabled(None)), names(schemas()));
+        assert_eq!(
+            names(enabled(Some(&["grep".into(), "read_file".into()]))),
+            ["read_file", "grep"]
+        );
+        assert!(enabled(Some(&[])).is_empty());
     }
 
     #[test]
