@@ -88,10 +88,11 @@ async fn live_profile_prompt_reaches_the_model_with_no_tools() {
     let agent = AgentConfig {
         system_prompt: Some("Your name is BUDDY. You have no tools.".into()),
         tools: Some(vec![]),
+        ..AgentConfig::default()
     };
     let factory = CoreFactory::new(live_config(), agent, root.path().into());
     let mut handle = factory
-        .new_session(root.path().into(), Resume::New)
+        .new_session(root.path().into(), Resume::New, vec![])
         .unwrap();
     handle.events.recv().await;
 

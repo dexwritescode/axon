@@ -11,6 +11,7 @@ use axon_protocol::{Command, Event, SessionHandle, StopReason};
 use tokio::sync::mpsc;
 
 use crate::backend::Backend;
+use crate::mcp::Started;
 use crate::model::{ModelClient, ModelConfig, RequestPause};
 use crate::store::{Saved, Store};
 use crate::turn::Agent;
@@ -104,6 +105,7 @@ pub(crate) fn agent(server: &MockServer, cwd: &Path) -> Agent {
         client: ModelClient::new(&config(api_url(server))),
         system: crate::prompt::system(&cwd),
         tools: crate::tools::schemas(),
+        mcp: Default::default(),
         cwd,
         max_requests: 25,
         request_pause: RequestPause::Fixed(Duration::ZERO),
@@ -128,11 +130,31 @@ pub(crate) async fn spawn_saving(
     saved: Saved,
     keep: impl Send + 'static,
 ) -> SessionHandle {
+    spawn_mcp_saving(agent, async { Started::default() }, store, saved, keep).await
+}
+
+/// Like `spawn_started`, with the MCP tools `mcp` starts.
+pub(crate) async fn spawn_mcp(
+    agent: Agent,
+    mcp: impl Future<Output = Started> + Send + 'static,
+) -> SessionHandle {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path(), &agent.cwd, "test-model");
+    spawn_mcp_saving(agent, mcp, store, Saved::default(), root).await
+}
+
+async fn spawn_mcp_saving(
+    agent: Agent,
+    mcp: impl Future<Output = Started> + Send + 'static,
+    store: Store,
+    saved: Saved,
+    keep: impl Send + 'static,
+) -> SessionHandle {
     let SessionHandle {
         id,
         commands,
         events: mut all,
-    } = crate::session::spawn(agent, async { None }, store, saved);
+    } = crate::session::spawn(agent, async { None }, mcp, store, saved);
     assert_eq!(all.recv().await, Some(Event::ContextLimit { tokens: None }));
     let (tx, events) = mpsc::channel(crate::session::EVENT_BUFFER);
     tokio::spawn(async move {

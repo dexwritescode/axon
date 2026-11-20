@@ -42,4 +42,5 @@ semver = "1"
 toml = "0.9"
 tokio-util = "0.7"
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
+rmcp = { version = "3.11", default-features = false, features = ["client", "transport-child-process"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }

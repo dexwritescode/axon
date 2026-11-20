@@ -8,13 +8,16 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Diff, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionNotification, SessionUpdate, StopReason as AcpStop, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    InitializeResponse, McpServer as AcpMcpServer, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionNotification, SessionUpdate,
+    StopReason as AcpStop, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Error, Stdio};
-use axon_protocol::{Change, Command, Event, Exit, Resume, SessionFactory, StopReason, ToolResult};
+use axon_protocol::{
+    Change, Command, Event, Exit, McpServer, Resume, SessionFactory, StopReason, ToolResult,
+};
 use tokio::sync::mpsc;
 
 /// The permission option that approves a change.
@@ -66,13 +69,8 @@ async fn serve_on(
         )
         .on_receive_request(
             async move |request: NewSessionRequest, responder, _connection| {
-                if !request.mcp_servers.is_empty() {
-                    eprintln!(
-                        "axon: MCP servers aren't supported yet; ignoring {}",
-                        request.mcp_servers.len()
-                    );
-                }
-                match factory.new_session(request.cwd.clone(), Resume::New) {
+                let servers = stdio_servers(request.mcp_servers);
+                match factory.new_session(request.cwd.clone(), Resume::New, servers) {
                     Ok(handle) => {
                         let id = handle.id.clone();
                         let session = Session {
@@ -237,6 +235,9 @@ impl Prompt<'_> {
             Change::RunCommand { command } => {
                 ToolCallUpdateFields::new().title(format!("Run {command}"))
             }
+            Change::CallTool { tool, args } => ToolCallUpdateFields::new()
+                .title(format!("Call {tool}"))
+                .raw_input(serde_json::from_str(&args).ok()),
         };
         let options = vec![
             PermissionOption::new(ALLOW, "Allow", PermissionOptionKind::AllowOnce),
@@ -255,6 +256,30 @@ impl Prompt<'_> {
             Err(_) => false,
         }
     }
+}
+
+/// The stdio servers among `servers`; the others are left out, saying so
+/// on stderr.
+fn stdio_servers(servers: Vec<AcpMcpServer>) -> Vec<McpServer> {
+    servers
+        .into_iter()
+        .filter_map(|server| match server {
+            AcpMcpServer::Stdio(server) => Some(McpServer {
+                name: server.name,
+                command: server.command,
+                args: server.args,
+                env: server
+                    .env
+                    .into_iter()
+                    .map(|variable| (variable.name, variable.value))
+                    .collect(),
+            }),
+            _ => {
+                eprintln!("axon: only stdio MCP servers are supported; ignoring one");
+                None
+            }
+        })
+        .collect()
 }
 
 fn lock(sessions: &Sessions) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
@@ -346,7 +371,8 @@ mod tests {
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        RequestPermissionResponse, SelectedPermissionOutcome, TextContent,
+        EnvVariable, McpServerHttp, McpServerStdio, RequestPermissionResponse,
+        SelectedPermissionOutcome, TextContent,
     };
     use axon_protocol::{SessionError, SessionHandle};
     use std::path::PathBuf;
@@ -356,6 +382,7 @@ mod tests {
     /// The core's end of a stub session, which the test plays.
     struct Core {
         cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
         commands: mpsc::Receiver<Command>,
         events: mpsc::Sender<Event>,
     }
@@ -381,7 +408,12 @@ mod tests {
     }
 
     impl SessionFactory for Stub {
-        fn new_session(&self, cwd: PathBuf, resume: Resume) -> Result<SessionHandle, SessionError> {
+        fn new_session(
+            &self,
+            cwd: PathBuf,
+            resume: Resume,
+            mcp_servers: Vec<McpServer>,
+        ) -> Result<SessionHandle, SessionError> {
             assert_eq!(resume, Resume::New);
             if cwd == Path::new("/broken") {
                 return Err(SessionError::Start("no such folder".into()));
@@ -392,6 +424,7 @@ mod tests {
             let id = format!("s{}", cores.len() + 1);
             cores.push(Core {
                 cwd,
+                mcp_servers,
                 commands: command_rx,
                 events: event_tx,
             });
@@ -410,6 +443,7 @@ mod tests {
         asked: mpsc::UnboundedReceiver<RequestPermissionRequest>,
         session: String,
         core: Core,
+        stub: Arc<Stub>,
     }
 
     /// How the test client answers permission requests.
@@ -483,6 +517,7 @@ mod tests {
             asked,
             session,
             core,
+            stub,
         }
     }
 
@@ -547,6 +582,37 @@ mod tests {
 
         assert_eq!(test.core.cwd, PathBuf::from("/work"));
         assert_eq!(test.session, "s1");
+    }
+
+    #[tokio::test]
+    async fn stdio_mcp_servers_reach_the_new_session_and_others_are_left_out() {
+        let test = start(Answer::Allow).await;
+        assert_eq!(test.core.mcp_servers, []);
+        let servers = vec![
+            AcpMcpServer::Stdio(
+                McpServerStdio::new("buddy", "/bin/buddy-tools")
+                    .args(vec!["--quiet".into()])
+                    .env(vec![EnvVariable::new("TZ", "UTC")]),
+            ),
+            AcpMcpServer::Http(McpServerHttp::new("web", "http://localhost:1")),
+        ];
+
+        test.connection
+            .send_request(NewSessionRequest::new("/work").mcp_servers(servers))
+            .block_task()
+            .await
+            .unwrap();
+
+        let core = test.stub.cores.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            core.mcp_servers,
+            [McpServer {
+                name: "buddy".into(),
+                command: "/bin/buddy-tools".into(),
+                args: vec!["--quiet".into()],
+                env: vec![("TZ".into(), "UTC".into())],
+            }]
+        );
     }
 
     #[tokio::test]
@@ -797,6 +863,25 @@ mod tests {
         assert!(approve);
         assert_eq!(asked.tool_call.fields.title.as_deref(), Some("Run date"));
         assert_eq!(asked.tool_call.fields.content, None);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tool_call_asks_with_its_name_and_arguments() {
+        let call = Change::CallTool {
+            tool: "open_app".into(),
+            args: r#"{"name": "Safari"}"#.into(),
+        };
+        let (approve, asked) = approval(Answer::Allow, call).await;
+
+        assert!(approve);
+        assert_eq!(
+            asked.tool_call.fields.title.as_deref(),
+            Some("Call open_app")
+        );
+        assert_eq!(
+            asked.tool_call.fields.raw_input,
+            Some(serde_json::json!({"name": "Safari"}))
+        );
     }
 
     #[tokio::test]

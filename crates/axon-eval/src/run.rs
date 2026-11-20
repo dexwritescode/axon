@@ -99,7 +99,7 @@ pub async fn run(
     }
     clean(&work)?;
 
-    let session = factory.new_session(work.clone(), Resume::New)?;
+    let session = factory.new_session(work.clone(), Resume::New, vec![])?;
     let id = session.id.clone();
     let began = Instant::now();
     let turn = drive(session, &task.spec.prompt, limits.turn).await;
@@ -296,7 +296,7 @@ fn clean(dir: &Path) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
     use crate::task::Spec;
-    use axon_protocol::{Change, SessionError};
+    use axon_protocol::{Change, McpServer, SessionError};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
@@ -318,7 +318,12 @@ pub(crate) mod tests {
     }
 
     impl SessionFactory for Stub {
-        fn new_session(&self, cwd: PathBuf, _: Resume) -> Result<SessionHandle, SessionError> {
+        fn new_session(
+            &self,
+            cwd: PathBuf,
+            _: Resume,
+            _: Vec<McpServer>,
+        ) -> Result<SessionHandle, SessionError> {
             let (commands, mut command_rx) = mpsc::channel(8);
             let (events, event_rx) = mpsc::channel(8);
             let stub = *self;

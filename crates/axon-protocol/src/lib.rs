@@ -66,6 +66,8 @@ pub enum Change {
     },
     /// Run `command` in the platform shell, in the working directory.
     RunCommand { command: String },
+    /// Call the MCP tool `tool` with `args`, the JSON text the model sent.
+    CallTool { tool: String, args: String },
 }
 
 /// How a tool call ended.
@@ -138,6 +140,18 @@ pub enum Resume {
     Id(String),
 }
 
+/// An MCP server a session starts as a child process and talks to over
+/// its stdin and stdout; its tools are offered to the model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServer {
+    /// Names the server in messages.
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    /// Set on top of Axon's own environment.
+    pub env: Vec<(String, String)>,
+}
+
 /// What a frontend holds: a session's command sender and event receiver.
 pub struct SessionHandle {
     /// Names the saved session, for `Resume::Id`.
@@ -160,8 +174,14 @@ pub enum SessionError {
 /// Creates sessions. Frontends get one from the binary, so they never
 /// depend on the core directly.
 pub trait SessionFactory: Send + Sync {
-    /// Start the session `resume` names, whose tools work inside `cwd`.
-    fn new_session(&self, cwd: PathBuf, resume: Resume) -> Result<SessionHandle, SessionError>;
+    /// Start the session `resume` names, whose tools work inside `cwd`,
+    /// with the tools of `mcp_servers` too.
+    fn new_session(
+        &self,
+        cwd: PathBuf,
+        resume: Resume,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<SessionHandle, SessionError>;
 }
 
 #[cfg(test)]
@@ -252,6 +272,13 @@ mod tests {
                 command: "ls".into(),
             },
             json!({"type": "run_command", "command": "ls"}),
+        );
+        same(
+            Change::CallTool {
+                tool: "get_time".into(),
+                args: "{}".into(),
+            },
+            json!({"type": "call_tool", "tool": "get_time", "args": "{}"}),
         );
     }
 

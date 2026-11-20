@@ -79,6 +79,9 @@ fn committed(line: &Committed, width: u16, diff_rows: usize) -> Paragraph<'stati
             return Paragraph::new(lines);
         }
         Committed::Change(Change::RunCommand { command }) => ("  $   ", theme::INPUT, command),
+        Committed::Change(Change::CallTool { tool, args }) => {
+            return tool_line("  →   ", theme::INPUT, tool, &preview(args));
+        }
         Committed::ToolCall { name, args } => {
             return tool_line("  →   ", theme::TOOL, name, &preview(args));
         }

@@ -7,6 +7,7 @@ mod context;
 mod jail;
 #[cfg(test)]
 mod live;
+mod mcp;
 mod model;
 mod prompt;
 mod session;
@@ -19,7 +20,7 @@ mod turn;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axon_protocol::{Resume, SessionError, SessionFactory, SessionHandle};
+use axon_protocol::{McpServer, Resume, SessionError, SessionFactory, SessionHandle};
 use model::ModelClient;
 use store::Store;
 use turn::Agent;
@@ -40,6 +41,8 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     /// The built-in tools offered to the model, by name; None offers all.
     pub tools: Option<Vec<String>>,
+    /// MCP tools that run without asking, by name; every other MCP tool asks.
+    pub allow: Vec<String>,
 }
 
 /// The names of the built-in tools.
@@ -70,7 +73,12 @@ impl CoreFactory {
 
 impl SessionFactory for CoreFactory {
     /// Must be called inside a tokio runtime; the session runs as a task on it.
-    fn new_session(&self, cwd: PathBuf, resume: Resume) -> Result<SessionHandle, SessionError> {
+    fn new_session(
+        &self,
+        cwd: PathBuf,
+        resume: Resume,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<SessionHandle, SessionError> {
         tokio::runtime::Handle::try_current().map_err(|e| SessionError::Start(e.to_string()))?;
         let http = reqwest::Client::builder()
             .timeout(DISCOVERY_TIMEOUT)
@@ -91,17 +99,25 @@ impl SessionFactory for CoreFactory {
             .system_prompt
             .clone()
             .unwrap_or_else(|| prompt::system(&cwd));
+        let tools = tools::enabled(self.agent.tools.as_deref());
+        let taken = tools
+            .iter()
+            .map(|tool| tools::name(tool).to_string())
+            .collect();
+        let mcp = mcp::start(mcp_servers, cwd.clone(), taken, self.agent.allow.clone());
         Ok(session::spawn(
             Agent {
                 client: ModelClient::new(&self.config),
                 system,
-                tools: tools::enabled(self.agent.tools.as_deref()),
+                tools,
+                mcp: Default::default(),
                 cwd,
                 max_requests: MAX_TURN_REQUESTS,
                 request_pause: self.config.request_pause,
                 seen: Default::default(),
             },
             async move { context::discover(&http, backend, &base_url, &api_key, &model).await },
+            mcp,
             store,
             saved,
         ))
@@ -144,7 +160,7 @@ mod tests {
     #[test]
     fn new_session_outside_a_runtime_is_an_error() {
         let (factory, _root) = factory("http://unused".into());
-        let result = factory.new_session(".".into(), Resume::New);
+        let result = factory.new_session(".".into(), Resume::New, vec![]);
 
         assert!(matches!(result, Err(SessionError::Start(_))));
     }
@@ -152,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn new_session_in_a_missing_directory_is_an_error() {
         let (factory, _root) = factory("http://unused".into());
-        let result = factory.new_session("/no/such/dir".into(), Resume::New);
+        let result = factory.new_session("/no/such/dir".into(), Resume::New, vec![]);
 
         assert!(matches!(result, Err(SessionError::Start(e)) if e.starts_with("/no/such/dir")));
     }
@@ -162,7 +178,7 @@ mod tests {
         let (factory, _root) = factory("http://unused".into());
 
         for resume in [Resume::Latest, Resume::Id("0193".into())] {
-            let result = factory.new_session(".".into(), resume);
+            let result = factory.new_session(".".into(), resume, vec![]);
             assert!(matches!(result, Err(SessionError::NotFound)));
         }
     }
@@ -172,7 +188,9 @@ mod tests {
         let server = MockServer::start().await;
         respond(&server, reply(&["Hello"])).await;
         let (factory, _root) = factory(api_url(&server));
-        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
+        let mut handle = factory
+            .new_session(".".into(), Resume::New, vec![])
+            .unwrap();
 
         assert_eq!(
             handle.events.recv().await,
@@ -191,9 +209,12 @@ mod tests {
         let agent = AgentConfig {
             system_prompt: Some("You are BUDDY.".into()),
             tools: Some(vec!["grep".into(), "read_file".into()]),
+            ..AgentConfig::default()
         };
         let (factory, _root) = factory_with(api_url(&server), agent);
-        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
+        let mut handle = factory
+            .new_session(".".into(), Resume::New, vec![])
+            .unwrap();
         handle.events.recv().await;
 
         prompt(&mut handle, "hi").await;
@@ -218,7 +239,9 @@ mod tests {
             ..AgentConfig::default()
         };
         let (factory, _root) = factory_with(api_url(&server), agent);
-        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
+        let mut handle = factory
+            .new_session(".".into(), Resume::New, vec![])
+            .unwrap();
         handle.events.recv().await;
 
         prompt(&mut handle, "hi").await;
@@ -240,7 +263,9 @@ mod tests {
             .mount(&server)
             .await;
         let (factory, _root) = factory(api_url(&server));
-        let mut handle = factory.new_session(".".into(), Resume::New).unwrap();
+        let mut handle = factory
+            .new_session(".".into(), Resume::New, vec![])
+            .unwrap();
 
         assert_eq!(
             handle.events.recv().await,
