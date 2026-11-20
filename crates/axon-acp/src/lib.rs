@@ -2,8 +2,10 @@
 //! client, such as Zed, over stdio.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Diff, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
@@ -20,25 +22,21 @@ const ALLOW: &str = "allow";
 /// The permission option that rejects a change.
 const REJECT: &str = "reject";
 
-/// JSON-RPC error codes.
-const INVALID_PARAMS: i32 = -32602;
-const INTERNAL_ERROR: i32 = -32603;
-
 /// Why serving ACP stopped.
 #[derive(Debug, thiserror::Error)]
 #[error("ACP: {0}")]
-pub struct AcpError(String);
+pub struct AcpError(#[from] Error);
 
 /// Serve ACP on stdin/stdout until the client disconnects; each
 /// `session/new` starts a session from `factory`.
 pub async fn serve(factory: Arc<dyn SessionFactory>) -> Result<(), AcpError> {
-    serve_on(factory, Stdio::new())
-        .await
-        .map_err(|e| AcpError(e.to_string()))
+    Ok(serve_on(factory, Stdio::new()).await?)
 }
 
 /// What the connection keeps per session.
 struct Session {
+    /// The client's working directory; tool paths are relative to it.
+    cwd: PathBuf,
     commands: mpsc::Sender<Command>,
     /// Taken by the running prompt; None while a turn runs.
     events: Option<mpsc::Receiver<Event>>,
@@ -58,9 +56,10 @@ async fn serve_on(
         .name("Axon")
         .on_receive_request(
             async |initialize: InitializeRequest, responder, _connection| {
+                // The client's version if we speak it, else our latest.
+                let version = initialize.protocol_version.min(ProtocolVersion::LATEST);
                 responder.respond(
-                    InitializeResponse::new(initialize.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new()),
+                    InitializeResponse::new(version).agent_capabilities(AgentCapabilities::new()),
                 )
             },
             agent_client_protocol::on_receive_request!(),
@@ -73,17 +72,18 @@ async fn serve_on(
                         request.mcp_servers.len()
                     );
                 }
-                match factory.new_session(request.cwd, Resume::New) {
+                match factory.new_session(request.cwd.clone(), Resume::New) {
                     Ok(handle) => {
                         let id = handle.id.clone();
                         let session = Session {
+                            cwd: request.cwd,
                             commands: handle.commands,
                             events: Some(handle.events),
                         };
                         lock(&for_new).insert(id.clone(), session);
                         responder.respond(NewSessionResponse::new(id))
                     }
-                    Err(e) => responder.respond_with_error(error(INTERNAL_ERROR, e)),
+                    Err(e) => responder.respond_with_error(internal(e)),
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -96,13 +96,13 @@ async fn serve_on(
                     Err(e) => return responder.respond_with_error(e),
                 };
                 let taken = match lock(&for_prompt).get_mut(&id) {
-                    None => Err(error(INVALID_PARAMS, format!("no session {id}"))),
+                    None => Err(Error::session_not_found(id.clone())),
                     Some(session) => match session.events.take() {
-                        None => Err(error(INVALID_PARAMS, "a turn is already running")),
-                        Some(events) => Ok((session.commands.clone(), events)),
+                        None => Err(invalid("a turn is already running")),
+                        Some(events) => Ok((session.cwd.clone(), session.commands.clone(), events)),
                     },
                 };
-                let (commands, mut events) = match taken {
+                let (cwd, commands, mut events) = match taken {
                     Ok(taken) => taken,
                     Err(e) => return responder.respond_with_error(e),
                 };
@@ -114,12 +114,19 @@ async fn serve_on(
                     let prompt = Prompt {
                         connection: &task_connection,
                         id: &id,
+                        cwd: &cwd,
                         commands: &commands,
                     };
                     let stop = prompt.run(text, &mut events).await;
-                    if let Some(session) = lock(&sessions).get_mut(&id) {
-                        session.events = Some(events);
+                    // After an error the turn may still be running, so its
+                    // events can't go to the next prompt: drop the session,
+                    // which cancels the turn.
+                    let mut sessions = lock(&sessions);
+                    match (&stop, sessions.get_mut(&id)) {
+                        (Ok(_), Some(session)) => session.events = Some(events),
+                        _ => drop(sessions.remove(&id)),
                     }
+                    drop(sessions);
                     match stop {
                         Ok(stop) => responder.respond(PromptResponse::new(stop)),
                         Err(e) => responder.respond_with_error(e),
@@ -134,7 +141,8 @@ async fn serve_on(
                     .get(&cancel.session_id.to_string())
                     .map(|session| session.commands.clone());
                 if let Some(commands) = commands {
-                    let _ = commands.send(Command::Cancel).await;
+                    // Not `send().await`: that could hold the dispatch loop.
+                    let _ = commands.try_send(Command::Cancel);
                 }
                 Ok(())
             },
@@ -148,6 +156,7 @@ async fn serve_on(
 struct Prompt<'a> {
     connection: &'a ConnectionTo<Client>,
     id: &'a str,
+    cwd: &'a Path,
     commands: &'a mpsc::Sender<Command>,
 }
 
@@ -158,9 +167,7 @@ impl Prompt<'_> {
         text: String,
         events: &mut mpsc::Receiver<Event>,
     ) -> Result<AcpStop, Error> {
-        // Left over from before this turn, e.g. the context limit.
-        while events.try_recv().is_ok() {}
-        let ended = || error(INTERNAL_ERROR, "the session ended");
+        let ended = || internal("the session ended");
         self.commands
             .send(Command::Prompt { text })
             .await
@@ -214,6 +221,8 @@ impl Prompt<'_> {
 
     /// Ask the client to approve `change` for tool call `id`. Anything but
     /// the allow option, including a cancelled request or an error, rejects it.
+    /// On `session/cancel` the client must answer a pending request with
+    /// cancelled (ACP requires it); until it does, this waits.
     async fn ask(&self, id: u64, change: Change) -> bool {
         let fields = match change {
             Change::WriteFile {
@@ -223,7 +232,7 @@ impl Prompt<'_> {
             } => ToolCallUpdateFields::new()
                 .title(format!("Write {path}"))
                 .content(vec![ToolCallContent::Diff(
-                    Diff::new(path, new_text).old_text(old_text),
+                    Diff::new(self.cwd.join(&path), new_text).old_text(old_text),
                 )]),
             Change::RunCommand { command } => {
                 ToolCallUpdateFields::new().title(format!("Run {command}"))
@@ -252,8 +261,12 @@ fn lock(sessions: &Sessions) -> std::sync::MutexGuard<'_, HashMap<String, Sessio
     sessions.lock().expect("sessions lock")
 }
 
-fn error(code: i32, message: impl ToString) -> Error {
-    Error::new(code, message.to_string())
+fn invalid(message: impl ToString) -> Error {
+    Error::invalid_params().data(message.to_string())
+}
+
+fn internal(message: impl ToString) -> Error {
+    Error::internal_error().data(message.to_string())
 }
 
 fn message(text: String) -> SessionUpdate {
@@ -266,7 +279,7 @@ fn prompt_text(prompt: Vec<ContentBlock>) -> Result<String, Error> {
     for block in prompt {
         match block {
             ContentBlock::Text(text) => texts.push(text.text),
-            _ => return Err(error(INVALID_PARAMS, "only text prompts are supported")),
+            _ => return Err(invalid("only text prompts are supported")),
         }
     }
     Ok(texts.join("\n"))
@@ -360,7 +373,8 @@ mod tests {
         }
     }
 
-    /// Hands each new session's core end to the test.
+    /// Hands each new session's core end to the test; fails to start
+    /// sessions in a cwd named "/broken".
     #[derive(Default)]
     struct Stub {
         cores: Mutex<Vec<Core>>,
@@ -369,6 +383,9 @@ mod tests {
     impl SessionFactory for Stub {
         fn new_session(&self, cwd: PathBuf, resume: Resume) -> Result<SessionHandle, SessionError> {
             assert_eq!(resume, Resume::New);
+            if cwd == Path::new("/broken") {
+                return Err(SessionError::Start("no such folder".into()));
+            }
             let (commands, command_rx) = mpsc::channel(16);
             let (event_tx, events) = mpsc::channel(64);
             let mut cores = self.cores.lock().unwrap();
@@ -401,6 +418,8 @@ mod tests {
         Allow,
         Reject,
         Cancel,
+        /// Answer with a JSON-RPC error.
+        Fail,
     }
 
     async fn start(answer: Answer) -> Test {
@@ -423,6 +442,9 @@ mod tests {
                 .on_receive_request(
                     async move |request: RequestPermissionRequest, responder, _connection| {
                         let _ = ask_tx.send(request);
+                        if let Answer::Fail = answer {
+                            return responder.respond_with_error(Error::internal_error());
+                        }
                         let outcome = match answer {
                             Answer::Allow => RequestPermissionOutcome::Selected(
                                 SelectedPermissionOutcome::new(ALLOW),
@@ -430,7 +452,7 @@ mod tests {
                             Answer::Reject => RequestPermissionOutcome::Selected(
                                 SelectedPermissionOutcome::new(REJECT),
                             ),
-                            Answer::Cancel => RequestPermissionOutcome::Cancelled,
+                            Answer::Cancel | Answer::Fail => RequestPermissionOutcome::Cancelled,
                         };
                         responder.respond(RequestPermissionResponse::new(outcome))
                     },
@@ -530,9 +552,6 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_streams_the_reply_and_ends_with_the_stop_reason() {
         let mut test = start(Answer::Allow).await;
-        test.core
-            .send(Event::ContextLimit { tokens: Some(8) })
-            .await;
 
         let pending = test.prompt(&["hello", "world"]);
         assert!(matches!(
@@ -569,15 +588,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn initialize_offers_the_clients_version_only_if_we_speak_it() {
+        let test = start(Answer::Allow).await;
+        for (asked, offered) in [(1, 1), (2, 1)] {
+            let response = test
+                .connection
+                .send_request(InitializeRequest::new(ProtocolVersion::from(asked)))
+                .block_task()
+                .await
+                .unwrap();
+            assert_eq!(response.protocol_version, ProtocolVersion::from(offered));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_that_fails_to_start_is_an_error() {
+        let test = start(Answer::Allow).await;
+
+        let error = test
+            .connection
+            .send_request(NewSessionRequest::new("/broken"))
+            .block_task()
+            .await
+            .unwrap_err();
+
+        let data = error.data.unwrap().to_string();
+        assert!(data.contains("no such folder"), "{data}");
+    }
+
     #[test]
-    fn every_stop_reason_has_an_acp_one() {
-        assert_eq!(stop_reason(StopReason::EndTurn), AcpStop::EndTurn);
-        assert_eq!(stop_reason(StopReason::Cancelled), AcpStop::Cancelled);
+    fn tool_kinds_follow_the_tool_names() {
+        let kinds: Vec<_> = [
+            "read_file",
+            "list_dir",
+            "grep",
+            "find",
+            "write_file",
+            "edit_file",
+            "run_command",
+            "get_time",
+        ]
+        .into_iter()
+        .map(kind)
+        .collect();
         assert_eq!(
-            stop_reason(StopReason::MaxTurnRequests),
-            AcpStop::MaxTurnRequests
+            kinds,
+            [
+                ToolKind::Read,
+                ToolKind::Search,
+                ToolKind::Search,
+                ToolKind::Search,
+                ToolKind::Edit,
+                ToolKind::Edit,
+                ToolKind::Execute,
+                ToolKind::Other,
+            ]
         );
-        assert_eq!(stop_reason(StopReason::MaxTokens), AcpStop::MaxTokens);
     }
 
     #[tokio::test]
@@ -655,17 +722,20 @@ mod tests {
         );
     }
 
-    /// Run a turn whose one tool call asks to write a file; returns the
-    /// approval the core got and the permission request the client saw.
-    async fn approval(answer: Answer) -> (bool, RequestPermissionRequest) {
-        let mut test = start(answer).await;
-        let pending = test.prompt(&["write"]);
-        test.core.next().await;
-        let change = Change::WriteFile {
+    fn write() -> Change {
+        Change::WriteFile {
             path: "a.txt".into(),
             old_text: Some("old".into()),
             new_text: "new".into(),
-        };
+        }
+    }
+
+    /// Run a turn whose one tool call asks for `change`; returns the
+    /// approval the core got and the permission request the client saw.
+    async fn approval(answer: Answer, change: Change) -> (bool, RequestPermissionRequest) {
+        let mut test = start(answer).await;
+        let pending = test.prompt(&["change"]);
+        test.core.next().await;
         test.core
             .send(Event::ApprovalRequested { id: 3, change })
             .await;
@@ -684,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_asks_the_client_with_a_diff() {
-        let (approve, asked) = approval(Answer::Allow).await;
+        let (approve, asked) = approval(Answer::Allow, write()).await;
 
         assert!(approve);
         assert_eq!(asked.session_id.to_string(), "s1");
@@ -693,7 +763,7 @@ mod tests {
         assert_eq!(
             asked.tool_call.fields.content,
             Some(vec![ToolCallContent::Diff(
-                Diff::new("a.txt", "new").old_text("old".to_string())
+                Diff::new("/work/a.txt", "new").old_text("old".to_string())
             )])
         );
         let options: Vec<_> = asked
@@ -711,9 +781,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_or_cancelled_permission_rejects_the_change() {
-        assert!(!approval(Answer::Reject).await.0);
-        assert!(!approval(Answer::Cancel).await.0);
+    async fn a_rejected_cancelled_or_failed_permission_rejects_the_change() {
+        for answer in [Answer::Reject, Answer::Cancel, Answer::Fail] {
+            assert!(!approval(answer, write()).await.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_asks_with_its_command_line() {
+        let command = Change::RunCommand {
+            command: "date".into(),
+        };
+        let (approve, asked) = approval(Answer::Allow, command).await;
+
+        assert!(approve);
+        assert_eq!(asked.tool_call.fields.title.as_deref(), Some("Run date"));
+        assert_eq!(asked.tool_call.fields.content, None);
     }
 
     #[tokio::test]
@@ -744,7 +827,7 @@ mod tests {
         test.core.next().await;
 
         let second = response(test.prompt(&["two"])).await.unwrap_err();
-        assert_eq!(second.message, "a turn is already running");
+        assert_eq!(second.data, Some("a turn is already running".into()));
 
         test.core
             .send(Event::TurnEnded {
@@ -771,7 +854,7 @@ mod tests {
 
         test.session = "nope".into();
         let unknown = response(test.prompt(&["hi"])).await.unwrap_err();
-        assert_eq!(unknown.message, "no session nope");
+        assert_eq!(unknown.code, Error::session_not_found("nope").code);
 
         test.session = "s1".into();
         let image = ContentBlock::Image(agent_client_protocol::schema::v1::ImageContent::new(
@@ -779,6 +862,21 @@ mod tests {
             "image/png",
         ));
         let error = response(test.send_prompt(vec![image])).await.unwrap_err();
-        assert_eq!(error.message, "only text prompts are supported");
+        assert_eq!(error.data, Some("only text prompts are supported".into()));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_whose_session_ended_is_an_error_and_drops_the_session() {
+        let mut test = start(Answer::Allow).await;
+        let pending = test.prompt(&["hi"]);
+        test.core.next().await;
+        // The core goes away mid-turn: its event sender is dropped.
+        let (gone, _) = mpsc::channel(1);
+        drop(std::mem::replace(&mut test.core.events, gone));
+
+        let error = response(pending).await.unwrap_err();
+        assert_eq!(error.data, Some("the session ended".into()));
+        let next = response(test.prompt(&["again"])).await.unwrap_err();
+        assert_eq!(next.code, Error::session_not_found("s1").code);
     }
 }
