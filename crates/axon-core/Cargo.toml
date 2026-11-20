@@ -19,10 +19,12 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util.workspace = true
 reqwest.workspace = true
+rmcp.workspace = true
 semver.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rmcp = { workspace = true, features = ["server"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 wiremock.workspace = true

@@ -18,6 +18,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::mcp::Mcp;
 use crate::model::{Delta, ModelClient, RequestPause, ToolCall, ToolCalls};
 use crate::tools::{self, Action, Printed, Seen};
 
@@ -42,6 +43,8 @@ pub(crate) struct Agent {
     pub(crate) system: String,
     /// The tools offered to the model; it can't run any other.
     pub(crate) tools: Vec<ChatCompletionTools>,
+    /// Runs the offered tools that come from MCP servers.
+    pub(crate) mcp: Mcp,
     /// Model requests per prompt before the turn stops.
     pub(crate) max_requests: usize,
     /// Wait between a turn's model requests.
@@ -249,45 +252,49 @@ impl Agent {
                 args: call.args.clone(),
             })
             .await?;
-        let action = if self.offers(&call.name) {
-            let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
-            tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?
+        let outcome = if self.mcp.runs(&call.name) {
+            self.run_mcp(call, events, &mut asking).await?
         } else {
-            Err(format!("unknown tool: {}", call.name))
-        };
-        let outcome = match action {
-            Ok(Action::Output(output)) => Outcome::output(output),
-            Ok(Action::Read { output, seen }) => {
-                self.saw(seen);
-                Outcome::output(output)
-            }
-            Ok(Action::Write(write)) => {
-                let checked = write.check(&self.seen.lock().expect("seen lock"));
-                match checked {
-                    Err(error) => Outcome::failed(error),
-                    Ok(()) => match asking.ask(write.change(), events).await? {
-                        Some(true) => {
-                            let seen = write.seen_after();
-                            match tokio::task::spawn_blocking(move || write.apply()).await? {
-                                Ok(output) => {
-                                    self.saw(seen);
-                                    Outcome::output(output)
-                                }
-                                Err(error) => Outcome::failed(error),
-                            }
-                        }
-                        answer => Outcome::not_approved(answer),
-                    },
+            let action = if self.offers(&call.name) {
+                let (cwd, name, args) = (self.cwd.clone(), call.name.clone(), call.args.clone());
+                tokio::task::spawn_blocking(move || tools::run(&cwd, &name, &args)).await?
+            } else {
+                Err(format!("unknown tool: {}", call.name))
+            };
+            match action {
+                Ok(Action::Output(output)) => Outcome::output(output),
+                Ok(Action::Read { output, seen }) => {
+                    self.saw(seen);
+                    Outcome::output(output)
                 }
-            }
-            Ok(Action::Run(run)) => match asking.ask(run.change(), events).await? {
-                Some(true) => match run.execute(&self.cwd, asking.cancel).await {
-                    Ok((printed, exit)) => Outcome::command(printed, exit),
-                    Err(error) => Outcome::failed(error),
+                Ok(Action::Write(write)) => {
+                    let checked = write.check(&self.seen.lock().expect("seen lock"));
+                    match checked {
+                        Err(error) => Outcome::failed(error),
+                        Ok(()) => match asking.ask(write.change(), events).await? {
+                            Some(true) => {
+                                let seen = write.seen_after();
+                                match tokio::task::spawn_blocking(move || write.apply()).await? {
+                                    Ok(output) => {
+                                        self.saw(seen);
+                                        Outcome::output(output)
+                                    }
+                                    Err(error) => Outcome::failed(error),
+                                }
+                            }
+                            answer => Outcome::not_approved(answer),
+                        },
+                    }
+                }
+                Ok(Action::Run(run)) => match asking.ask(run.change(), events).await? {
+                    Some(true) => match run.execute(&self.cwd, asking.cancel).await {
+                        Ok((printed, exit)) => Outcome::command(printed, exit),
+                        Err(error) => Outcome::failed(error),
+                    },
+                    answer => Outcome::not_approved(answer),
                 },
-                answer => Outcome::not_approved(answer),
-            },
-            Err(error) => Outcome::failed(error),
+                Err(error) => Outcome::failed(error),
+            }
         };
         events
             .send(Event::ToolCallFinished {
@@ -296,6 +303,33 @@ impl Agent {
             })
             .await?;
         Ok(outcome)
+    }
+
+    /// Run a call to an MCP tool, asking first unless the profile allows it.
+    async fn run_mcp(
+        &self,
+        call: &ToolCall,
+        events: &mpsc::Sender<Event>,
+        asking: &mut Asking<'_>,
+    ) -> Result<Outcome> {
+        if !self.mcp.allows(&call.name) {
+            let change = Change::CallTool {
+                tool: call.name.clone(),
+                args: call.args.clone(),
+            };
+            let answer = asking.ask(change, events).await?;
+            if answer != Some(true) {
+                return Ok(Outcome::not_approved(answer));
+            }
+        }
+        Ok(tokio::select! {
+            biased;
+            _ = asking.cancel.cancelled() => Outcome::cancelled(),
+            result = self.mcp.call(&call.name, &call.args) => match result {
+                Ok(output) => Outcome::output(output),
+                Err(error) => Outcome::failed(error),
+            },
+        })
     }
 }
 
@@ -317,6 +351,14 @@ impl Outcome {
         Self {
             for_model: format!("error: {error}"),
             result: ToolResult::Failed(error),
+        }
+    }
+
+    /// The turn was cancelled while the tool ran.
+    fn cancelled() -> Self {
+        Self {
+            result: ToolResult::Failed(CANCELLED.into()),
+            for_model: CANCELLED.into(),
         }
     }
 
@@ -727,6 +769,7 @@ mod tests {
         let mut handle = crate::session::spawn(
             agent(&server, dir.path()),
             async { None },
+            async { Default::default() },
             store,
             Default::default(),
         );

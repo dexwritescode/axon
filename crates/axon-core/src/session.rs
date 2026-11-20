@@ -8,6 +8,7 @@ use axon_protocol::{Command, Event, SessionHandle, StopReason};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::mcp::Started;
 use crate::store::{Saved, Store, Turn};
 use crate::turn::{Agent, Approval};
 
@@ -15,10 +16,12 @@ const COMMAND_BUFFER: usize = 16;
 pub(crate) const EVENT_BUFFER: usize = 64;
 
 /// Start a session task that saves to `store`, going on from `saved`, and
-/// return the frontend's end of it.
+/// return the frontend's end of it. The task first waits for the context
+/// limit and for `mcp`, the MCP servers starting.
 pub(crate) fn spawn(
     agent: Agent,
     context_limit: impl Future<Output = Option<u64>> + Send + 'static,
+    mcp: impl Future<Output = Started> + Send + 'static,
     store: Store,
     saved: Saved,
 ) -> SessionHandle {
@@ -28,6 +31,7 @@ pub(crate) fn spawn(
     tokio::spawn(run(
         agent,
         context_limit,
+        mcp,
         store,
         saved,
         command_rx,
@@ -42,20 +46,28 @@ pub(crate) fn spawn(
 
 /// Runs until the frontend drops its command sender or its event receiver.
 async fn run(
-    agent: Agent,
+    mut agent: Agent,
     context_limit: impl Future<Output = Option<u64>> + Send,
+    mcp: impl Future<Output = Started> + Send,
     mut store: Store,
     saved: Saved,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
 ) {
-    let tokens = context_limit.await;
+    let (tokens, started) = tokio::join!(context_limit, mcp);
+    agent.tools.extend(started.schemas);
+    agent.mcp = started.mcp;
     if events.send(Event::ContextLimit { tokens }).await.is_err() {
         return;
     }
     if !saved.past.is_empty() {
         let items = saved.past;
         if events.send(Event::History { items }).await.is_err() {
+            return;
+        }
+    }
+    for message in started.errors {
+        if events.send(Event::Error { message }).await.is_err() {
             return;
         }
     }
@@ -352,7 +364,13 @@ mod tests {
             commands,
             events: mut all,
             ..
-        } = super::spawn(agent(&server, cwd.path()), async { None }, store, saved);
+        } = super::spawn(
+            agent(&server, cwd.path()),
+            async { None },
+            async { Started::default() },
+            store,
+            saved,
+        );
         assert_eq!(all.recv().await, Some(Event::ContextLimit { tokens: None }));
         let Some(Event::History { items }) = all.recv().await else {
             panic!("History should follow ContextLimit");

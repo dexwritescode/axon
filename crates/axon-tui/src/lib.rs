@@ -43,7 +43,7 @@ pub async fn run(
     settings: Settings,
     resume: Resume,
 ) -> Result<(), TuiError> {
-    let session = factory.new_session(std::env::current_dir()?, resume)?;
+    let session = factory.new_session(std::env::current_dir()?, resume, vec![])?;
     let id = session.id.clone();
     let saved = {
         let _screen = Screen::enter()?;

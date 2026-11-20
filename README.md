@@ -53,9 +53,10 @@ system_prompt = """
 You are BUDDY, a voice assistant. Answer in one or two short sentences.
 """
 tools = ["read_file", "grep"]   # built-in tools to offer; [] offers none; leave it out for all
+allow = ["get_time"]            # MCP tools that run without asking
 ```
 
-Both fields are optional: `system_prompt` replaces Axon's own, and `tools` limits which built-in tools the model gets: `read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`. A profile that can't be read or parsed, or names an unknown field or tool, stops Axon with an error.
+Every field is optional: `system_prompt` replaces Axon's own, `tools` limits which built-in tools the model gets (`read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`), and `allow` names the MCP tools (see ACP below) that run without asking; every other MCP tool asks first. A profile that can't be read or parsed, or names an unknown field or built-in tool, stops Axon with an error. MCP tool names are known only once their servers start, so an `allow` entry that matches none is reported as an error at session start instead.
 
 A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the input and the history as one `[pasted N chars]` token; the model gets it in full.
 
@@ -69,7 +70,9 @@ At session start Axon asks the backend for the model's loaded context size (all 
 "agent_servers": { "Axon": { "command": "axon", "args": ["acp"] } }
 ```
 
-It supports `session/new`, `session/prompt` (text only), `session/cancel`, streamed replies, reasoning and tool calls, and asks for approval of writes (with a diff) and commands through `session/request_permission`. One prompt runs at a time per session; another sent meanwhile is an error. MCP servers sent with `session/new` are ignored for now.
+It supports `session/new`, `session/prompt` (text only), `session/cancel`, streamed replies, reasoning and tool calls, and asks for approval of writes (with a diff) and commands through `session/request_permission`. One prompt runs at a time per session; another sent meanwhile is an error.
+
+The stdio MCP servers a client sends with `session/new` are started in the session's working directory and their tools offered next to the built-in ones, under the tools' own names; a tool named like another is skipped. A server that fails to start, or a skipped tool, is reported as an error message and the session goes on without it. A call runs until it answers, the turn is cancelled, or 60 s pass; the model gets its text content. HTTP and SSE servers are ignored, with a note on stderr. The servers stop with the session.
 
 ## Test against real servers (macOS)
 

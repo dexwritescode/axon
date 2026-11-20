@@ -128,6 +128,8 @@ fn model(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelConfig, ConfigE
 struct Profile {
     system_prompt: Option<String>,
     tools: Option<Vec<String>>,
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 /// The profile file `AXON_PROFILE` names, or the default without one.
@@ -159,6 +161,7 @@ fn profile(text: &str) -> Result<AgentConfig, String> {
     Ok(AgentConfig {
         system_prompt: profile.system_prompt,
         tools: profile.tools,
+        allow: profile.allow,
     })
 }
 
@@ -324,6 +327,13 @@ mod tests {
             Some("You are BUDDY.\nBe brief.")
         );
         assert_eq!(config.tools, Some(vec!["read_file".into(), "grep".into()]));
+    }
+
+    #[test]
+    fn a_profile_names_the_mcp_tools_that_run_without_asking() {
+        let config = profile("allow = [\"get_time\", \"open_app\"]").unwrap();
+
+        assert_eq!(config.allow, ["get_time", "open_app"]);
     }
 
     #[test]

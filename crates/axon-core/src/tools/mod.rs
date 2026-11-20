@@ -145,7 +145,7 @@ pub(crate) fn name(tool: &ChatCompletionTools) -> &str {
     }
 }
 
-fn schema(name: &str, description: &str, parameters: Value) -> ChatCompletionTools {
+pub(crate) fn schema(name: &str, description: &str, parameters: Value) -> ChatCompletionTools {
     ChatCompletionTools::Function(ChatCompletionTool {
         function: FunctionObject {
             name: name.into(),
