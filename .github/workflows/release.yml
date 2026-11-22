@@ -1,25 +1,31 @@
 name: Release
 
+# Each merged PR releases, sized by its release:* label. The action commits the
+# release version to Cargo.toml (tagged), then the next -dev version, and pushes
+# both to main with the release App's token (a bypass actor on main's ruleset).
+
 on:
   push:
     branches: ["main"]
 
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
   release:
+    # Skip the action's own push, so it never joins the group and cancels a waiting release.
+    if: ${{ !startsWith(github.event.head_commit.message, 'Next development version') }}
+    concurrency:
+      group: release
+      cancel-in-progress: false
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: dexwritescode/release-on-merge-action@v1.2.0
-        id: release
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: dexwritescode/release-on-merge-action@v1.3.0
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
         with:
           initial-version: '0.1.0'
           version-increment-strategy: patch
@@ -29,20 +35,4 @@ jobs:
           label-minor: 'release:minor'
           label-patch: 'release:patch'
           label-skip: 'release:skip'
-
-      - uses: actions/checkout@v7
-
-      - name: Check a release was made for this commit
-        id: made
-        env:
-          TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          if [ -n "$TAG" ] && git ls-remote --tags origin "$TAG" "$TAG^{}" | grep -q "^$GITHUB_SHA"; then
-            echo "yes=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Open the next -dev version PR
-        if: steps.made.outputs.yes == 'true'
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: scripts/next-dev.sh
+          version-files: cargo
