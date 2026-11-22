@@ -1,8 +1,9 @@
 name: Release
 
-# Each merged PR releases, sized by its release:* label. The action commits the
-# release version to Cargo.toml (tagged), then the next -dev version, and pushes
-# both to main with the release App's token (a bypass actor on main's ruleset).
+# A merged PR releases only when labelled release:patch, :minor or :major. The
+# action commits the release version to Cargo.toml (tagged), then the next -dev
+# version, and pushes both to main with the release App's token (a bypass actor
+# on main's ruleset).
 
 on:
   push:
@@ -28,7 +29,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
         with:
           initial-version: '0.1.0'
-          version-increment-strategy: patch
+          version-increment-strategy: norelease
           generate-release-notes: true
           use-label-strategy: true
           label-major: 'release:major'
