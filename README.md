@@ -3,85 +3,41 @@
 [![Build](https://github.com/dexwritescode/axon/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/dexwritescode/axon/actions/workflows/build.yml)
 [![Test](https://github.com/dexwritescode/axon/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/dexwritescode/axon/actions/workflows/test.yml)
 
-Axon is an AI coding agent.
+Axon is an AI coding agent for local models. It runs as a terminal UI or as an [ACP](https://agentclientprotocol.com/) agent for editors such as Zed.
 
-## Run against a local model
+## Quick start
 
-Axon talks to any OpenAI-compatible server. By default it uses LM Studio's local server and Qwen3.6 35B A3B.
+Axon talks to any OpenAI-compatible server. By default it uses LM Studio on `localhost:1234` with Qwen3.6 35B A3B.
+
+Clone the repo, start the server, then run Axon from the repo's root folder:
 
 ```sh
-lms server start                  # OpenAI-compatible server on localhost:1234
-lms load qwen/qwen3.6-35b-a3b     # pass --context-length 32768 to set the context size
-lms ps                            # what's loaded
-cargo run                         # the TUI
-lms unload --all && lms server stop
+git clone https://github.com/dexwritescode/axon.git
+cd axon
+lms server start                       # start LM Studio's server
+lms load qwen/qwen3.6-35b-a3b          # load the model
+cargo run --bin axon                   # build and run Axon
+lms unload --all && lms server stop    # when done: unload the model and stop the server
 ```
 
-TUI keys:
+Type a prompt and press Enter. Type `/exit` to quit.
 
-| Key | Action |
-| --- | --- |
-| Enter | send; during a turn, send when it ends |
-| Ctrl+Enter, Ctrl+S | during a turn, stop it and send what waits now |
-| Shift+Enter, Ctrl+J | new line |
-| ←/→, ↑/↓ | move the cursor |
-| ↑ on the first row, ↓ on the last | previous / next sent prompt |
-| Alt+←/→, Ctrl+←/→, Alt+B/F | move by word |
-| Home/End, Ctrl+A/E | line start/end |
-| PageUp/PageDown, mouse wheel | scroll the history |
-| Ctrl+End | jump the history to the bottom |
-| Y / N | approve or reject a change |
-| Esc, Ctrl+C | cancel the turn; what waits is sent |
-| Ctrl+C when idle, `/exit`, `/quit` | quit |
+## Docs
 
-Prompts sent during a turn wait below it as `Next`. When the turn ends, however it ends, they go to the model together as one message. Ctrl+Enter adds the input to them and stops the turn at once, keeping the reply so far.
+- [Terminal UI](docs/tui.md): keys, queued prompts, sessions
+- [Configuration](docs/configuration.md): servers, models and other settings
+- [Profiles](docs/profiles.md): custom system prompt and tools
+- [ACP](docs/acp.md): Zed and other editors, MCP servers
+- [Evals](docs/evals.md): measuring Axon on coding tasks
+- [Development](docs/development.md): backend tests and releases
 
-Ctrl+Enter needs a terminal with the kitty keyboard protocol, for example kitty, WezTerm, Ghostty, iTerm2, Alacritty or foot. On Windows it works in any console. Other terminals, such as macOS Terminal, and tmux by default, send it as Enter (it queues) or as Ctrl+J (a new line). Ctrl+S works in every terminal.
+## License
 
-Each session is saved when a turn ends, in `~/.axon/sessions` (`%USERPROFILE%\.axon\sessions` on Windows) or in `AXON_SESSIONS_DIR`. Quitting prints the command to resume it. `axon --continue` resumes the session last used in the current folder and `axon --resume <id>` the one whose id starts with `<id>`; the history shows again and the model gets the conversation so far.
+Axon is licensed under either of
 
-To use another server or model, set `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `AXON_MODEL`, and name the server in `AXON_BACKEND`: `lmstudio` (the default), `ollama`, `llamacpp`, `vllm`, or `openai` for any other OpenAI-compatible server. Axon adapts its requests to the backend's quirks.
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
 
-To let the machine cool between a turn's model requests, set `AXON_REQUEST_PAUSE_SECS` (default 0). Set `AXON_REQUEST_PAUSE_RATIO` too and the pause follows the request before it instead: that many times as long as it took, at most `AXON_REQUEST_PAUSE_SECS` (no cap when 0). With `0.5` and `30`, a 10 s request is followed by 5 s, a 90 s one by 30 s.
+at your option.
 
-Each model reply may take at most `AXON_MAX_TOKENS` tokens, reasoning included (default 16384); a reply cut off there ends the turn. `AXON_REASONING_EFFORT` (`none`, `low`, `medium` or `high`) is sent with each request when set; `none` turns thinking off where the server supports it (LM Studio does for qwen); a server may reject a value it doesn't support.
-
-`AXON_PROFILE` names a TOML file that changes the agent, for example:
-
-```toml
-system_prompt = """
-You are BUDDY, a voice assistant. Answer in one or two short sentences.
-"""
-tools = ["read_file", "grep"]   # built-in tools to offer; [] offers none; leave it out for all
-allow = ["get_time"]            # MCP tools that run without asking
-```
-
-Every field is optional: `system_prompt` replaces Axon's own, `tools` limits which built-in tools the model gets (`read_file`, `list_dir`, `grep`, `find`, `write_file`, `edit_file`, `run_command`), and `allow` names the MCP tools (see ACP below) that run without asking; every other MCP tool asks first. A profile that can't be read or parsed, or names an unknown field or built-in tool, stops Axon with an error. MCP tool names are known only once their servers start, so an `allow` entry that matches none is reported as an error at the start of a session that has MCP servers instead.
-
-A paste longer than `AXON_PASTE_TOKEN_CHARS` chars (default 1000) shows in the input and the history as one `[pasted N chars]` token; the model gets it in full.
-
-At session start Axon asks the backend for the model's loaded context size (all but `openai` report it) and shows it after each turn, e.g. `✓ Finished at 14:32 · 2m 5s · 262k context`. Ollama and LM Studio report it only while the model is loaded.
-
-## ACP (Zed and other clients)
-
-`axon acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com/) over stdio, with the same env vars and `AXON_PROFILE` as the TUI. In Zed's settings:
-
-```json
-"agent_servers": { "Axon": { "command": "axon", "args": ["acp"] } }
-```
-
-It supports `session/new`, `session/prompt` (text only), `session/cancel`, streamed replies, reasoning and tool calls, and asks for approval of writes (with a diff) and commands through `session/request_permission`. One prompt runs at a time per session; another sent meanwhile is an error.
-
-The stdio MCP servers a client sends with `session/new` are started in the session's working directory and their tools offered next to the built-in ones, under the tools' own names; a tool named like another is skipped. A server that fails to start, or a skipped tool, is reported as an error message and the session goes on without it. A call runs until it answers, the turn is cancelled, or 60 s pass; the model gets its text content. HTTP and SSE servers are ignored, with a note on stderr. The servers stop with the session.
-
-## Test against real servers (macOS)
-
-`scripts/backend-test.sh NAME` installs a backend with Homebrew or `lms`, starts it, loads a small Qwen3 0.6B model, runs the ignored live test (context discovery and a reply), then stops what it started. NAME is `ollama`, `llamacpp` or `lmstudio`. Downloads stay cached; `scripts/backends/NAME.sh purge` removes them. These scripts are macOS-only dev tooling.
-
-## Evals
-
-`cargo run -p axon-eval -- evals/tasks evals/runs/NAME [--runs N]` runs each task in `evals/tasks` through Axon on the configured model (the same env vars as above), one run at a time, approving every tool call. A task is a `task.toml` (the prompt, the `check` command that passes once the task is done, the `tests` paths) and the `repo/` the model starts from, or a `rev` of this repo to start from instead. `evals/tasks` holds small bug fixes in Rust and Python; `evals/axon` holds changes from Axon's own history, starting at the commit before each, whose check is that the workspace's tests still pass. A run that changes nothing fails. For a `rev` task any change that keeps the tests passing counts, so read its diff. The runs share one cargo build folder, `<out>/target`, deleted at the end or on Ctrl-C; `CARGO_TARGET_DIR` must be unset. Each run leaves its `work/` folder, `diff.patch` and `check.txt` in `evals/runs/NAME/<task>-<n>`, and a line in `results.jsonl`; a pass-rate summary prints at the end. Tests the model changes are put back before the check. The Python tasks need `uv`.
-
-## Releases
-
-Every merged PR is a release. Label the PR `release:patch` (the default when unlabelled), `release:minor` or `release:major` to size it, or `release:skip` for no release. On merge, `.github/workflows/release.yml` (release-on-merge-action with `version-files: cargo`) commits the release version to `Cargo.toml` and `Cargo.lock` and tags that commit, then commits the next `-dev` version (the release's patch + 1) and moves `main` to it. Nobody edits the version by hand: `main` always says the next version with `-dev`, and each tag's `Cargo.toml` says that tag's version. The pushes use the release GitHub App's token (`RELEASE_APP_CLIENT_ID`, `RELEASE_APP_PRIVATE_KEY`), which is on the bypass list of `main`'s ruleset.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Axon by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
