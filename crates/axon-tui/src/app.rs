@@ -176,7 +176,6 @@ impl App {
             return self.on_approval_key(key);
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => Some(Action::Quit),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if self.turn.is_none() => {
                 Some(Action::Quit)
             }
@@ -219,12 +218,11 @@ impl App {
         }
     }
 
-    /// While a change waits, only y, n, cancel and quit do anything.
+    /// While a change waits, only y, n and cancel do anything.
     fn on_approval_key(&mut self, key: KeyEvent) -> Option<Action> {
         let approve = match (key.code, key.modifiers) {
             (KeyCode::Char('y' | 'Y'), KeyModifiers::NONE | KeyModifiers::SHIFT) => true,
             (KeyCode::Char('n' | 'N'), KeyModifiers::NONE | KeyModifiers::SHIFT) => false,
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Some(Action::Quit),
             (KeyCode::Char('c' | 's'), KeyModifiers::CONTROL)
             | (KeyCode::Enter, KeyModifiers::CONTROL)
             | (KeyCode::Esc, _) => {
@@ -247,6 +245,9 @@ impl App {
         if self.input.is_empty() {
             return None;
         }
+        if self.is_exit() {
+            return Some(Action::Quit);
+        }
         let prompt = self.input.trimmed();
         self.input.clear();
         self.recall = None;
@@ -266,12 +267,16 @@ impl App {
 
     /// Queue the input, then cancel the turn so the queue is sent at once.
     fn send_now(&mut self) -> Option<Action> {
-        if self.turn.is_none() {
+        if self.turn.is_none() || self.is_exit() {
             return self.submit();
         }
         self.submit();
         self.queued.as_ref()?;
         self.cancel()
+    }
+
+    fn is_exit(&self) -> bool {
+        matches!(self.input.expanded().trim(), "/exit" | "/quit")
     }
 
     /// Show the prompt sent before the one shown, keeping the draft.
@@ -585,11 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_and_ctrl_q_quit_while_idle() {
+    fn ctrl_c_quits_while_idle() {
         let mut app = App::default();
 
         assert_eq!(app.on_key(ctrl('c')), Some(Action::Quit));
-        assert_eq!(app.on_key(ctrl('q')), Some(Action::Quit));
         assert_eq!(app.on_key(key(KeyCode::Esc)), None);
     }
 
@@ -605,8 +609,28 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_q_quits_during_a_turn() {
-        assert_eq!(busy_app().on_key(ctrl('q')), Some(Action::Quit));
+    fn exit_and_quit_quit_while_idle_or_during_a_turn() {
+        for app in [App::default, busy_app] {
+            for command in ["/exit", " /quit "] {
+                for send in [key(KeyCode::Enter), ctrl('s')] {
+                    let mut app = app();
+                    type_text(&mut app, command);
+
+                    assert_eq!(app.on_key(send), Some(Action::Quit));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exit_inside_a_prompt_is_sent() {
+        let mut app = App::default();
+        type_text(&mut app, "/exit now");
+
+        assert!(matches!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Submit(_))
+        ));
     }
 
     #[test]
