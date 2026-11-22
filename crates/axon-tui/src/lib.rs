@@ -347,7 +347,7 @@ mod tests {
         let mut app = App::default();
 
         assert_eq!(step(&mut app, &commands, Input::Session(None)).await, None);
-        let quit = Input::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        let quit = Input::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(step(&mut app, &commands, quit).await, None);
     }
 }

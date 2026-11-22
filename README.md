@@ -32,7 +32,7 @@ TUI keys:
 | Ctrl+End | jump the history to the bottom |
 | Y / N | approve or reject a change |
 | Esc, Ctrl+C | cancel the turn; what waits is sent |
-| Ctrl+C when idle, Ctrl+Q | quit |
+| Ctrl+C when idle, `/exit`, `/quit` | quit |
 
 Prompts sent during a turn wait below it as `Next`. When the turn ends, however it ends, they go to the model together as one message. Ctrl+Enter adds the input to them and stops the turn at once, keeping the reply so far.
 
