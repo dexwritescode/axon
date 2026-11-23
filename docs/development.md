@@ -21,13 +21,15 @@ A merged PR releases only when it is labelled:
 | `release:patch` | Patch |
 | `release:minor` | Minor |
 | `release:major` | Major |
-| `release:skip` | None (the default when unlabelled) |
+| `release:skip` | None at merge (the default when unlabelled) |
+
+A weekly run releases a patch if anything merged since the last release, labelled or not. It can also be started by hand from the Actions tab.
 
 Leave most PRs unlabelled. `release:minor` is only for a big rollout the maintainer announces. `release:major` waits for 1.0.
 
 A PR that adds a session store migration always gets `release:patch`, with the migration at `main`'s version without `-dev`. Migrations count a dev build as its release, so each format change needs a release of its own.
 
-On merge, `.github/workflows/release.yml` commits the release version to `Cargo.toml` and `Cargo.lock` and tags that commit. It then commits the next `-dev` version (the release's patch + 1) to `main`.
+On release, `.github/workflows/release.yml` commits the release version to `Cargo.toml` and `Cargo.lock` and tags that commit. It then commits the next `-dev` version (the release's patch + 1) to `main`.
 
 Never edit the version by hand. `main` always holds the next version with `-dev`, and each tag's `Cargo.toml` holds that tag's version.
 

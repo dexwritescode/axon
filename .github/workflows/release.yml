@@ -1,20 +1,27 @@
 name: Release
 
-# A merged PR releases only when labelled release:patch, :minor or :major. The
-# action commits the release version to Cargo.toml (tagged), then the next -dev
-# version, and pushes both to main with the release App's token (a bypass actor
-# on main's ruleset).
+# A merged PR releases only when labelled release:patch, :minor or :major. A
+# weekly or manual run releases a patch if anything merged since the last
+# release. The action commits the release version to Cargo.toml (tagged), then
+# the next -dev version, and pushes both to main with the release App's token
+# (a bypass actor on main's ruleset).
 
 on:
   push:
     branches: ["main"]
+  schedule:
+    - cron: '50 19 * * 0'
+      timezone: America/Toronto
+  workflow_dispatch:
 
 jobs:
   release:
-    # Skip the action's own push, so it never joins the group and cancels a waiting release.
-    if: ${{ !startsWith(github.event.head_commit.message, 'Next development version') }}
+    # Only main releases. Skip the action's own push, so it never joins the group
+    # and cancels a waiting release.
+    if: ${{ github.ref == 'refs/heads/main' && !startsWith(github.event.head_commit.message, 'Next development version') }}
     concurrency:
-      group: release
+      # Weekly and manual runs wait in their own group, so they never replace a waiting merge.
+      group: release-${{ github.event_name == 'push' && 'merge' || 'weekly' }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
@@ -24,12 +31,12 @@ jobs:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - uses: dexwritescode/release-on-merge-action@v1.3.0
+      - uses: dexwritescode/release-on-merge-action@v1.4.0
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
         with:
           initial-version: '0.1.0'
-          version-increment-strategy: norelease
+          version-increment-strategy: ${{ github.event_name == 'push' && 'norelease' || 'patch' }}
           generate-release-notes: true
           use-label-strategy: true
           label-major: 'release:major'
